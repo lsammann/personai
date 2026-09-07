@@ -219,6 +219,10 @@ Additional rules:
 - Retry a failing message a few times (small delay between attempts) before
   giving up and moving on to the next one.
 - A single message's failure must never halt a poll cycle or a backfill run.
+- **Auth failure is the exception to that rule.** An expired refresh token
+  (`invalid_grant`) is not a per-message problem and retrying it accomplishes
+  nothing — every subsequent message will fail identically. It halts the run,
+  sets `needs_auth`, and surfaces in the webapp. See Authentication & re-auth.
 - Log failures to stdout and to the classification log.
 
 **Poison-pill handling.** "Never mark a failure as Processed" means a message
@@ -385,6 +389,10 @@ vector store in Future Enhancements arrives.
 - **Does not auto-start the live poller.** The loop only activates on "Start"
   in the webapp — explicit control over when something with write access to
   the inbox is running. "Stop" halts it; closing the laptop halts it too.
+- **Start validates credentials before doing anything else.** If the refresh
+  token is dead, Start does not launch a poller that will fail on every
+  cycle — it returns `needs_auth` and the UI sends me straight into the
+  consent flow.
 - **Config / Settings view**, backed by a config file:
   - Poll interval (default: 1 minute)
   - Confidence threshold (default: 0.8)
@@ -400,8 +408,42 @@ vector store in Future Enhancements arrives.
 - **Run Backfill** button with progress display, locked out while the poller
   runs (see Concurrency).
 - **Status view:** agent running or not, last poll time, recent actions,
-  current `Agent/Error` count.
+  current `Agent/Error` count, Gmail connection state and days until token
+  expiry.
 - **Metrics view** (below).
+
+### Authentication & re-auth
+
+The OAuth flow lives in the webapp as ordinary routes, which is why the
+client is registered as a **Web application** rather than a Desktop app. The
+installed-app helper (`run_local_server()`) blocks, starts a second web
+server of its own, and shells out to a browser — all awkward inside a FastAPI
+request handler, and a poor fit for something that now runs weekly rather
+than once.
+
+- `GET /auth/start` — builds the Google consent URL and redirects to it
+- `GET /auth/callback` — receives the code, exchanges it for tokens, writes
+  them to `data/`, records the consent timestamp, redirects to the dashboard
+
+Re-auth is therefore an ordinary web login: click, approve at Google, land
+back on the dashboard connected. First-time setup and weekly re-auth are the
+**same code path**, so there's no separate CLI bootstrap script to maintain.
+
+Four behaviours make the expiry non-silent:
+
+1. **Start gate** — Start checks credential validity first and returns
+   `needs_auth` instead of launching a doomed poller.
+2. **Reconnect Gmail button** — always present in the status view, for
+   fixing it before it bites.
+3. **Proactive warning** — the consent timestamp is recorded at
+   `/auth/callback`, and since the window is a known 7 days the dashboard
+   shows "Gmail access expires tomorrow — reconnect" from day 6. Turns a
+   weekly surprise into a warning.
+4. **Reactive catch** — a mid-cycle `invalid_grant` stops the poller, sets
+   `needs_auth`, and logs it, rather than retrying every minute for a day.
+
+The 7-day figure is an assumption to confirm empirically, since the
+proactive warning depends on it.
 
 ### Metrics view
 
@@ -445,8 +487,10 @@ Not built preemptively.
 ## Technical Stack
 
 - **Backend:** Python, FastAPI
-- **Gmail access:** `google-api-python-client` + OAuth (installed-app flow,
-  `gmail.modify` scope — required for label changes)
+- **Gmail access:** `google-api-python-client` + OAuth. **Web application**
+  client type — *not* Desktop/installed-app — with redirect URI
+  `http://localhost:8000/auth/callback` (Google permits plain HTTP for
+  localhost). `gmail.modify` scope, required for label changes.
 - **LLM inference:** Ollama, local model (assumption: `llama3.1:8b` or
   `qwen2.5:7b-instruct` — confirm once hardware is tested), called with
   schema-constrained structured output
@@ -459,15 +503,32 @@ Not built preemptively.
 - **Process lifecycle:** OS login item for the FastAPI server; in-app
   Start/Stop for the poll loop
 
-### OAuth gotcha — token expiry
+### OAuth: staying in Testing, and what that costs
 
-A Google Cloud project whose OAuth consent screen is left in **Testing**
-status issues refresh tokens that expire after **7 days**. The agent would
-silently stop working roughly weekly, and the symptom (an auth error deep in
-a background loop) looks nothing like the cause. Verify this before building
-anything else. The standard fix for a personal-use app is to publish the
-consent screen to Production and accept the one-time "unverified app" warning
-during the OAuth flow; refresh tokens then persist.
+A Google Cloud project whose consent screen is left in **Testing** status
+issues refresh tokens that expire after **7 days**. Publishing to Production
+removes that, but publishing demands full branding — logo, app domain,
+privacy policy, terms of service — and, for Gmail's restricted scopes, likely
+verification. None of that is worth doing for a single-user personal tool.
+
+**Decision: stay in Testing and accept weekly re-authentication.** I'm the
+only test user; the cost is one browser round-trip a week.
+
+The danger isn't the re-auth itself, it's that the default failure mode is
+*silent*: the token dies, the poller starts erroring inside a background
+loop, and nothing surfaces until mail visibly piles up. So the expiry is
+handled as a first-class application state rather than an error — see
+**Authentication & re-auth** under Webapp & control flow.
+
+Two tokens are involved and only one is a problem:
+- **Access token** (~1 hour) — refreshed silently by `google-auth` on every
+  call. Never visible.
+- **Refresh token** (7 days in Testing) — cannot be renewed programmatically.
+  Re-consent requires a human in a browser, so genuinely automatic recovery
+  is impossible. Automatic *detection* plus one-click repair is the goal.
+
+Expect the "unverified app" warning on **every** re-consent, not just the
+first (Advanced → Go to email-agent). Unavoidable in Testing.
 
 ### Secrets & config hygiene
 
@@ -494,7 +555,8 @@ email-agent/
     agent.py            # poll loop, classify_and_label(), reconcile step
     rules.py            # pure decision logic: (category, confidence) -> labels
     classifier.py       # Ollama calls, prompt templates, category defs
-    gmail_client.py     # OAuth, label ops, message fetching, batchModify
+    auth.py             # OAuth routes, token storage, credential validation
+    gmail_client.py     # label ops, message fetching, batchModify
     prefilter.py        # sender-domain allowlist matching
     logbook.py          # append/read the JSONL classification log
     config.py           # load/save config, defaults, in-memory state
@@ -506,7 +568,6 @@ email-agent/
     run_eval.py         # score current model+prompt; accuracy, confusion, calibration
   scripts/
     setup_labels.py     # idempotent label creation (check-then-create)
-    oauth_setup.py      # initial OAuth flow
     undo_run.py         # strip Agent/ labels, restore INBOX — time-window REQUIRED
   data/                 # config.json, oauth token, classifications.jsonl — gitignored
   tests/
@@ -648,5 +709,5 @@ building later for the reasons given.
   is equally consistent with "working well" and "confidence signal is dead".
 - Real backfill volume once sent/drafts/chats are excluded (~3000 is a
   pre-exclusion guess).
-- Whether the OAuth consent screen needs publishing to Production to avoid
-  7-day refresh token expiry — verify early.
+- **Exact refresh-token lifetime in Testing status** — assumed 7 days.
+  Confirm empirically, since the proactive expiry warning is timed off it.
