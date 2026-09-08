@@ -44,7 +44,7 @@ This doc uses **"remove `INBOX`"** throughout for precision.
 
 ### Category taxonomy
 
-Seven Gmail labels, all nested under an `Agent/` parent for visibility and
+Eight Gmail labels, all nested under an `Agent/` parent for visibility and
 easy querying:
 
 | Label | Definition | Keeps `INBOX`? | Model can output? |
@@ -54,6 +54,7 @@ easy querying:
 | `Agent/Bookings` | Confirmation of something scheduled/reserved (appointment, flight, reservation); reference only | No | Yes |
 | `Agent/Updates` | Low-priority informational content, no action ever needed (newsletters, LinkedIn digests) | No | Yes |
 | `Agent/Promotions` | Marketing/sales content trying to get me to buy something | No | Yes |
+| `Agent/Personal` | Written by a real person directly to me, not automated or bulk mail | Yes | Yes |
 | `Agent/Needs-Review` | Classifier confidence below threshold; holding label until I manually re-file it | Yes | No — applied by the app |
 | `Agent/Processed` | Marker applied alongside every category label; the sole dedup mechanism | N/A (never affects inbox state) | No — applied by the app |
 
@@ -69,14 +70,25 @@ a silent bug that returns wrong results rather than an error. Hyphenated
 names query cleanly as `label:Agent/To-Action`. Decided once here; the
 display cost is trivial.
 
-**The action space is binary, and that matters.** Four of the five real
-categories (`Receipts`, `Bookings`, `Updates`, `Promotions`) produce
-identical behaviour: label it, remove `INBOX`. Only `To-Action` behaves
-differently. So a Receipts↔Bookings confusion costs nothing, while a
-`To-Action` false negative means a missed bill. The categories exist for
-retrieval and tidiness; the only decision with consequences is *does this
-need me or not*. This asymmetry drives the evaluation strategy below, and v2's
-threshold design.
+**The action space is nearly binary, and that matters.** Four of the six
+real categories (`Receipts`, `Bookings`, `Updates`, `Promotions`) produce
+identical behaviour: label it, remove `INBOX`. `To-Action` and `Personal`
+both keep it. So a Receipts↔Bookings confusion costs nothing, and so does a
+To-Action↔Personal one — while a `To-Action` false negative means a missed
+bill. The categories exist for retrieval and tidiness; the only decision with
+consequences is *does this need to stay visible*. This asymmetry drives the
+evaluation strategy and the asymmetric threshold rule below.
+
+**Why `Personal` exists.** The other five categories all describe
+machine-generated mail — receipts, confirmations, newsletters, marketing,
+bills. Human correspondence fits none of them, and forcing a choice among
+five wrong options produces an arbitrary answer with arbitrary confidence.
+The original plan was to let the confidence floor catch personal mail and
+route it to `Needs-Review`, but Phase 0 measured that failing: on a two-line
+note from a friend, `qwen2.5:3b` returned `Updates` at **0.953** confidence.
+It would have been silently archived. `Personal` keeps `INBOX`, so a
+misfiling between it and `To-Action` is operationally harmless — no attempt
+is made to split personal mail into actionable and not.
 
 ### Scope of processing
 
@@ -155,51 +167,125 @@ id isn't possible without a DB; bounding by time is, and is sufficient.
 
 ### Classification logic
 
-- Local Ollama model, called with the five category definitions in the
-  system prompt.
-- Forced structured JSON output via Ollama's `format` parameter with an
-  explicit JSON schema: `{"reasoning": ..., "category": ..., "confidence":
-  ...}`. Ollama compiles the schema into a decoding grammar, so generation
-  follows the schema's property order — placing `reasoning` first genuinely
-  does force the model to produce its justification before committing to a
-  confidence number. The `category` field is an enum in the schema, which
-  eliminates invalid-category-name failures at the decoding level rather than
-  catching them in parsing.
+The design below is what Phase 0 measured rather than what it assumed — the
+spikes and their findings are recorded in `docs/PLAN.md`.
+
+- **One forward pass, one token.** The six category definitions are mapped to
+  letters `A`–`F` in the system prompt and the model is asked to reply with
+  exactly one character. Called with `num_predict: 1`, `logprobs: true`,
+  `top_logprobs: 20`.
+- **Confidence is the renormalised token distribution, not a self-reported
+  number.** Take the returned top-20 token distribution, keep the entries
+  that are valid category letters, exponentiate the logprobs and normalise so
+  they sum to 1. That yields a probability distribution over the six
+  categories; the prediction is the argmax and the confidence is its
+  probability. Any letter falling outside the top 20 gets probability 0 and
+  the classification log records that it happened.
+- **Single-token letter labels, not category names.** Category words tokenize
+  into several tokens and their first tokens collide (`Receipts` and
+  `Reminders` both begin `Re`), which makes the first-token distribution
+  unreadable. Letters are reliably one token each.
+- **No chain-of-thought.** Reasoning is not requested. Emitting reasoning
+  first conditions the category on that reasoning, so the token distribution
+  would measure agreement-with-its-own-argument rather than confidence in the
+  answer. Phase 0 measured the accuracy cost of dropping it at roughly zero
+  (identical scores on two of three models, one point worse on the third).
+  The full six-way distribution goes into the classification log, which is
+  more useful for debugging than prose would have been.
 - **Category precedence rule, stated explicitly in the prompt.** Several
   emails legitimately belong to two categories — a flight receipt is both a
   Receipt and a Booking; a sale email from a shop I use is both Promotions
-  and Updates. Without a tiebreak the model dithers, produces low confidence,
-  and floods Needs-Review with items where *either answer was fine*. The
-  prompt states a fixed precedence: `To-Action` beats everything; then
-  `Bookings` (future-dated, reference value) over `Receipts`; then
+  and Updates. Without a tiebreak the model dithers and floods Needs-Review
+  with items where *either answer was fine*. The prompt states a fixed
+  precedence: anything written by a real human is `Personal`; otherwise
+  `To-Action` beats everything; then `Bookings` over `Receipts`; then
   `Promotions` over `Updates`.
-- **Confidence threshold starts at 0.8 (conservative), applied
-  symmetrically.** Below this → `Agent/Needs-Review` instead of the model's
-  suggested category. Config value, not hardcoded. A symmetric threshold is a
-  deliberate v1 simplification: I'd rather over-review than build asymmetric
-  routing before I have calibration data. See Future Enhancements.
+- **Confidence threshold starts at 0.8.** Below this → `Agent/Needs-Review`
+  instead of the argmax category. Config value, not hardcoded, and expected
+  to move once the eval set produces a calibration table.
+- **Asymmetric rule for `To-Action`.** Independently of the argmax, if
+  `p(To-Action)` exceeds a second, much lower threshold (starting at 0.15),
+  `INBOX` is retained. This is nearly free now that the full distribution is
+  available, and it protects the only error class that costs anything: a
+  missed bill. A Receipts/Bookings coin-flip still just picks one and
+  archives, because both outcomes are identical in behaviour.
+- **Fixed letter mapping, not randomised.** See the label-bias note below.
+- **Temperature does not affect reported logprobs** on this stack — measured
+  identical to three decimal places at 0.5, 1.0 and 2.0. Pinned at `1.0`
+  anyway to document the intent, but nothing depends on it. Note that
+  repeated identical calls vary in the fourth decimal place, so confidence is
+  reproducible to about three decimals, not exactly — do not assert exact
+  equality in tests.
 - **No second-model fallback in v1.** Low confidence goes straight to
   Needs-Review rather than escalating to a stronger model. A deliberate cut.
 - **Input consistency is a hard requirement.** The poller and the backfill
   must build the model's input from the same fields, fetched the same way —
   see Backfill for why.
-- **Prompt input fields** (sender, subject, snippet, body truncation length)
-  are tuned during build against the eval set rather than guessed here. The
-  one constraint set in advance: the body budget is spent on `To-Action`
-  signal. A bill's due date is routinely below the snippet cutoff, and that's
-  the one category where being wrong actually costs something.
+- **Prompt input fields** (sender, subject, body truncation length) are tuned
+  during build against the eval set rather than guessed here. The one
+  constraint set in advance: the body budget is spent on `To-Action` signal.
+  A bill's due date is routinely below the snippet cutoff, and that is the
+  one category where being wrong actually costs something. Phase 0 measured
+  the cost of body text at roughly +74% latency on the 8B going from 300 to
+  2000 characters — affordable.
 
-**Known risk — self-reported confidence is often miscalibrated.** Small
-instruct models tend to emit confidence bimodally (0.9/0.95 for nearly
-everything, including wrong answers). If that happens here, Needs-Review will
-sit near-empty while misclassifications flow straight through with `INBOX`
-removed — a failure mode that *looks identical to success*. This means the
-size of the Needs-Review queue cannot be the validation signal. The eval set
-is what settles it: bucket predictions by reported confidence and measure
-actual accuracy per bucket. If confidence turns out not to track accuracy,
-the threshold mechanism is worthless and needs replacing (candidates:
-self-consistency across two samples at non-zero temperature, or asking for a
-runner-up category and treating disagreement as low confidence).
+**Rejected in Phase 0: self-reported confidence.** The original design asked
+the model to emit `{reasoning, category, confidence}` as schema-constrained
+JSON, with `reasoning` first to ground the number. The schema mechanism works
+exactly as claimed — 30/30 valid outputs, property order held every time — but
+the confidence it produces is worthless. Measured as mean confidence when
+right minus when wrong: `qwen2.5:3b` **−0.050** (inversely calibrated),
+`llama3.2:3b` **0.000** (it emitted `0.900` for all nine emails, right and
+wrong alike), `llama3.1:8b` **+0.017**. A 0.8 threshold would have caught
+none of the errors. The renormalised token distribution on the same emails
+gave gaps of 0.000 / 0.332 / 0.209 — a real signal on two of three models.
+
+**Rejected in Phase 0: self-consistency sampling.** Running N samples and
+measuring agreement is a legitimate calibration technique, but it costs N×
+latency for a coarser, quantised signal that logprobs provide continuously in
+a single pass. Kept only as a fallback if a future runtime cannot expose
+logprobs.
+
+**Known risk — label-position bias.** Models can favour a letter slot
+independently of what sits in it, which would make "confidence" partly an
+artifact of the alphabet. Phase 0 measured this by classifying identical
+emails under three different letter→category mappings and checking whether
+the predicted category stayed stable: `qwen2.5:3b` 5/11, `llama3.2:3b` 5/11,
+`llama3.1:8b` **9/11**. The 3B models change their answer on half the emails
+based on nothing but which letter a category sits at, which makes their
+distributions untrustworthy regardless of how well-spread they look. The 8B's
+two instabilities were both on genuinely ambiguous pairs (Updates/Promotions,
+Bookings/Receipts), which is defensible behaviour rather than bias.
+
+The mitigation, if a future model needs it, is **permutation averaging** —
+classify under two or three mappings and average the distributions. It is not
+used in v1 because it costs a multiple of the latency, and because three
+passes on a 3B (12.6s) is slower than one pass on the 8B (9.9s) while
+starting from a worse distribution. Permutation stability must be re-measured
+whenever the model changes.
+
+### Model selection
+
+**Lead candidate: `llama3.1:8b`.** It is the only model tested that survives
+all three Phase 0 screens — acceptable latency, a confidence signal that
+separates right from wrong, and stability under letter permutation.
+
+| Model | Latency (2000-char body) | Calibration gap | Permutation stability |
+|---|---|---|---|
+| `qwen2.5:3b` | 4.3s | 0.000 (saturated at 1.00) | 5/11 |
+| `llama3.2:3b` | 4.2s | 0.332 | 5/11 |
+| `llama3.1:8b` | 9.9s | 0.209 | **9/11** |
+
+`qwen2.5:3b` is rejected outright: besides the saturated distribution, it
+classified an energy bill reading "payment due 15 October" as `Receipts` with
+`p(To-Action) = 0.000` — a false negative on the one category that matters,
+with no probability mass left for the asymmetric rule to catch it.
+
+This is a **lead candidate, not a settled decision.** It rests on eleven
+synthetic emails, and the ranking changed twice as each new screen was added
+(speed, then calibration, then robustness). Phase 2 decides it against 150–200
+real hand-labeled messages, and must re-measure all three properties rather
+than inheriting these numbers.
 
 ### Error handling
 
@@ -455,12 +541,21 @@ log). No database.
 - Recall on `To-Action`, called out separately as the headline number
 - The calibration table (confidence bucket → measured accuracy), which is
   what makes the 0.8 threshold defensible or exposes it as noise
+- **Calibration gap** — mean confidence when right minus when wrong. A gap
+  near zero means the confidence carries no information, whatever the
+  accuracy says. This is the number that killed self-reported confidence in
+  Phase 0 and it stays a first-class metric.
+- **Permutation stability** — the fraction of eval messages whose predicted
+  category is unchanged under a different letter→category mapping. Guards
+  against the distribution being an artifact of label position rather than
+  content.
 
 **From the live log — what is it actually doing?**
 - Volume per category over time; % of messages hitting Needs-Review;
   failure and `Agent/Error` counts
-- Recent classifications with reasoning and confidence shown — this is also
-  what makes a dry run inspectable
+- Recent classifications with the full six-way probability distribution
+  shown, not just the winning score — this is also what makes a dry run
+  inspectable, and the runner-up is often the interesting part
 
 **The improvement surface — what should I fix next?**
 - The list of corrections from reconciliation: what the model predicted, at
@@ -568,6 +663,8 @@ email-agent/
     run_eval.py         # score current model+prompt; accuracy, confusion, calibration
   scripts/
     setup_labels.py     # idempotent label creation (check-then-create)
+    spike_ollama.py     # Phase 0: latency, schema compliance, confidence method
+    spike_labels.py     # Phase 0: label-position bias, temperature
     undo_run.py         # strip Agent/ labels, restore INBOX — time-window REQUIRED
   data/                 # config.json, oauth token, classifications.jsonl — gitignored
   tests/
@@ -605,11 +702,17 @@ correctness, the **eval set** covers model quality. They're different
 questions and shouldn't be conflated.
 
 **Worth testing:**
-- Label decision logic in `rules.py`: given a category + confidence, which
-  labels get applied and is `INBOX` removed? (Pure function, test it
-  thoroughly.)
-- Classifier output parsing: valid JSON, malformed JSON, missing fields,
-  invalid category names, confidence at/above/below threshold
+- Label decision logic in `rules.py`: given a distribution + thresholds,
+  which labels get applied and is `INBOX` removed? Includes the asymmetric
+  `p(To-Action)` rule firing even when the argmax is a different category.
+  (Pure function, test it thoroughly.)
+- Distribution renormalisation: letters outside the top-20 treated as zero,
+  normalisation summing to 1, argmax selection, and the case where no valid
+  category letter appears at all. Also pure, also worth testing thoroughly.
+- Classifier output parsing: missing `logprobs` in the response, an empty
+  top-20, whitespace-prefixed token variants (`"A"` vs `" A"`), confidence
+  at/above/below threshold. Assert approximate equality on probabilities —
+  repeated calls vary in the fourth decimal.
 - Pre-filter matching: domain allowlist hits and misses
 - Dry-run mode: asserts that **no write calls** are made — the most valuable
   single test here, given the blast radius of a bad backfill
@@ -628,13 +731,15 @@ the eval set rather than asserted in tests.
 ## Future Enhancements (out of scope for v1)
 
 ### Classifier quality
-- **Asymmetric confidence thresholds** — the action space is binary (see
-  taxonomy), so the thresholds shouldn't be symmetric. A low-confidence
-  Receipts/Bookings coin-flip should just pick one and archive; anything
-  where `To-Action` is a plausible runner-up should keep `INBOX` regardless
-  of the top-line confidence. Cut from v1 because tuning an asymmetric rule
-  without calibration data is guesswork — this is the first thing to build
-  once the eval set has produced a calibration table.
+- **Permutation averaging** — classify each message under two or three
+  letter→category mappings and average the distributions, cancelling out
+  label-position bias. Measured as unnecessary for the chosen model in Phase
+  0 (9/11 stable) and it costs a multiple of the latency, but it is the
+  mitigation to reach for if a future model shows bias.
+- **Semantic labels instead of letters** — possibly better grounded than
+  arbitrary letters, but multi-token first tokens and prefix collisions
+  (`Receipts`/`Reminders`) make the distribution hard to read. Only worth
+  revisiting if letters prove to be the accuracy bottleneck.
 - **Claude API fallback** — a second-tier check for low-confidence emails
   before giving up to Needs-Review (Ollama → Claude → Needs-Review). Cut from
   v1 to keep the escalation path simple to reason about first.
@@ -697,16 +802,20 @@ building later for the reasons given.
 
 ## Open Assumptions to Confirm During Build
 
-- Exact Ollama model choice — pick based on what runs comfortably on
-  available hardware, then compare candidates against the eval set rather
-  than by feel.
+- **Final model choice.** `llama3.1:8b` leads on eleven synthetic emails,
+  but the ranking changed twice during Phase 0 as new screens were added.
+  Phase 2 re-measures latency, calibration gap and permutation stability
+  against real hand-labeled mail and decides.
+- **Where the confidence threshold actually belongs.** 0.8 is a starting
+  value, not a measured one. The calibration table sets it. So does the
+  `p(To-Action)` floor, provisionally 0.15.
 - Prompt input fields and body truncation length — tuned against the eval
   set, with the body budget prioritised for `To-Action` signal.
 - Initial seed list for the Promotions sender allowlist.
-- **Whether self-reported model confidence is calibrated well enough for the
-  0.8 threshold to be meaningful.** Settled by the calibration table from the
-  eval set, *not* by how full Needs-Review looks — a near-empty Needs-Review
-  is equally consistent with "working well" and "confidence signal is dead".
+- **Whether `Personal` holds up on real mail.** It classified cleanly on
+  three synthetic examples, but real human correspondence is far more varied
+  than a note from a friend — forwarded threads, mailing lists, and
+  recruiters all blur the line with `Updates`.
 - Real backfill volume once sent/drafts/chats are excluded (~3000 is a
   pre-exclusion guess).
 - **Exact refresh-token lifetime in Testing status** — assumed 7 days.
