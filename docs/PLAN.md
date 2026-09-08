@@ -188,6 +188,9 @@ and the single highest-value phase for interview purposes.
   safe to commit).
 - **Hand-label 150–200 messages.** Sample deliberately across categories
   rather than taking the most recent 200, which would be 80% promos.
+  Confirmed and probably understated - twenty consecutive recent inbox
+  subjects contained no To-Action, Personal, Receipts or Bookings at all.
+  See `docs/BACKLOG.md`.
 - `eval/run_eval.py` — score the current model + prompt against the set.
   Outputs overall accuracy, confusion matrix, **recall on `To-Action`**, the
   confidence-bucket calibration table, the **calibration gap**, and
@@ -260,6 +263,10 @@ is a plan, not a safety net.
 ---
 
 ## Phase 4 — Automation
+
+> Read `docs/BACKLOG.md` first. The real backlog is 18,668 messages, not the
+> ~3000 DESIGN.md assumes, which makes a single undifferentiated pass a
+> ~49-hour job. That document sizes three strategies; none is chosen.
 
 **Goal:** it runs by itself over everything.
 

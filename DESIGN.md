@@ -227,7 +227,9 @@ spikes and their findings are recorded in `docs/PLAN.md`.
   A bill's due date is routinely below the snippet cutoff, and that is the
   one category where being wrong actually costs something. Phase 0 measured
   the cost of body text at roughly +74% latency on the 8B going from 300 to
-  2000 characters — affordable.
+  2000 characters — but those figures are optimistic: real bodies have a
+  median of 7,445 characters, so 2000 covers only the 28th percentile. See
+  `docs/BACKLOG.md`.
 
 **Rejected in Phase 0: self-reported confidence.** The original design asked
 the model to emit `{reasoning, category, confidence}` as schema-constrained
@@ -350,18 +352,45 @@ to retrieve.
 ### Classification log (JSONL)
 
 Every classification attempt appends one JSON object to a local `.jsonl`
-file: timestamp, message id, sender, subject, source (`model` /
-`prefilter` / `correction`), predicted category, confidence, reasoning,
-action taken (labels added/removed, or `dry_run`), and any error.
+file.
+
+**Guiding principle: record the decision's inputs *and* its parameters.** A
+row should carry enough to (a) recompute why a message was labelled the way
+it was, and (b) segment any metric by anything that was tuned. Anything
+tunable that isn't logged becomes a variable you cannot control for later —
+if the model changes mid-backfill and the rows don't say which produced them,
+the Metrics view silently averages across two models.
+
+| Field | Why |
+|---|---|
+| `timestamp` | ordering, rotation |
+| `message_id` | join back to Gmail; dedup |
+| `sender`, `subject` | human-readable identification when reviewing |
+| `source` | `model` / `prefilter` / `correction` — prefilter hits never reach the model, corrections come from reconciliation |
+| `category` | the argmax |
+| `confidence` | the winning probability |
+| `distribution` | **all six probabilities.** The runner-up drives the asymmetric `To-Action` rule, and a saturated distribution is only visible here |
+| `model` | which Ollama model produced the row |
+| `prompt_version` | bump on every prompt or category-definition edit |
+| `body_chars` | truncation length actually used |
+| `confidence_threshold`, `to_action_floor` | the thresholds in force, so a past decision can be recomputed |
+| `action` | labels added/removed, or `dry_run` |
+| `error` | failure reason, `null` on success |
+| `note` | e.g. a category letter falling outside the returned top-20 |
+
+`model`, `prompt_version` and `body_chars` are the three tuning knobs Phase 2
+iterates on. Without them in the row, a mixed log cannot be segmented and the
+eval numbers become uninterpretable the first time something changes
+mid-run.
 
 This is **not** a database and doesn't undermine the no-DB decision below —
-it's an append-only file with no schema, no migrations, and no queries beyond
-"read it all and aggregate", which is trivial at this volume. It exists
-because three things in this design are impossible without it:
+it's an append-only file with no migrations and no queries beyond "read it
+all and aggregate", which is trivial at this volume. It exists because three
+things in this design are impossible without it:
 
-- **Threshold tuning.** Gmail labels don't retain confidence or reasoning, so
-  once a label is applied the evidence is gone. Nothing can be tuned from
-  label counts alone.
+- **Threshold tuning.** Gmail labels retain none of the distribution, so once
+  a label is applied the evidence is gone. Nothing can be tuned from label
+  counts alone.
 - **Dry-run inspection.** A dry run writes no labels by definition, so the
   log is the *only* record a dry run produces.
 - **The correction corpus.** See reconciliation above.
@@ -392,6 +421,13 @@ regression check that makes it safe to change the prompt or swap the model
 later. It also de-risks the first backfill more than dry-run alone does.
 
 ### Backfill (existing mail)
+
+> **The volume figures in this section are wrong.** The real backlog is
+> **18,668** messages, not ~3000, and it is concentrated in the last three
+> years rather than spread thin. Measured against the live mailbox and
+> recorded in `docs/BACKLOG.md`, along with body-length and sender-
+> concentration data and three unchosen strategies. Nothing here has been
+> revised yet — read that document before building this.
 
 - Triggered manually via a **"Run Backfill" button** in the webapp — not
   automatic, not on first run.
@@ -460,9 +496,10 @@ A deliberate simplification — state Gmail already tracks for free doesn't
 need duplicating locally, and there's no join, no transaction, and no
 concurrent writer to justify a schema.
 
-What *is* kept locally is the append-only classification log, because Gmail
-labels don't retain confidence or reasoning and that evidence is needed for
-tuning. A JSONL file is the smallest thing that solves that. The point at
+What *is* kept locally is the append-only classification log, because a Gmail
+label records only the winning category — not the probability distribution
+behind it, nor which model, prompt version or thresholds produced it, all of
+which are needed for tuning. A JSONL file is the smallest thing that solves that. The point at
 which it stops being enough — when the correction corpus needs similarity
 search rather than sequential scanning — is exactly the point where the
 vector store in Future Enhancements arrives.
@@ -670,6 +707,7 @@ email-agent/
   tests/
   docs/
     PLAN.md             # phased build order and gates
+    BACKLOG.md          # mailbox survey: real volume, ages, body lengths
   config.example.json
   pyproject.toml
   DESIGN.md
@@ -816,7 +854,8 @@ building later for the reasons given.
   three synthetic examples, but real human correspondence is far more varied
   than a note from a friend — forwarded threads, mailing lists, and
   recruiters all blur the line with `Updates`.
-- Real backfill volume once sent/drafts/chats are excluded (~3000 is a
-  pre-exclusion guess).
+- ~~Real backfill volume once sent/drafts/chats are excluded.~~
+  *Measured: 18,668. See `docs/BACKLOG.md`. The backfill section has not yet
+  been revised to match.*
 - **Exact refresh-token lifetime in Testing status** — assumed 7 days.
   Confirm empirically, since the proactive expiry warning is timed off it.
