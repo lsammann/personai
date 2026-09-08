@@ -68,7 +68,7 @@ are about right — and Phase 2 being the biggest is the point, not a problem.
 
 ---
 
-## Phase 0 — Foundations & spikes  *(model spikes DONE)*
+## Phase 0 — Foundations & spikes
 
 **Goal:** prove the two things I don't control actually work, before building
 anything on top of them.
@@ -80,8 +80,8 @@ anything on top of them.
   stored in `data/`
 - A throwaway script that fetches 20 messages and prints sender/subject/snippet
 
-**Status:** the Ollama spikes are complete (`scripts/spike_ollama.py`,
-`scripts/spike_labels.py`). The scaffold and the Gmail read test remain.
+The spikes live in `scripts/spike_ollama.py`, `scripts/spike_labels.py`
+and `scripts/spike_gmail.py`.
 
 ### Findings
 
@@ -140,8 +140,8 @@ rests on eleven synthetic emails I wrote. Phase 2 decides against real mail.
   proactive expiry warning is timed off it. Confirm empirically once OAuth is
   wired up.
 
-**Gate:** I can read my own mail from Python. *(Model half of this gate is
-passed.)*
+**Gate:** I can read my own mail from Python, and a local model returns a
+usable, well-behaved category distribution in tolerable time.
 
 ---
 
