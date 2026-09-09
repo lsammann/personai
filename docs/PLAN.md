@@ -76,31 +76,72 @@ anything on top of them.
 **Build:**
 - Repo scaffold: `pyproject.toml`, `uv` venv, `.gitignore` (`data/` first
   line), `README.md` stub, the directory tree from `DESIGN.md`
-- `scripts/oauth_setup.py` — installed-app OAuth flow, **`gmail.readonly`
-  scope**, token stored in `data/`
+- `app/auth.py` — OAuth routes on the **`gmail.readonly` scope**, token
+  stored in `data/`
 - A throwaway script that fetches 20 messages and prints sender/subject/snippet
-- A throwaway script that calls Ollama with a schema-constrained prompt on a
-  hardcoded email and prints the parsed JSON
 
-**Spike questions to answer and write down:**
-- Does the consent screen need publishing to Production to avoid the 7-day
-  refresh token expiry? *Test this by checking the granted token's behaviour,
-  not by trusting the docs.*
-- Which model runs comfortably here — `llama3.1:8b`, `qwen2.5:7b-instruct`,
-  something smaller? **Time a single classification.** That number times 3000
-  is the backfill duration, and if it's 15 seconds this project needs a
-  different model before anything else gets built.
-- Does Ollama's `format` schema actually constrain output the way `DESIGN.md`
-  claims — including holding the property order so `reasoning` precedes
-  `confidence`?
+The spikes live in `scripts/spike_ollama.py`, `scripts/spike_labels.py`
+and `scripts/spike_gmail.py`.
 
-**Gate:** I can read my own mail from Python, and get valid structured JSON
-out of a local model in a tolerable amount of time. Model choice is decided
-(provisionally) and written into `DESIGN.md`'s open-assumptions section.
+### Findings
 
-**If the gate fails:** a too-slow model means dropping to a smaller one or
-reconsidering local inference entirely — that's a v1-scope conversation, and
-much better to have now than after the webapp exists.
+**Speed is not a constraint.** Measured on a Ryzen 5 PRO 7540U, CPU-only,
+on mains power. Earlier estimates of 25–50 hours were wrong by roughly 4×.
+
+| Model | 300-char body | 2000-char body | Backfill (3000) |
+|---|---|---|---|
+| `qwen2.5:3b` | 2.8s | 4.3s | 2.3–3.6h |
+| `llama3.2:3b` | 2.7s | 4.2s | 2.3–3.5h |
+| `llama3.1:8b` | 5.7s | 9.9s | 4.7–8.2h |
+
+Nothing is eliminated on latency. Even the slowest configuration is a single
+overnight backfill and a ~33-minute eval run, so prompt iteration in Phase 2
+is practical. Body text costs +55% latency on 3B and +74% on 8B — affordable,
+which means the `To-Action` recall argument for feeding in real body content
+survives.
+
+**Schema-constrained output works exactly as `DESIGN.md` claimed.** 30/30
+valid JSON, zero invalid category names, and property order held in every
+case. That assumption is settled — but it turned out not to matter, because
+the confidence it produced was worthless.
+
+**Self-reported confidence is dead.** Mean confidence when right minus when
+wrong: `qwen2.5:3b` −0.050, `llama3.2:3b` 0.000, `llama3.1:8b` +0.017.
+llama3.2 emitted `0.900` for all nine test emails, right and wrong alike. A
+0.8 threshold would have caught none of the errors. Replaced with the
+renormalised first-token distribution — see `DESIGN.md` → Classification
+logic.
+
+**Label-position bias is real and disqualifies the 3B models.** Classifying
+identical emails under three different letter→category mappings, the
+predicted category stayed stable for `qwen2.5:3b` 5/11, `llama3.2:3b` 5/11,
+`llama3.1:8b` **9/11**. The 3B models change their answer based on nothing but
+which letter a category sits at, so their distributions cannot be trusted —
+including llama3.2's apparently healthy 0.332 calibration gap, which is better
+explained as a flat, noisy distribution. The 8B's two instabilities were both
+on genuinely ambiguous pairs, which is defensible rather than biased.
+
+**Temperature does not affect reported logprobs** (identical to three decimals
+at 0.5 / 1.0 / 2.0). Repeated identical calls do vary in the fourth decimal,
+so confidence is reproducible to ~3dp, not exactly.
+
+**A sixth category, `Personal`, was added.** Human correspondence fits none of
+the five machine-mail categories. Relying on the confidence floor to catch it
+failed in measurement — qwen classified a two-line note from a friend as
+`Updates` at 0.953 and would have archived it silently.
+
+**Lead candidate: `llama3.1:8b`** — the only model to survive all three
+screens. Not settled: the ranking changed twice as screens were added, and it
+rests on eleven synthetic emails I wrote. Phase 2 decides against real mail.
+
+### Remaining spike question
+
+- **Exact refresh-token lifetime in Testing status.** Assumed 7 days; the
+  proactive expiry warning is timed off it. Confirm empirically once OAuth is
+  wired up.
+
+**Gate:** I can read my own mail from Python, and a local model returns a
+usable, well-behaved category distribution in tolerable time.
 
 ---
 
@@ -111,15 +152,22 @@ network. This is where the "testable pure function" claim in `DESIGN.md` gets
 earned rather than asserted.
 
 **Build:**
-- `app/rules.py` — `(category, confidence, threshold) -> (labels_to_add,
-  labels_to_remove)`. The whole decision table, no I/O.
-- `app/config.py` — load/save, defaults, in-memory source of truth
+- `app/categories.py` — the six categories, their letter mapping, and the
+  `Agent/` label names. Shared constants, so `rules` and `classifier` do not
+  have to depend on each other.
+- `app/rules.py` — `(distribution, config) -> (labels_to_add,
+  labels_to_remove)`. The whole decision table including the asymmetric
+  `p(To-Action)` rule. No I/O, no network — the most-tested file in the
+  project.
+- `app/config.py` — load/save, defaults, in-memory source of truth *(done in
+  Phase 0; auth needed it)*
 - `app/logbook.py` — append/read the JSONL classification log
 - `app/prefilter.py` — sender-domain allowlist matching
-- `app/classifier.py` — **split the parsing from the calling.** A pure
-  `parse_response(raw: str) -> Classification` that can be tested against
-  malformed JSON, missing fields, and out-of-enum categories without Ollama
-  running.
+- `app/classifier.py` — **split interpreting the model from calling it.** The
+  pure half turns a raw top-20 logprob list into a normalised distribution
+  over the six categories, and is testable against a partial top-20, tokens
+  with leading whitespace, and a response containing no valid category letter
+  at all. The impure half is the Ollama HTTP call, mocked in tests.
 - `tests/` covering all of the above
 
 **Gate:** `pytest` passes, and the test suite covers every row of the label
@@ -144,9 +192,19 @@ and the single highest-value phase for interview purposes.
   safe to commit).
 - **Hand-label 150–200 messages.** Sample deliberately across categories
   rather than taking the most recent 200, which would be 80% promos.
+  Confirmed and probably understated - twenty consecutive recent inbox
+  subjects contained no To-Action, Personal, Receipts or Bookings at all.
+  See `docs/BACKLOG.md`.
 - `eval/run_eval.py` — score the current model + prompt against the set.
-  Outputs overall accuracy, confusion matrix, **recall on `To-Action`**, and
-  the confidence-bucket calibration table.
+  Outputs overall accuracy, confusion matrix, **recall on `To-Action`**, the
+  confidence-bucket calibration table, the **calibration gap**, and
+  **permutation stability**.
+
+**Re-run the Phase 0 screens against real mail.** The synthetic results are
+directional only, and the model ranking already reversed twice under them.
+All three properties get re-measured here — latency, calibration gap, and
+stability under a permuted letter mapping — because a model that looked
+stable on eleven emails I wrote may not be on two hundred of mine.
 
 **Then iterate.** This is the real work of the phase: tune the prompt, the
 category definitions, the precedence rule, the input fields, and the body
@@ -159,11 +217,18 @@ Phase 0 against each other. Every change is scored, not vibed.
    space argument in `DESIGN.md`.)
 2. **Is recall on `To-Action` high?** This is the one that matters. A missed
    bill is the only error with a real cost.
-3. **Does the calibration table show confidence tracking accuracy?** If every
-   prediction comes back at 0.9+ regardless of correctness, the threshold
-   mechanism is decorative, `Needs-Review` will sit empty, and Phase 3 needs
-   a different low-confidence signal (self-consistency across two samples, or
-   a runner-up category) before it's safe to let anything remove `INBOX`.
+3. **Is the calibration gap meaningfully positive?** If mean confidence when
+   right is no higher than when wrong, the threshold is decorative,
+   `Needs-Review` will sit empty, and nothing should be allowed to remove
+   `INBOX` until a working signal exists. This is the screen that killed
+   self-reported confidence in Phase 0.
+4. **Is permutation stability high?** If the predicted category moves when
+   only the letter mapping changes, the distribution is measuring alphabet
+   position rather than content. Mitigation is permutation averaging, at a
+   multiple of the latency.
+5. **What are the actual threshold values?** 0.8 and a 0.15 `p(To-Action)`
+   floor are placeholders. The calibration table replaces them with measured
+   ones, and those go back into `DESIGN.md`.
 
 **If the gate fails:** stop and fix it here. Everything downstream is
 plumbing around a classifier; plumbing around a bad classifier is wasted
@@ -202,6 +267,10 @@ is a plan, not a safety net.
 ---
 
 ## Phase 4 — Automation
+
+> Read `docs/BACKLOG.md` first. The real backlog is 18,668 messages, not the
+> ~3000 DESIGN.md assumes, which makes a single undifferentiated pass a
+> ~49-hour job. That document sizes three strategies; none is chosen.
 
 **Goal:** it runs by itself over everything.
 
@@ -278,10 +347,18 @@ is already paid for.
 
 Places where reality is expected to argue back, and that's fine:
 
-- **Phase 0, model speed.** Could force a smaller model, or reopen local-vs-API.
-- **Phase 2, calibration.** If confidence doesn't track accuracy, the 0.8
-  threshold is fiction and the low-confidence signal needs replacing. This is
-  the most likely design change in the whole plan.
+- ~~**Phase 0, model speed.**~~ *Resolved: not a constraint. 2.7–9.9s per
+  message, every candidate viable.*
+- ~~**Phase 0, calibration.**~~ *Resolved the hard way: self-reported
+  confidence carried no signal on any model and was replaced with the
+  renormalised token distribution. The design changed, as expected — this was
+  correctly flagged as the most likely change in the plan.*
+- **Phase 2, calibration and stability on real mail.** The Phase 0 numbers
+  come from eleven synthetic emails. Both the model ranking and the threshold
+  values are provisional until re-measured here.
+- **Phase 2, the `Personal` category.** Clean on three synthetic examples;
+  real human mail is messier — forwarded threads, mailing lists and
+  recruiters all blur the line with `Updates`.
 - **Phase 2, taxonomy.** The confusion matrix may show `Updates` and
   `Promotions` are indistinguishable in practice — at which point merging
   them costs nothing, since they behave identically.

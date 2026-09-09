@@ -44,7 +44,7 @@ This doc uses **"remove `INBOX`"** throughout for precision.
 
 ### Category taxonomy
 
-Seven Gmail labels, all nested under an `Agent/` parent for visibility and
+Eight Gmail labels, all nested under an `Agent/` parent for visibility and
 easy querying:
 
 | Label | Definition | Keeps `INBOX`? | Model can output? |
@@ -54,6 +54,7 @@ easy querying:
 | `Agent/Bookings` | Confirmation of something scheduled/reserved (appointment, flight, reservation); reference only | No | Yes |
 | `Agent/Updates` | Low-priority informational content, no action ever needed (newsletters, LinkedIn digests) | No | Yes |
 | `Agent/Promotions` | Marketing/sales content trying to get me to buy something | No | Yes |
+| `Agent/Personal` | Written by a real person directly to me, not automated or bulk mail | Yes | Yes |
 | `Agent/Needs-Review` | Classifier confidence below threshold; holding label until I manually re-file it | Yes | No — applied by the app |
 | `Agent/Processed` | Marker applied alongside every category label; the sole dedup mechanism | N/A (never affects inbox state) | No — applied by the app |
 
@@ -69,14 +70,25 @@ a silent bug that returns wrong results rather than an error. Hyphenated
 names query cleanly as `label:Agent/To-Action`. Decided once here; the
 display cost is trivial.
 
-**The action space is binary, and that matters.** Four of the five real
-categories (`Receipts`, `Bookings`, `Updates`, `Promotions`) produce
-identical behaviour: label it, remove `INBOX`. Only `To-Action` behaves
-differently. So a Receipts↔Bookings confusion costs nothing, while a
-`To-Action` false negative means a missed bill. The categories exist for
-retrieval and tidiness; the only decision with consequences is *does this
-need me or not*. This asymmetry drives the evaluation strategy below, and v2's
-threshold design.
+**The action space is nearly binary, and that matters.** Four of the six
+real categories (`Receipts`, `Bookings`, `Updates`, `Promotions`) produce
+identical behaviour: label it, remove `INBOX`. `To-Action` and `Personal`
+both keep it. So a Receipts↔Bookings confusion costs nothing, and so does a
+To-Action↔Personal one — while a `To-Action` false negative means a missed
+bill. The categories exist for retrieval and tidiness; the only decision with
+consequences is *does this need to stay visible*. This asymmetry drives the
+evaluation strategy and the asymmetric threshold rule below.
+
+**Why `Personal` exists.** The other five categories all describe
+machine-generated mail — receipts, confirmations, newsletters, marketing,
+bills. Human correspondence fits none of them, and forcing a choice among
+five wrong options produces an arbitrary answer with arbitrary confidence.
+The original plan was to let the confidence floor catch personal mail and
+route it to `Needs-Review`, but Phase 0 measured that failing: on a two-line
+note from a friend, `qwen2.5:3b` returned `Updates` at **0.953** confidence.
+It would have been silently archived. `Personal` keeps `INBOX`, so a
+misfiling between it and `To-Action` is operationally harmless — no attempt
+is made to split personal mail into actionable and not.
 
 ### Scope of processing
 
@@ -155,51 +167,127 @@ id isn't possible without a DB; bounding by time is, and is sufficient.
 
 ### Classification logic
 
-- Local Ollama model, called with the five category definitions in the
-  system prompt.
-- Forced structured JSON output via Ollama's `format` parameter with an
-  explicit JSON schema: `{"reasoning": ..., "category": ..., "confidence":
-  ...}`. Ollama compiles the schema into a decoding grammar, so generation
-  follows the schema's property order — placing `reasoning` first genuinely
-  does force the model to produce its justification before committing to a
-  confidence number. The `category` field is an enum in the schema, which
-  eliminates invalid-category-name failures at the decoding level rather than
-  catching them in parsing.
+The design below is what Phase 0 measured rather than what it assumed — the
+spikes and their findings are recorded in `docs/PLAN.md`.
+
+- **One forward pass, one token.** The six category definitions are mapped to
+  letters `A`–`F` in the system prompt and the model is asked to reply with
+  exactly one character. Called with `num_predict: 1`, `logprobs: true`,
+  `top_logprobs: 20`.
+- **Confidence is the renormalised token distribution, not a self-reported
+  number.** Take the returned top-20 token distribution, keep the entries
+  that are valid category letters, exponentiate the logprobs and normalise so
+  they sum to 1. That yields a probability distribution over the six
+  categories; the prediction is the argmax and the confidence is its
+  probability. Any letter falling outside the top 20 gets probability 0 and
+  the classification log records that it happened.
+- **Single-token letter labels, not category names.** Category words tokenize
+  into several tokens and their first tokens collide (`Receipts` and
+  `Reminders` both begin `Re`), which makes the first-token distribution
+  unreadable. Letters are reliably one token each.
+- **No chain-of-thought.** Reasoning is not requested. Emitting reasoning
+  first conditions the category on that reasoning, so the token distribution
+  would measure agreement-with-its-own-argument rather than confidence in the
+  answer. Phase 0 measured the accuracy cost of dropping it at roughly zero
+  (identical scores on two of three models, one point worse on the third).
+  The full six-way distribution goes into the classification log, which is
+  more useful for debugging than prose would have been.
 - **Category precedence rule, stated explicitly in the prompt.** Several
   emails legitimately belong to two categories — a flight receipt is both a
   Receipt and a Booking; a sale email from a shop I use is both Promotions
-  and Updates. Without a tiebreak the model dithers, produces low confidence,
-  and floods Needs-Review with items where *either answer was fine*. The
-  prompt states a fixed precedence: `To-Action` beats everything; then
-  `Bookings` (future-dated, reference value) over `Receipts`; then
+  and Updates. Without a tiebreak the model dithers and floods Needs-Review
+  with items where *either answer was fine*. The prompt states a fixed
+  precedence: anything written by a real human is `Personal`; otherwise
+  `To-Action` beats everything; then `Bookings` over `Receipts`; then
   `Promotions` over `Updates`.
-- **Confidence threshold starts at 0.8 (conservative), applied
-  symmetrically.** Below this → `Agent/Needs-Review` instead of the model's
-  suggested category. Config value, not hardcoded. A symmetric threshold is a
-  deliberate v1 simplification: I'd rather over-review than build asymmetric
-  routing before I have calibration data. See Future Enhancements.
+- **Confidence threshold starts at 0.8.** Below this → `Agent/Needs-Review`
+  instead of the argmax category. Config value, not hardcoded, and expected
+  to move once the eval set produces a calibration table.
+- **Asymmetric rule for `To-Action`.** Independently of the argmax, if
+  `p(To-Action)` exceeds a second, much lower threshold (starting at 0.15),
+  `INBOX` is retained. This is nearly free now that the full distribution is
+  available, and it protects the only error class that costs anything: a
+  missed bill. A Receipts/Bookings coin-flip still just picks one and
+  archives, because both outcomes are identical in behaviour.
+- **Fixed letter mapping, not randomised.** See the label-bias note below.
+- **Temperature does not affect reported logprobs** on this stack — measured
+  identical to three decimal places at 0.5, 1.0 and 2.0. Pinned at `1.0`
+  anyway to document the intent, but nothing depends on it. Note that
+  repeated identical calls vary in the fourth decimal place, so confidence is
+  reproducible to about three decimals, not exactly — do not assert exact
+  equality in tests.
 - **No second-model fallback in v1.** Low confidence goes straight to
   Needs-Review rather than escalating to a stronger model. A deliberate cut.
 - **Input consistency is a hard requirement.** The poller and the backfill
   must build the model's input from the same fields, fetched the same way —
   see Backfill for why.
-- **Prompt input fields** (sender, subject, snippet, body truncation length)
-  are tuned during build against the eval set rather than guessed here. The
-  one constraint set in advance: the body budget is spent on `To-Action`
-  signal. A bill's due date is routinely below the snippet cutoff, and that's
-  the one category where being wrong actually costs something.
+- **Prompt input fields** (sender, subject, body truncation length) are tuned
+  during build against the eval set rather than guessed here. The one
+  constraint set in advance: the body budget is spent on `To-Action` signal.
+  A bill's due date is routinely below the snippet cutoff, and that is the
+  one category where being wrong actually costs something. Phase 0 measured
+  the cost of body text at roughly +74% latency on the 8B going from 300 to
+  2000 characters — but those figures are optimistic: real bodies have a
+  median of 7,445 characters, so 2000 covers only the 28th percentile. See
+  `docs/BACKLOG.md`.
 
-**Known risk — self-reported confidence is often miscalibrated.** Small
-instruct models tend to emit confidence bimodally (0.9/0.95 for nearly
-everything, including wrong answers). If that happens here, Needs-Review will
-sit near-empty while misclassifications flow straight through with `INBOX`
-removed — a failure mode that *looks identical to success*. This means the
-size of the Needs-Review queue cannot be the validation signal. The eval set
-is what settles it: bucket predictions by reported confidence and measure
-actual accuracy per bucket. If confidence turns out not to track accuracy,
-the threshold mechanism is worthless and needs replacing (candidates:
-self-consistency across two samples at non-zero temperature, or asking for a
-runner-up category and treating disagreement as low confidence).
+**Rejected in Phase 0: self-reported confidence.** The original design asked
+the model to emit `{reasoning, category, confidence}` as schema-constrained
+JSON, with `reasoning` first to ground the number. The schema mechanism works
+exactly as claimed — 30/30 valid outputs, property order held every time — but
+the confidence it produces is worthless. Measured as mean confidence when
+right minus when wrong: `qwen2.5:3b` **−0.050** (inversely calibrated),
+`llama3.2:3b` **0.000** (it emitted `0.900` for all nine emails, right and
+wrong alike), `llama3.1:8b` **+0.017**. A 0.8 threshold would have caught
+none of the errors. The renormalised token distribution on the same emails
+gave gaps of 0.000 / 0.332 / 0.209 — a real signal on two of three models.
+
+**Rejected in Phase 0: self-consistency sampling.** Running N samples and
+measuring agreement is a legitimate calibration technique, but it costs N×
+latency for a coarser, quantised signal that logprobs provide continuously in
+a single pass. Kept only as a fallback if a future runtime cannot expose
+logprobs.
+
+**Known risk — label-position bias.** Models can favour a letter slot
+independently of what sits in it, which would make "confidence" partly an
+artifact of the alphabet. Phase 0 measured this by classifying identical
+emails under three different letter→category mappings and checking whether
+the predicted category stayed stable: `qwen2.5:3b` 5/11, `llama3.2:3b` 5/11,
+`llama3.1:8b` **9/11**. The 3B models change their answer on half the emails
+based on nothing but which letter a category sits at, which makes their
+distributions untrustworthy regardless of how well-spread they look. The 8B's
+two instabilities were both on genuinely ambiguous pairs (Updates/Promotions,
+Bookings/Receipts), which is defensible behaviour rather than bias.
+
+The mitigation, if a future model needs it, is **permutation averaging** —
+classify under two or three mappings and average the distributions. It is not
+used in v1 because it costs a multiple of the latency, and because three
+passes on a 3B (12.6s) is slower than one pass on the 8B (9.9s) while
+starting from a worse distribution. Permutation stability must be re-measured
+whenever the model changes.
+
+### Model selection
+
+**Lead candidate: `llama3.1:8b`.** It is the only model tested that survives
+all three Phase 0 screens — acceptable latency, a confidence signal that
+separates right from wrong, and stability under letter permutation.
+
+| Model | Latency (2000-char body) | Calibration gap | Permutation stability |
+|---|---|---|---|
+| `qwen2.5:3b` | 4.3s | 0.000 (saturated at 1.00) | 5/11 |
+| `llama3.2:3b` | 4.2s | 0.332 | 5/11 |
+| `llama3.1:8b` | 9.9s | 0.209 | **9/11** |
+
+`qwen2.5:3b` is rejected outright: besides the saturated distribution, it
+classified an energy bill reading "payment due 15 October" as `Receipts` with
+`p(To-Action) = 0.000` — a false negative on the one category that matters,
+with no probability mass left for the asymmetric rule to catch it.
+
+This is a **lead candidate, not a settled decision.** It rests on eleven
+synthetic emails, and the ranking changed twice as each new screen was added
+(speed, then calibration, then robustness). Phase 2 decides it against 150–200
+real hand-labeled messages, and must re-measure all three properties rather
+than inheriting these numbers.
 
 ### Error handling
 
@@ -219,6 +307,10 @@ Additional rules:
 - Retry a failing message a few times (small delay between attempts) before
   giving up and moving on to the next one.
 - A single message's failure must never halt a poll cycle or a backfill run.
+- **Auth failure is the exception to that rule.** An expired refresh token
+  (`invalid_grant`) is not a per-message problem and retrying it accomplishes
+  nothing — every subsequent message will fail identically. It halts the run,
+  sets `needs_auth`, and surfaces in the webapp. See Authentication & re-auth.
 - Log failures to stdout and to the classification log.
 
 **Poison-pill handling.** "Never mark a failure as Processed" means a message
@@ -260,18 +352,45 @@ to retrieve.
 ### Classification log (JSONL)
 
 Every classification attempt appends one JSON object to a local `.jsonl`
-file: timestamp, message id, sender, subject, source (`model` /
-`prefilter` / `correction`), predicted category, confidence, reasoning,
-action taken (labels added/removed, or `dry_run`), and any error.
+file.
+
+**Guiding principle: record the decision's inputs *and* its parameters.** A
+row should carry enough to (a) recompute why a message was labelled the way
+it was, and (b) segment any metric by anything that was tuned. Anything
+tunable that isn't logged becomes a variable you cannot control for later —
+if the model changes mid-backfill and the rows don't say which produced them,
+the Metrics view silently averages across two models.
+
+| Field | Why |
+|---|---|
+| `timestamp` | ordering, rotation |
+| `message_id` | join back to Gmail; dedup |
+| `sender`, `subject` | human-readable identification when reviewing |
+| `source` | `model` / `prefilter` / `correction` — prefilter hits never reach the model, corrections come from reconciliation |
+| `category` | the argmax |
+| `confidence` | the winning probability |
+| `distribution` | **all six probabilities.** The runner-up drives the asymmetric `To-Action` rule, and a saturated distribution is only visible here |
+| `model` | which Ollama model produced the row |
+| `prompt_version` | bump on every prompt or category-definition edit |
+| `body_chars` | truncation length actually used |
+| `confidence_threshold`, `to_action_floor` | the thresholds in force, so a past decision can be recomputed |
+| `action` | labels added/removed, or `dry_run` |
+| `error` | failure reason, `null` on success |
+| `note` | e.g. a category letter falling outside the returned top-20 |
+
+`model`, `prompt_version` and `body_chars` are the three tuning knobs Phase 2
+iterates on. Without them in the row, a mixed log cannot be segmented and the
+eval numbers become uninterpretable the first time something changes
+mid-run.
 
 This is **not** a database and doesn't undermine the no-DB decision below —
-it's an append-only file with no schema, no migrations, and no queries beyond
-"read it all and aggregate", which is trivial at this volume. It exists
-because three things in this design are impossible without it:
+it's an append-only file with no migrations and no queries beyond "read it
+all and aggregate", which is trivial at this volume. It exists because three
+things in this design are impossible without it:
 
-- **Threshold tuning.** Gmail labels don't retain confidence or reasoning, so
-  once a label is applied the evidence is gone. Nothing can be tuned from
-  label counts alone.
+- **Threshold tuning.** Gmail labels retain none of the distribution, so once
+  a label is applied the evidence is gone. Nothing can be tuned from label
+  counts alone.
 - **Dry-run inspection.** A dry run writes no labels by definition, so the
   log is the *only* record a dry run produces.
 - **The correction corpus.** See reconciliation above.
@@ -302,6 +421,13 @@ regression check that makes it safe to change the prompt or swap the model
 later. It also de-risks the first backfill more than dry-run alone does.
 
 ### Backfill (existing mail)
+
+> **The volume figures in this section are wrong.** The real backlog is
+> **18,668** messages, not ~3000, and it is concentrated in the last three
+> years rather than spread thin. Measured against the live mailbox and
+> recorded in `docs/BACKLOG.md`, along with body-length and sender-
+> concentration data and three unchosen strategies. Nothing here has been
+> revised yet — read that document before building this.
 
 - Triggered manually via a **"Run Backfill" button** in the webapp — not
   automatic, not on first run.
@@ -370,9 +496,10 @@ A deliberate simplification — state Gmail already tracks for free doesn't
 need duplicating locally, and there's no join, no transaction, and no
 concurrent writer to justify a schema.
 
-What *is* kept locally is the append-only classification log, because Gmail
-labels don't retain confidence or reasoning and that evidence is needed for
-tuning. A JSONL file is the smallest thing that solves that. The point at
+What *is* kept locally is the append-only classification log, because a Gmail
+label records only the winning category — not the probability distribution
+behind it, nor which model, prompt version or thresholds produced it, all of
+which are needed for tuning. A JSONL file is the smallest thing that solves that. The point at
 which it stops being enough — when the correction corpus needs similarity
 search rather than sequential scanning — is exactly the point where the
 vector store in Future Enhancements arrives.
@@ -385,6 +512,10 @@ vector store in Future Enhancements arrives.
 - **Does not auto-start the live poller.** The loop only activates on "Start"
   in the webapp — explicit control over when something with write access to
   the inbox is running. "Stop" halts it; closing the laptop halts it too.
+- **Start validates credentials before doing anything else.** If the refresh
+  token is dead, Start does not launch a poller that will fail on every
+  cycle — it returns `needs_auth` and the UI sends me straight into the
+  consent flow.
 - **Config / Settings view**, backed by a config file:
   - Poll interval (default: 1 minute)
   - Confidence threshold (default: 0.8)
@@ -400,8 +531,42 @@ vector store in Future Enhancements arrives.
 - **Run Backfill** button with progress display, locked out while the poller
   runs (see Concurrency).
 - **Status view:** agent running or not, last poll time, recent actions,
-  current `Agent/Error` count.
+  current `Agent/Error` count, Gmail connection state and days until token
+  expiry.
 - **Metrics view** (below).
+
+### Authentication & re-auth
+
+The OAuth flow lives in the webapp as ordinary routes, which is why the
+client is registered as a **Web application** rather than a Desktop app. The
+installed-app helper (`run_local_server()`) blocks, starts a second web
+server of its own, and shells out to a browser — all awkward inside a FastAPI
+request handler, and a poor fit for something that now runs weekly rather
+than once.
+
+- `GET /auth/start` — builds the Google consent URL and redirects to it
+- `GET /auth/callback` — receives the code, exchanges it for tokens, writes
+  them to `data/`, records the consent timestamp, redirects to the dashboard
+
+Re-auth is therefore an ordinary web login: click, approve at Google, land
+back on the dashboard connected. First-time setup and weekly re-auth are the
+**same code path**, so there's no separate CLI bootstrap script to maintain.
+
+Four behaviours make the expiry non-silent:
+
+1. **Start gate** — Start checks credential validity first and returns
+   `needs_auth` instead of launching a doomed poller.
+2. **Reconnect Gmail button** — always present in the status view, for
+   fixing it before it bites.
+3. **Proactive warning** — the consent timestamp is recorded at
+   `/auth/callback`, and since the window is a known 7 days the dashboard
+   shows "Gmail access expires tomorrow — reconnect" from day 6. Turns a
+   weekly surprise into a warning.
+4. **Reactive catch** — a mid-cycle `invalid_grant` stops the poller, sets
+   `needs_auth`, and logs it, rather than retrying every minute for a day.
+
+The 7-day figure is an assumption to confirm empirically, since the
+proactive warning depends on it.
 
 ### Metrics view
 
@@ -413,12 +578,21 @@ log). No database.
 - Recall on `To-Action`, called out separately as the headline number
 - The calibration table (confidence bucket → measured accuracy), which is
   what makes the 0.8 threshold defensible or exposes it as noise
+- **Calibration gap** — mean confidence when right minus when wrong. A gap
+  near zero means the confidence carries no information, whatever the
+  accuracy says. This is the number that killed self-reported confidence in
+  Phase 0 and it stays a first-class metric.
+- **Permutation stability** — the fraction of eval messages whose predicted
+  category is unchanged under a different letter→category mapping. Guards
+  against the distribution being an artifact of label position rather than
+  content.
 
 **From the live log — what is it actually doing?**
 - Volume per category over time; % of messages hitting Needs-Review;
   failure and `Agent/Error` counts
-- Recent classifications with reasoning and confidence shown — this is also
-  what makes a dry run inspectable
+- Recent classifications with the full six-way probability distribution
+  shown, not just the winning score — this is also what makes a dry run
+  inspectable, and the runner-up is often the interesting part
 
 **The improvement surface — what should I fix next?**
 - The list of corrections from reconciliation: what the model predicted, at
@@ -445,8 +619,10 @@ Not built preemptively.
 ## Technical Stack
 
 - **Backend:** Python, FastAPI
-- **Gmail access:** `google-api-python-client` + OAuth (installed-app flow,
-  `gmail.modify` scope — required for label changes)
+- **Gmail access:** `google-api-python-client` + OAuth. **Web application**
+  client type — *not* Desktop/installed-app — with redirect URI
+  `http://localhost:8000/auth/callback` (Google permits plain HTTP for
+  localhost). `gmail.modify` scope, required for label changes.
 - **LLM inference:** Ollama, local model (assumption: `llama3.1:8b` or
   `qwen2.5:7b-instruct` — confirm once hardware is tested), called with
   schema-constrained structured output
@@ -459,15 +635,32 @@ Not built preemptively.
 - **Process lifecycle:** OS login item for the FastAPI server; in-app
   Start/Stop for the poll loop
 
-### OAuth gotcha — token expiry
+### OAuth: staying in Testing, and what that costs
 
-A Google Cloud project whose OAuth consent screen is left in **Testing**
-status issues refresh tokens that expire after **7 days**. The agent would
-silently stop working roughly weekly, and the symptom (an auth error deep in
-a background loop) looks nothing like the cause. Verify this before building
-anything else. The standard fix for a personal-use app is to publish the
-consent screen to Production and accept the one-time "unverified app" warning
-during the OAuth flow; refresh tokens then persist.
+A Google Cloud project whose consent screen is left in **Testing** status
+issues refresh tokens that expire after **7 days**. Publishing to Production
+removes that, but publishing demands full branding — logo, app domain,
+privacy policy, terms of service — and, for Gmail's restricted scopes, likely
+verification. None of that is worth doing for a single-user personal tool.
+
+**Decision: stay in Testing and accept weekly re-authentication.** I'm the
+only test user; the cost is one browser round-trip a week.
+
+The danger isn't the re-auth itself, it's that the default failure mode is
+*silent*: the token dies, the poller starts erroring inside a background
+loop, and nothing surfaces until mail visibly piles up. So the expiry is
+handled as a first-class application state rather than an error — see
+**Authentication & re-auth** under Webapp & control flow.
+
+Two tokens are involved and only one is a problem:
+- **Access token** (~1 hour) — refreshed silently by `google-auth` on every
+  call. Never visible.
+- **Refresh token** (7 days in Testing) — cannot be renewed programmatically.
+  Re-consent requires a human in a browser, so genuinely automatic recovery
+  is impossible. Automatic *detection* plus one-click repair is the goal.
+
+Expect the "unverified app" warning on **every** re-consent, not just the
+first (Advanced → Go to email-agent). Unavoidable in Testing.
 
 ### Secrets & config hygiene
 
@@ -494,7 +687,8 @@ email-agent/
     agent.py            # poll loop, classify_and_label(), reconcile step
     rules.py            # pure decision logic: (category, confidence) -> labels
     classifier.py       # Ollama calls, prompt templates, category defs
-    gmail_client.py     # OAuth, label ops, message fetching, batchModify
+    auth.py             # OAuth routes, token storage, credential validation
+    gmail_client.py     # label ops, message fetching, batchModify
     prefilter.py        # sender-domain allowlist matching
     logbook.py          # append/read the JSONL classification log
     config.py           # load/save config, defaults, in-memory state
@@ -506,12 +700,14 @@ email-agent/
     run_eval.py         # score current model+prompt; accuracy, confusion, calibration
   scripts/
     setup_labels.py     # idempotent label creation (check-then-create)
-    oauth_setup.py      # initial OAuth flow
+    spike_ollama.py     # Phase 0: latency, schema compliance, confidence method
+    spike_labels.py     # Phase 0: label-position bias, temperature
     undo_run.py         # strip Agent/ labels, restore INBOX — time-window REQUIRED
   data/                 # config.json, oauth token, classifications.jsonl — gitignored
   tests/
   docs/
     PLAN.md             # phased build order and gates
+    BACKLOG.md          # mailbox survey: real volume, ages, body lengths
   config.example.json
   pyproject.toml
   DESIGN.md
@@ -544,11 +740,17 @@ correctness, the **eval set** covers model quality. They're different
 questions and shouldn't be conflated.
 
 **Worth testing:**
-- Label decision logic in `rules.py`: given a category + confidence, which
-  labels get applied and is `INBOX` removed? (Pure function, test it
-  thoroughly.)
-- Classifier output parsing: valid JSON, malformed JSON, missing fields,
-  invalid category names, confidence at/above/below threshold
+- Label decision logic in `rules.py`: given a distribution + thresholds,
+  which labels get applied and is `INBOX` removed? Includes the asymmetric
+  `p(To-Action)` rule firing even when the argmax is a different category.
+  (Pure function, test it thoroughly.)
+- Distribution renormalisation: letters outside the top-20 treated as zero,
+  normalisation summing to 1, argmax selection, and the case where no valid
+  category letter appears at all. Also pure, also worth testing thoroughly.
+- Classifier output parsing: missing `logprobs` in the response, an empty
+  top-20, whitespace-prefixed token variants (`"A"` vs `" A"`), confidence
+  at/above/below threshold. Assert approximate equality on probabilities —
+  repeated calls vary in the fourth decimal.
 - Pre-filter matching: domain allowlist hits and misses
 - Dry-run mode: asserts that **no write calls** are made — the most valuable
   single test here, given the blast radius of a bad backfill
@@ -567,13 +769,15 @@ the eval set rather than asserted in tests.
 ## Future Enhancements (out of scope for v1)
 
 ### Classifier quality
-- **Asymmetric confidence thresholds** — the action space is binary (see
-  taxonomy), so the thresholds shouldn't be symmetric. A low-confidence
-  Receipts/Bookings coin-flip should just pick one and archive; anything
-  where `To-Action` is a plausible runner-up should keep `INBOX` regardless
-  of the top-line confidence. Cut from v1 because tuning an asymmetric rule
-  without calibration data is guesswork — this is the first thing to build
-  once the eval set has produced a calibration table.
+- **Permutation averaging** — classify each message under two or three
+  letter→category mappings and average the distributions, cancelling out
+  label-position bias. Measured as unnecessary for the chosen model in Phase
+  0 (9/11 stable) and it costs a multiple of the latency, but it is the
+  mitigation to reach for if a future model shows bias.
+- **Semantic labels instead of letters** — possibly better grounded than
+  arbitrary letters, but multi-token first tokens and prefix collisions
+  (`Receipts`/`Reminders`) make the distribution hard to read. Only worth
+  revisiting if letters prove to be the accuracy bottleneck.
 - **Claude API fallback** — a second-tier check for low-confidence emails
   before giving up to Needs-Review (Ollama → Claude → Needs-Review). Cut from
   v1 to keep the escalation path simple to reason about first.
@@ -636,17 +840,22 @@ building later for the reasons given.
 
 ## Open Assumptions to Confirm During Build
 
-- Exact Ollama model choice — pick based on what runs comfortably on
-  available hardware, then compare candidates against the eval set rather
-  than by feel.
+- **Final model choice.** `llama3.1:8b` leads on eleven synthetic emails,
+  but the ranking changed twice during Phase 0 as new screens were added.
+  Phase 2 re-measures latency, calibration gap and permutation stability
+  against real hand-labeled mail and decides.
+- **Where the confidence threshold actually belongs.** 0.8 is a starting
+  value, not a measured one. The calibration table sets it. So does the
+  `p(To-Action)` floor, provisionally 0.15.
 - Prompt input fields and body truncation length — tuned against the eval
   set, with the body budget prioritised for `To-Action` signal.
 - Initial seed list for the Promotions sender allowlist.
-- **Whether self-reported model confidence is calibrated well enough for the
-  0.8 threshold to be meaningful.** Settled by the calibration table from the
-  eval set, *not* by how full Needs-Review looks — a near-empty Needs-Review
-  is equally consistent with "working well" and "confidence signal is dead".
-- Real backfill volume once sent/drafts/chats are excluded (~3000 is a
-  pre-exclusion guess).
-- Whether the OAuth consent screen needs publishing to Production to avoid
-  7-day refresh token expiry — verify early.
+- **Whether `Personal` holds up on real mail.** It classified cleanly on
+  three synthetic examples, but real human correspondence is far more varied
+  than a note from a friend — forwarded threads, mailing lists, and
+  recruiters all blur the line with `Updates`.
+- ~~Real backfill volume once sent/drafts/chats are excluded.~~
+  *Measured: 18,668. See `docs/BACKLOG.md`. The backfill section has not yet
+  been revised to match.*
+- **Exact refresh-token lifetime in Testing status** — assumed 7 days.
+  Confirm empirically, since the proactive expiry warning is timed off it.

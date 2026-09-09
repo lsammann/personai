@@ -1,0 +1,8 @@
+{
+  "poll_interval_seconds": 60,
+  "confidence_threshold": 0.8,
+  "to_action_floor": 0.15,
+  "ollama_model": "llama3.1:8b",
+  "dry_run": true,
+  "max_failures_before_error": 3
+}
