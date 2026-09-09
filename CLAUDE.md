@@ -3,7 +3,7 @@
 Personal Gmail classification agent. Read `DESIGN.md` for what and why,
 `docs/PLAN.md` for build order and phase gates.
 
-**Current phase: 1 (pure core).** This is the single source of truth for
+**Current phase: 2 (eval harness).** This is the single source of truth for
 where the project is - `docs/PLAN.md` describes the phases and records what
 each one found, but never claims which is current.
 
