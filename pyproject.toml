@@ -34,6 +34,12 @@ packages = ["app"]
 
 [tool.ruff]
 line-length = 88
+# extend-exclude, not exclude: plain `exclude` REPLACES ruff's built-in
+# defaults (.venv, __pycache__, .git ...), which we still want.
+# Only the Phase 0 spikes are exempt - throwaway measurement code nobody will
+# change, where a linter reporting 27 errors just gets ignored. Anything else
+# in scripts/ is a tool that gets re-run and is held to the same standard.
+extend-exclude = ["scripts/spike_*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -53,16 +53,25 @@ worth nothing here.
   See DESIGN.md → Classification logic before changing this.
 - **Failure ≠ low confidence.** A failure applies *no* labels (not even
   `Agent/Processed`) so the message retries. Low confidence applies
-  `Agent/Needs-Review` + `Agent/Processed`. Never collapse these.
+  `Agent/Needs Review` + `Agent/Processed`. Never collapse these.
+- **Three mutually exclusive mailbox states**: `Agent/Processed`,
+  `Agent/Error`, or neither. A dead-lettered message gets `Agent/Error`
+  *alone* — never alongside `Agent/Processed` — and keeps `INBOX`. Every
+  queue query excludes both, built from `STOP_LABELS` in `app/categories.py`
+  rather than retyped. `undo_run.py` must sweep both.
 - **Don't build anything from Future Enhancements.** If it gets tempting,
   write it down there and move on.
 
 ## Conventions
 
 - `uv` for dependencies (`uv add`, `uv run`), `pytest` for tests
-- Label names use **hyphens**: `Agent/To-Action`, not `Agent/To Action`
-- `app/rules.py` stays pure — no network, no I/O. It's the most-tested file
-  in the project and that only holds if it stays isolated.
+- Label names use **spaces** — `Agent/To Action`, not `Agent/To-Action`.
+  Every Gmail query is built through `categories.label_term()`, which
+  quotes, so a label name never has to be formatted into a query string at
+  a call site.
+- `app/decision.py` stays pure — no network, no I/O. It's the most-tested
+  file in the project and that only holds if it stays isolated; a test parses
+  its imports and fails if anything else creeps in.
 - `app/classifier.py` separates the pure part — turning a raw top-20 logprob
   list into a normalised distribution over the six categories — from the
   Ollama call, which is mocked in tests

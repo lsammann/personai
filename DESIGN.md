@@ -49,32 +49,60 @@ easy querying:
 
 | Label | Definition | Keeps `INBOX`? | Model can output? |
 |---|---|---|---|
-| `Agent/To-Action` | Requires a decision, payment, reply, or click from me — especially anything with a deadline | Yes | Yes |
+| `Agent/To Action` | Requires a decision, payment, reply, or click from me — especially anything with a deadline | Yes | Yes |
 | `Agent/Receipts` | A transaction already completed; record-keeping only, no action needed | No | Yes |
 | `Agent/Bookings` | Confirmation of something scheduled/reserved (appointment, flight, reservation); reference only | No | Yes |
 | `Agent/Updates` | Low-priority informational content, no action ever needed (newsletters, LinkedIn digests) | No | Yes |
 | `Agent/Promotions` | Marketing/sales content trying to get me to buy something | No | Yes |
 | `Agent/Personal` | Written by a real person directly to me, not automated or bulk mail | Yes | Yes |
-| `Agent/Needs-Review` | Classifier confidence below threshold; holding label until I manually re-file it | Yes | No — applied by the app |
-| `Agent/Processed` | Marker applied alongside every category label; the sole dedup mechanism | N/A (never affects inbox state) | No — applied by the app |
+| `Agent/Needs Review` | Classifier confidence below threshold; holding label until I manually re-file it | Yes | No — applied by the app |
+| `Agent/Processed` | Marker applied alongside every category label; means "successfully classified, never look again" | N/A (never affects inbox state) | No — applied by the app |
+| `Agent/Error` | The system gave up on this message after repeated failures. Should always be empty | Yes | No — applied by the app |
 
-`Agent/Needs-Review` is not a "real" category — it should be empty most of
+**Three mutually exclusive mailbox states.** `Agent/Processed` and
+`Agent/Error` are the two labels that take a message out of the work queue,
+and a message carries at most one of them: `Processed` (classified),
+`Error` (gave up), or neither (unprocessed, will be retried). They are kept
+separate rather than layering `Error` on top of `Processed` for three
+reasons: requeuing a message after the underlying bug is fixed means removing
+one label instead of two — and under the layered scheme, stripping only
+`Agent/Error` would leave it silently invisible forever; the exclusivity is an
+invariant a test can assert, where an implication is not; and `Processed`
+keeps meaning exactly one thing, so dead-lettered mail does not inflate the
+processed count in the Metrics view. The cost is that every queue query must
+exclude both, which is why they live in a single `STOP_LABELS` constant in
+`app/categories.py` rather than being retyped at each call site.
+
+`Agent/Needs Review` is not a "real" category — it should be empty most of
 the time. Every manual re-file out of it is a labeled example, captured by
 the classification log (below) for future retrieval-augmented
 classification.
 
-**Label naming decision: hyphens, not spaces.** Gmail search syntax doesn't
-accept unquoted spaces, so space-separated label names require
-`label:"Agent/To Action"` everywhere, and a single missing pair of quotes is
-a silent bug that returns wrong results rather than an error. Hyphenated
-names query cleanly as `label:Agent/To-Action`. Decided once here; the
-display cost is trivial.
+**Label naming: spaces, and every query is quoted.** Labels are read in the
+Gmail sidebar every day, so they are named the way they should read —
+`Agent/To Action`, not `Agent/To-Action`. Two of the nine are multi-word; the
+rest are single words and the question does not arise.
+
+The obvious objection is that an unquoted space would split a search term. In
+practice it does not: Gmail's `label:` operator resolves a multi-word label
+name by longest match, verified against this mailbox — `label:Europe Planning`
+returns exactly the label's 52 messages, `-label:Europe Planning` returns
+exactly the complement, and reversing the words to `label:Planning Europe`
+returns nothing, which is what proves the trailing word is being matched as
+part of the name rather than as free text. Hyphens also work as substitutes for
+spaces, so `label:Agent/To-Action` finds `Agent/To Action` anyway.
+
+Regardless, **every query the app builds is quoted**, via `label_term()` in
+`app/categories.py`. That is what keeps the naming a purely cosmetic decision:
+a quoted term is unambiguous whatever the name contains, so no query in the
+project has to know how a label is spelled. Nothing formats a label into a
+query string at the call site.
 
 **The action space is nearly binary, and that matters.** Four of the six
 real categories (`Receipts`, `Bookings`, `Updates`, `Promotions`) produce
-identical behaviour: label it, remove `INBOX`. `To-Action` and `Personal`
+identical behaviour: label it, remove `INBOX`. `To Action` and `Personal`
 both keep it. So a Receipts↔Bookings confusion costs nothing, and so does a
-To-Action↔Personal one — while a `To-Action` false negative means a missed
+To Action↔Personal one — while a `To Action` false negative means a missed
 bill. The categories exist for retrieval and tidiness; the only decision with
 consequences is *does this need to stay visible*. This asymmetry drives the
 evaluation strategy and the asymmetric threshold rule below.
@@ -84,10 +112,10 @@ machine-generated mail — receipts, confirmations, newsletters, marketing,
 bills. Human correspondence fits none of them, and forcing a choice among
 five wrong options produces an arbitrary answer with arbitrary confidence.
 The original plan was to let the confidence floor catch personal mail and
-route it to `Needs-Review`, but Phase 0 measured that failing: on a two-line
+route it to `Needs Review`, but Phase 0 measured that failing: on a two-line
 note from a friend, `qwen2.5:3b` returned `Updates` at **0.953** confidence.
 It would have been silently archived. `Personal` keeps `INBOX`, so a
-misfiling between it and `To-Action` is operationally harmless — no attempt
+misfiling between it and `To Action` is operationally harmless — no attempt
 is made to split personal mail into actionable and not.
 
 ### Scope of processing
@@ -97,7 +125,8 @@ is made to split personal mail into actionable and not.
   entirely, so real actionable mail can hide there unseen — the agent should
   catch it.
 - Query for unprocessed mail:
-  `in:inbox -label:Agent/Processed -in:sent -in:drafts -in:chats`
+  `in:inbox -label:"Agent/Processed" -label:"Agent/Error" -in:sent -in:drafts -in:chats`
+  — the two exclusion labels come from `STOP_LABELS`, never retyped.
 - The sent/drafts/chats exclusions matter more for backfill than for the live
   poller, but they're applied in both for consistency — see Backfill.
 - **Per-message, not per-thread.** Each message is classified independently.
@@ -112,10 +141,10 @@ is made to split personal mail into actionable and not.
 
 For every successfully classified message, the agent applies, **in a single
 `messages.modify` call**:
-- `addLabelIds`: the chosen category label (or `Agent/Needs-Review`), plus
+- `addLabelIds`: the chosen category label (or `Agent/Needs Review`), plus
   `Agent/Processed`
-- `removeLabelIds`: `INBOX` — except for `Agent/To-Action` and
-  `Agent/Needs-Review`, which retain it
+- `removeLabelIds`: `INBOX` — except for `Agent/To Action` and
+  `Agent/Needs Review`, which retain it
 
 **One atomic call, not three sequential ones.** Gmail's `messages.modify`
 accepts adds and removes together. Splitting this into separate calls means a
@@ -125,7 +154,7 @@ run and can leave it carrying two different category labels.
 
 Removing `INBOX` is the agent's most consequential write action and the
 mechanism behind the end-state goal: **the inbox only ever contains
-`Agent/To-Action` and `Agent/Needs-Review` items.**
+`Agent/To Action` and `Agent/Needs Review` items.**
 
 ### Dry-run mode
 
@@ -142,10 +171,18 @@ Because dry runs write to the log, the Metrics view works normally during a
 dry run. This is the whole point — a dry run whose output vanishes to stdout
 is much less useful than one you can query afterwards.
 
-**Undo path:** because every agent-touched message carries `Agent/Processed`,
-a bad run is recoverable — a script can query `label:Agent/Processed`, strip
-all `Agent/` labels, and restore `INBOX`. Worth writing this script *before*
-the first live run, not after.
+**Undo path:** every agent-touched message carries `Agent/Processed` *or*
+`Agent/Error`, so a bad run is recoverable — a script can query
+`{label:"Agent/Processed" label:"Agent/Error"}`, strip all `Agent/` labels, and
+restore `INBOX`. Worth writing this script *before* the first live run, not
+after.
+
+**Both labels, not just `Processed`.** This is the one real cost of the
+three-state design above: an undo that sweeps only `label:"Agent/Processed"`
+is incomplete. The consequence is mild — an `Agent/Error` message was never
+archived and carries no category, so a missed one leaves a stray label on
+mail still sitting in the inbox — but `undo_run.py` is the safety net for the
+entire write path, so it is called out here and in the Phase 3 checklist.
 
 **`undo_run.py` must be time-scoped.** An unscoped undo run, executed after
 several good weeks, would dump thousands of correctly-archived emails back
@@ -161,7 +198,7 @@ id isn't possible without a DB; bounding by time is, and is sufficient.
 - Anything not matched goes to the classifier with the five real categories
   as options.
 - The allowlist starts short and manually seeded, growing as I notice repeat
-  senders that keep landing in Needs-Review or get misclassified.
+  senders that keep landing in Needs Review or get misclassified.
 - Pre-filter hits are written to the classification log the same as model
   results, tagged with their source, so metrics account for them.
 
@@ -195,20 +232,31 @@ spikes and their findings are recorded in `docs/PLAN.md`.
 - **Category precedence rule, stated explicitly in the prompt.** Several
   emails legitimately belong to two categories — a flight receipt is both a
   Receipt and a Booking; a sale email from a shop I use is both Promotions
-  and Updates. Without a tiebreak the model dithers and floods Needs-Review
+  and Updates. Without a tiebreak the model dithers and floods Needs Review
   with items where *either answer was fine*. The prompt states a fixed
   precedence: anything written by a real human is `Personal`; otherwise
-  `To-Action` beats everything; then `Bookings` over `Receipts`; then
+  `To Action` beats everything; then `Bookings` over `Receipts`; then
   `Promotions` over `Updates`.
-- **Confidence threshold starts at 0.8.** Below this → `Agent/Needs-Review`
+- **Confidence threshold starts at 0.8.** Below this → `Agent/Needs Review`
   instead of the argmax category. Config value, not hardcoded, and expected
   to move once the eval set produces a calibration table.
-- **Asymmetric rule for `To-Action`.** Independently of the argmax, if
-  `p(To-Action)` exceeds a second, much lower threshold (starting at 0.15),
+- **Asymmetric rule for `To Action`.** Independently of the argmax, if
+  `p(To Action)` exceeds a second, much lower threshold (starting at 0.15),
   `INBOX` is retained. This is nearly free now that the full distribution is
   available, and it protects the only error class that costs anything: a
   missed bill. A Receipts/Bookings coin-flip still just picks one and
   archives, because both outcomes are identical in behaviour.
+- **The two thresholds are coupled: `confidence_threshold + to_action_floor`
+  must be below 1.** The rule needs one category above the threshold and
+  `To Action` above the floor *in the same distribution*, and a distribution
+  sums to 1 — so if the two thresholds sum to 1 or more, no message can satisfy
+  both and the rule is unreachable. At 0.8 and 0.15 the firing window is
+  `p(argmax) ∈ [0.80, 0.85]` and `p(To Action) ∈ [0.15, 0.20]`, with the other
+  four categories holding 0.05 between them: a near two-horse race, which is
+  the bill-versus-receipt shape the rule is aimed at. Raising the threshold to
+  0.9 without lowering the floor deletes the rule, and would do so silently —
+  mail keeps flowing and `Needs Review` keeps working. `Config` rejects such a
+  pair outright rather than letting it start.
 - **Fixed letter mapping, not randomised.** See the label-bias note below.
 - **Temperature does not affect reported logprobs** on this stack — measured
   identical to three decimal places at 0.5, 1.0 and 2.0. Pinned at `1.0`
@@ -217,13 +265,13 @@ spikes and their findings are recorded in `docs/PLAN.md`.
   reproducible to about three decimals, not exactly — do not assert exact
   equality in tests.
 - **No second-model fallback in v1.** Low confidence goes straight to
-  Needs-Review rather than escalating to a stronger model. A deliberate cut.
+  Needs Review rather than escalating to a stronger model. A deliberate cut.
 - **Input consistency is a hard requirement.** The poller and the backfill
   must build the model's input from the same fields, fetched the same way —
   see Backfill for why.
 - **Prompt input fields** (sender, subject, body truncation length) are tuned
   during build against the eval set rather than guessed here. The one
-  constraint set in advance: the body budget is spent on `To-Action` signal.
+  constraint set in advance: the body budget is spent on `To Action` signal.
   A bill's due date is routinely below the snippet cutoff, and that is the
   one category where being wrong actually costs something. Phase 0 measured
   the cost of body text at roughly +74% latency on the 8B going from 300 to
@@ -280,7 +328,7 @@ separates right from wrong, and stability under letter permutation.
 
 `qwen2.5:3b` is rejected outright: besides the saturated distribution, it
 classified an energy bill reading "payment due 15 October" as `Receipts` with
-`p(To-Action) = 0.000` — a false negative on the one category that matters,
+`p(To Action) = 0.000` — a false negative on the one category that matters,
 with no probability mass left for the asymmetric rule to catch it.
 
 This is a **lead candidate, not a settled decision.** It rests on eleven
@@ -294,7 +342,7 @@ than inheriting these numbers.
 Critical distinction: **a failure is not a low-confidence result.**
 
 - **Low confidence** = a successful classification the model is unsure about
-  → `Agent/Needs-Review` + `Agent/Processed`, keeps `INBOX`. Resolved by me.
+  → `Agent/Needs Review` + `Agent/Processed`, keeps `INBOX`. Resolved by me.
 - **Failure** = Ollama unreachable, malformed JSON, invalid category name,
   or a Gmail API error → **apply no labels at all**, including *not*
   `Agent/Processed`. The message stays invisible to the system and is
@@ -313,31 +361,38 @@ Additional rules:
   sets `needs_auth`, and surfaces in the webapp. See Authentication & re-auth.
 - Log failures to stdout and to the classification log.
 
-**Poison-pill handling.** "Never mark a failure as Processed" means a message
+**Dead-lettering a message that never succeeds.** This is the poison-message
+problem from queue systems, in Gmail labels: because a failure applies no
+labels at all, "never mark a failure as Processed" means a message
 that *reliably* breaks the classifier — pathological encoding, an oversized
 body, a prompt the model always fails on — is retried on every poll cycle
 forever, and guarantees a backfill can never reach 3000/3000. After a
 configurable number of cumulative failures (tracked in the classification
-log, keyed by message id), the message gets a dedicated `Agent/Error` label
-plus `Agent/Processed`, and is skipped from then on. It deliberately does
-*not* go to Needs-Review: Needs-Review means "the model was unsure",
+log, keyed by message id), the message is **dead-lettered**: it gets a
+dedicated `Agent/Error` label — and *only* that label — and is skipped from
+then on. `Agent/Error` is the dead-letter queue, and because Gmail labels
+are the state, it is one you can actually go and read: `label:"Agent/Error"`. `Agent/Error` is the
+stop signal in its own right, per the three mailbox states above; it retains
+`INBOX`, because the system never established what the message is and so
+nothing has earned the right to archive it. It deliberately does
+*not* go to Needs Review: Needs Review means "the model was unsure",
 `Agent/Error` means "the system could not process this", and keeping those
 separate is the whole point of the distinction above. `Agent/Error` is
 surfaced in the webapp and should be empty; anything landing there is a bug
 to investigate, not mail to re-file.
 
-### Needs-Review reconciliation
+### Needs Review reconciliation
 
-When I manually re-file a message out of Needs-Review, nothing tells the
+When I manually re-file a message out of Needs Review, nothing tells the
 system. The message already carries `Agent/Processed`, so the agent never
-looks at it again, and `Agent/Needs-Review` stays on it forever — meaning the
+looks at it again, and `Agent/Needs Review` stays on it forever — meaning the
 review queue only grows and "unresolved" stops meaning anything.
 
 Each poll cycle therefore runs a cheap reconcile step before classification:
 
-- Query `label:Agent/Needs-Review` and find messages that *also* carry a real
+- Query `label:Agent/Needs Review` and find messages that *also* carry a real
   category label
-- Remove `Agent/Needs-Review` from them
+- Remove `Agent/Needs Review` from them
 - Write a **correction record** to the classification log: message id, what
   the model originally predicted (and at what confidence), what I chose
   instead
@@ -369,14 +424,51 @@ the Metrics view silently averages across two models.
 | `source` | `model` / `prefilter` / `correction` — prefilter hits never reach the model, corrections come from reconciliation |
 | `category` | the argmax |
 | `confidence` | the winning probability |
-| `distribution` | **all six probabilities.** The runner-up drives the asymmetric `To-Action` rule, and a saturated distribution is only visible here |
+| `distribution` | **all six probabilities.** The runner-up drives the asymmetric `To Action` rule, and a saturated distribution is only visible here |
+| `retained_mass` | share of the returned top-20 that sat on category letters at all, before renormalising — the only thing separating a confident answer from a barely-engaged one |
 | `model` | which Ollama model produced the row |
 | `prompt_version` | bump on every prompt or category-definition edit |
 | `body_chars` | truncation length actually used |
 | `confidence_threshold`, `to_action_floor` | the thresholds in force, so a past decision can be recomputed |
-| `action` | labels added/removed, or `dry_run` |
+| `action` | labels added and removed — **always populated**, including on a dry run |
+| `dry_run` | whether those labels were actually applied |
+| `run_id` | stamped on every row of one invocation, so runs are separable |
+| `run_kind` | `poll` / `backfill` / `eval` / `manual` — which invocation produced the row |
 | `error` | failure reason, `null` on success |
 | `note` | e.g. a category letter falling outside the returned top-20 |
+
+**`retained_mass` is the counterweight to renormalising.** Confidence is
+computed over the category letters only, which is the right question to ask —
+the model is constrained to emit one letter, so `P(A | answer is a letter)` is
+what a category probability means here, and mass on prose is an
+instruction-following failure rather than category uncertainty. But it means a
+response that put 6% of its mass on letters and 94% on prose reports the same
+confidence as one that put 99% on letters, and would archive mail on that
+basis. Recording the retained mass costs nothing and is unrecoverable
+afterwards. Whether a floor on it should force `Needs Review` is a Phase 2
+question, to be answered from the measured distribution rather than guessed
+now.
+
+**`action` and `dry_run` are two fields because they are two facts.** The
+earlier design defined `action` as "labels added/removed, *or* `dry_run`",
+which destroyed exactly what a dry run exists to show — what it *would* have
+done. Dry-run inspection is one of the three reasons this log exists, so the
+intended label sets are always recorded and `dry_run` says whether they were
+applied.
+
+**`run_id` and `run_kind` keep hand-runs out of the live numbers.** Trying
+the classifier on twenty emails otherwise lands in the same file as real
+traffic and quietly skews metrics like "% hitting Needs Review"; `eval`
+keeps Phase 2's scoring runs out of them entirely. `run_kind` is orthogonal
+to `source`: `source` says where a row's *answer* came from, `run_kind` says
+which invocation produced it. Both are added up front because they are
+uniquely lossy — a field introduced later is absent from every row written
+before it, including the full dry-run backfill most worth segmenting.
+
+*Consequence worth noting:* `run_id` weakens the argument below that
+"bounding by run id isn't possible without a DB", so a run-scoped undo
+becomes possible later. `undo_run.py` keeps its required time window with no
+default regardless.
 
 `model`, `prompt_version` and `body_chars` are the three tuning knobs Phase 2
 iterates on. Without them in the row, a mixed log cannot be segmented and the
@@ -407,7 +499,7 @@ result (message ids and my labels — not message content) as
 
 Outputs:
 - Overall accuracy and a confusion matrix
-- **Recall on `To-Action`** — the metric that actually matters, per the
+- **Recall on `To Action`** — the metric that actually matters, per the
   asymmetry noted in the taxonomy section. Everything else is cosmetic
   filing; a missed bill is not.
 - A **calibration table**: predictions bucketed by reported confidence
@@ -434,7 +526,7 @@ later. It also de-risks the first backfill more than dry-run alone does.
 - **Scope: all mail, not just the inbox.** Archived-but-unprocessed mail is
   included; reprocessing it is acceptable and desirable. Query drops the
   `in:inbox` constraint but keeps the rest:
-  `-label:Agent/Processed -in:sent -in:drafts -in:chats`
+  `-label:"Agent/Processed" -label:"Agent/Error" -in:sent -in:drafts -in:chats`
 - **Excluding sent/drafts/chats is not optional here.** Without `in:inbox`
   narrowing the search, the query otherwise sweeps in my own outgoing mail
   and labels it as `Promotions`. The ~3000 estimate should be re-measured
@@ -488,8 +580,8 @@ ignores a disabled button entirely.
 ### No database in v1
 
 Message state lives entirely in Gmail labels:
-- "Unprocessed" = missing `Agent/Processed`
-- "Unresolved" = has `Agent/Needs-Review`
+- "Unprocessed" = missing both `Agent/Processed` and `Agent/Error`
+- "Unresolved" = has `Agent/Needs Review`
 - "Broken" = has `Agent/Error`
 
 A deliberate simplification — state Gmail already tracks for free doesn't
@@ -575,7 +667,7 @@ log). No database.
 
 **From the eval set — is the classifier any good?**
 - Overall accuracy and confusion matrix
-- Recall on `To-Action`, called out separately as the headline number
+- Recall on `To Action`, called out separately as the headline number
 - The calibration table (confidence bucket → measured accuracy), which is
   what makes the 0.8 threshold defensible or exposes it as noise
 - **Calibration gap** — mean confidence when right minus when wrong. A gap
@@ -588,7 +680,7 @@ log). No database.
   content.
 
 **From the live log — what is it actually doing?**
-- Volume per category over time; % of messages hitting Needs-Review;
+- Volume per category over time; % of messages hitting Needs Review;
   failure and `Agent/Error` counts
 - Recent classifications with the full six-way probability distribution
   shown, not just the winning score — this is also what makes a dry run
@@ -601,17 +693,17 @@ log). No database.
   worth fixing. This list is the v1 tuning worklist and the v2 few-shot
   corpus.
 
-### Handling `To-Action` items day-to-day
+### Handling `To Action` items day-to-day
 
 Once an item is dealt with, remove `INBOX` from it manually (Gmail's archive
-action). The `Agent/To-Action` label persists, so `label:Agent/To-Action`
+action). The `Agent/To Action` label persists, so `label:Agent/To Action`
 remains a full searchable history of everything ever flagged. Pin that label
 in the Gmail sidebar for quick access.
 
 Known limitation: that view mixes still-pending and already-handled items
 with no visual distinction. If that becomes annoying, an `Agent/Actioned`
 label (as a second tag, not a destination) would allow
-`label:Agent/To-Action -label:Agent/Actioned` for outstanding items only.
+`label:"Agent/To Action" -label:"Agent/Actioned"` for outstanding items only.
 Not built preemptively.
 
 ---
@@ -685,7 +777,8 @@ email-agent/
   app/
     main.py             # FastAPI app + routes ONLY — thin, no logic
     agent.py            # poll loop, classify_and_label(), reconcile step
-    rules.py            # pure decision logic: (category, confidence) -> labels
+    decision.py         # pure decision logic: distribution -> labels
+    categories.py       # the six categories, letter mapping, label names
     classifier.py       # Ollama calls, prompt templates, category defs
     auth.py             # OAuth routes, token storage, credential validation
     gmail_client.py     # label ops, message fetching, batchModify
@@ -709,6 +802,7 @@ email-agent/
     PLAN.md             # phased build order and gates
     BACKLOG.md          # mailbox survey: real volume, ages, body lengths
   config.example.json
+  prefilter_domains.json
   pyproject.toml
   DESIGN.md
   README.md
@@ -720,11 +814,20 @@ I can explain all of it:
 - **`agent.py` exists so `main.py` stays thin.** The poll loop and the shared
   `classify_and_label()` need an owner. Without one they drift into
   `main.py`, which becomes the 600-line file that nobody can follow.
-- **`rules.py` exists to keep the decision logic pure.** The
-  category+confidence → labels mapping is the single most testable thing in
+- **`decision.py` exists to keep the decision logic pure.** The
+  distribution → labels mapping is the single most testable thing in
   the project, and it only stays that way if it lives apart from the Ollama
   and Gmail I/O. Putting it inside `classifier.py` next to network calls
   would quietly make it untestable.
+- **It is named for what it holds, not for a pattern.** It was `rules.py`
+  first; "rules" promises a collection of heterogeneous rules, where the
+  file answers one question four ways — given an outcome, which labels? —
+  and returns a `Decision`. Things that are not that shape stay elsewhere:
+  backfill *consumes* decisions, and prefilter matching lives in
+  `prefilter.py` with only its outcome arriving here.
+- **`categories.py` exists so `decision` and `classifier` need not import
+  each other.** It holds the six categories, the letter mapping, the label
+  names and `STOP_LABELS`.
 
 **Label creation must be idempotent** — Gmail errors when creating a label
 that already exists, so `setup_labels.py` checks before creating and is safe
@@ -740,9 +843,9 @@ correctness, the **eval set** covers model quality. They're different
 questions and shouldn't be conflated.
 
 **Worth testing:**
-- Label decision logic in `rules.py`: given a distribution + thresholds,
+- Label decision logic in `decision.py`: given a distribution + thresholds,
   which labels get applied and is `INBOX` removed? Includes the asymmetric
-  `p(To-Action)` rule firing even when the argmax is a different category.
+  `p(To Action)` rule firing even when the argmax is a different category.
   (Pure function, test it thoroughly.)
 - Distribution renormalisation: letters outside the top-20 treated as zero,
   normalisation summing to 1, argmax selection, and the case where no valid
@@ -754,10 +857,11 @@ questions and shouldn't be conflated.
 - Pre-filter matching: domain allowlist hits and misses
 - Dry-run mode: asserts that **no write calls** are made — the most valuable
   single test here, given the blast radius of a bad backfill
-- Reconciliation: a message with both `Needs-Review` and a real category has
-  `Needs-Review` stripped and a correction logged
-- Poison-pill: after N failures, `Agent/Error` + `Agent/Processed` are
-  applied and the message is skipped thereafter
+- Reconciliation: a message with both `Needs Review` and a real category has
+  `Needs Review` stripped and a correction logged
+- Dead-lettering: after N failures, `Agent/Error` alone is applied and the
+  message is skipped thereafter — plus the invariant that no decision ever
+  produces both `Agent/Processed` and `Agent/Error`
 
 **Not worth testing:** the Gmail API client itself, Ollama's behaviour, or
 the frontend. Gmail and Ollama calls get mocked; live behaviour is verified
@@ -779,7 +883,7 @@ the eval set rather than asserted in tests.
   (`Receipts`/`Reminders`) make the distribution hard to read. Only worth
   revisiting if letters prove to be the accuracy bottleneck.
 - **Claude API fallback** — a second-tier check for low-confidence emails
-  before giving up to Needs-Review (Ollama → Claude → Needs-Review). Cut from
+  before giving up to Needs Review (Ollama → Claude → Needs Review). Cut from
   v1 to keep the escalation path simple to reason about first.
 - **Retrieval-augmented few-shot classification** — embed the correction
   records from the classification log into a local vector store (Chroma + an
@@ -831,7 +935,7 @@ building later for the reasons given.
 - **"Chat with your inbox"** — RAG-based search/Q&A over archived mail, built
   on the same vector store as the few-shot system.
 - **`Agent/Actioned` label** — if distinguishing handled from pending
-  `To-Action` items becomes necessary.
+  `To Action` items becomes necessary.
 - **Re-evaluate `Agent/Updates`** — it and `Promotions` produce identical
   behaviour, so if the distinction isn't earning its keep, merging them costs
   nothing operationally.
@@ -846,9 +950,9 @@ building later for the reasons given.
   against real hand-labeled mail and decides.
 - **Where the confidence threshold actually belongs.** 0.8 is a starting
   value, not a measured one. The calibration table sets it. So does the
-  `p(To-Action)` floor, provisionally 0.15.
+  `p(To Action)` floor, provisionally 0.15.
 - Prompt input fields and body truncation length — tuned against the eval
-  set, with the body budget prioritised for `To-Action` signal.
+  set, with the body budget prioritised for `To Action` signal.
 - Initial seed list for the Promotions sender allowlist.
 - **Whether `Personal` holds up on real mail.** It classified cleanly on
   three synthetic examples, but real human correspondence is far more varied

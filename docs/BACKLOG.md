@@ -125,14 +125,14 @@ tally in `data/sender_domains.csv` (gitignored).
 Twenty consecutive recent inbox subjects were **all** promotional or
 notification mail — Depop, Macpac, Live Nation, Vinted, PUMA, Crust Pizza,
 Collingwood FC, Grill'd, Spotify, LinkedIn, Flybuys, Qantas, Kathmandu,
-Skyscanner. Zero `To-Action`, zero `Personal`, zero `Receipts`, zero
+Skyscanner. Zero `To Action`, zero `Personal`, zero `Receipts`, zero
 `Bookings` in that window.
 
 The six categories look adequate; the *distribution* across them is extremely
 lopsided.
 
 Two useful edge cases surfaced immediately:
-- Vinted, *"Review and accept our new T&Cs"* — arguably `To-Action`
+- Vinted, *"Review and accept our new T&Cs"* — arguably `To Action`
 - LinkedIn, *"Bridget Danaher — I want to connect"* — a real human, but an
   automated message, so `Updates` rather than `Personal`
 
@@ -147,7 +147,7 @@ design, so this is roughly five overnight runs. Simple, complete, no new
 concepts. Slow, and much of the work has little value.
 
 **B. Date-scoped LLM pass.** Classify the last 6–12 months, leave older mail
-alone. One to two nights. The argument: `To-Action` is time-sensitive by
+alone. One to two nights. The argument: `To Action` is time-sensitive by
 definition — a bill from 2022 is either paid or already a catastrophe — so
 classification of old mail only buys retrieval-by-category, which for 2021
 promotional mail is worth close to nothing. The cost is that old mail keeps
@@ -178,7 +178,7 @@ Nothing here needs acting on now. It should be read at these points:
 - **Phase 2 — eval sampling.** `PLAN.md` already says to sample deliberately
   rather than take the most recent 200 because they would be "80% promos".
   Confirmed, and probably understated. Random sampling would yield almost no
-  `To-Action` examples, and `To-Action` recall is the headline metric.
+  `To Action` examples, and `To Action` recall is the headline metric.
 - **Phase 2 — truncation tuning.** The body distribution above is the input
   to that decision. 1,500 chars is a placeholder, not a measurement.
 - **Phase 4 — backfill.** `DESIGN.md`'s backfill section assumes ~3,000
