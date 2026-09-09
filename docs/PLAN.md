@@ -97,7 +97,7 @@ on mains power. Earlier estimates of 25–50 hours were wrong by roughly 4×.
 Nothing is eliminated on latency. Even the slowest configuration is a single
 overnight backfill and a ~33-minute eval run, so prompt iteration in Phase 2
 is practical. Body text costs +55% latency on 3B and +74% on 8B — affordable,
-which means the `To-Action` recall argument for feeding in real body content
+which means the `To Action` recall argument for feeding in real body content
 survives.
 
 **Schema-constrained output works exactly as `DESIGN.md` claimed.** 30/30
@@ -152,13 +152,13 @@ network. This is where the "testable pure function" claim in `DESIGN.md` gets
 earned rather than asserted.
 
 **Build:**
-- `app/categories.py` — the six categories, their letter mapping, and the
-  `Agent/` label names. Shared constants, so `rules` and `classifier` do not
-  have to depend on each other.
-- `app/rules.py` — `(distribution, config) -> (labels_to_add,
+- `app/categories.py` — the six categories, their letter mapping, the
+  `Agent/` label names, and `STOP_LABELS`. Shared constants, so `decision` and
+  `classifier` do not have to depend on each other.
+- `app/decision.py` — `(distribution, thresholds) -> (labels_to_add,
   labels_to_remove)`. The whole decision table including the asymmetric
-  `p(To-Action)` rule. No I/O, no network — the most-tested file in the
-  project.
+  `p(To Action)` rule, the prefilter hit, the failure path and the dead
+  letter. No I/O, no network — the most-tested file in the project.
 - `app/config.py` — load/save, defaults, in-memory source of truth *(done in
   Phase 0; auth needed it)*
 - `app/logbook.py` — append/read the JSONL classification log
@@ -170,9 +170,72 @@ earned rather than asserted.
   at all. The impure half is the Ollama HTTP call, mocked in tests.
 - `tests/` covering all of the above
 
+### Findings
+
+**Four design decisions changed during the phase.** All four are now reflected
+in `DESIGN.md`; they are recorded here because the reasoning is the point.
+
+**`Agent/Error` is its own mailbox state, not a decoration on `Processed`.**
+The original scheme applied `Agent/Error` *plus* `Agent/Processed` to a
+dead-lettered message. Replaced with three mutually exclusive states —
+`Processed`, `Error`, or neither. The deciding argument was requeuing: once the
+underlying bug is fixed you want those messages reprocessed, and under the
+layered scheme stripping only `Agent/Error` leaves them silently invisible
+forever, because `Processed` is what the queue actually excludes. Separating
+them also makes the exclusivity an assertable invariant, and stops `Processed`
+meaning two things at once in the metrics. The cost is that dedup now spans two
+labels: mitigated by `STOP_LABELS` in `app/categories.py`, which every queue
+query is built from, and paid for once in `undo_run.py`, which must sweep both.
+
+**`rules.py` became `decision.py`.** "Rules" promises a collection of
+heterogeneous rules; the file answers one question four ways — given an
+outcome, which labels? — and returns a `Decision`. Everything that could
+plausibly land there later is the same shape.
+
+**Token variants are summed, not first-won.** The Phase 0 spike kept the
+highest-ranked token per letter and ignored the rest, so mass split across
+`"A"` and `" A"` was silently discarded. `interpret()` sums every token
+spelling the same letter before renormalising. Phase 1 numbers will therefore
+differ slightly from the Phase 0 spike figures above — the spike understated
+confidence wherever a letter's mass was split.
+
+**The classification log gained `dry_run`, `run_id` and `run_kind`.**
+`DESIGN.md` defined `action` as "labels added/removed, *or* `dry_run`", which
+destroys what a dry run exists to show. `action` is now always populated and
+`dry_run` is a separate boolean. `run_id` / `run_kind` keep a hand-run over
+twenty emails from skewing live metrics; both were added now rather than later
+because a field introduced in a later phase is absent from every row written
+before it.
+
+**A tie-break mechanism was built and then removed under review.** A
+`PRECEDENCE` tuple resolved exact argmax ties using `DESIGN.md`'s prompt
+precedence rule. It could never change a label: if two categories tie at `v`
+they are both the maximum, so the six probabilities sum to at least `2v` and
+therefore `v <= 0.5` — a tie always falls below any threshold above 0.5 and
+goes to `Needs Review`. It affected only the category recorded in the log, and
+the justification written for it (determinism) was already provided free by
+enum declaration order. Removed: `argmax` now iterates `Category`, so
+declaration order *is* the tie-break, documented on the enum. A mechanism that
+cannot change behaviour is the kind of thing that reads as rigour and is not.
+
+**One deviation from this plan's own sketch.** `decide()` takes explicit
+threshold floats rather than a `Config` object, so `decision.py` imports
+nothing but `app.categories` and the standard library, and every test states
+the thresholds it exercises. `agent.py` does the unpack in Phase 3.
+
+**Two bugs the tests caught, both in code written this phase.** `rpartition`
+returns the whole string in its third slot when the separator is absent, so a
+sender with no `@` came back as its own domain; and `LOG_PATH` bound as a
+default argument would have frozen at import, making the suite's redirect into
+`tmp_path` silently ineffective and writing test rows to the real log.
+
+**Result:** 149 tests, `ruff` clean, no new dependencies.
+
 **Gate:** `pytest` passes, and the test suite covers every row of the label
 decision table plus every malformed-input case in `DESIGN.md`'s testing
-section. No mocks needed yet, because there's no I/O to mock.
+section. Only the Ollama call needs a mock; `categories`, `decision`,
+`prefilter` and `logbook` are all reachable without one, which is the point of
+the phase.
 
 **Why here:** it's the cheapest phase, it's completely safe, and it means
 Phase 2's iteration loop is only ever debugging *prompts*, never debugging
@@ -193,10 +256,10 @@ and the single highest-value phase for interview purposes.
 - **Hand-label 150–200 messages.** Sample deliberately across categories
   rather than taking the most recent 200, which would be 80% promos.
   Confirmed and probably understated - twenty consecutive recent inbox
-  subjects contained no To-Action, Personal, Receipts or Bookings at all.
+  subjects contained no To Action, Personal, Receipts or Bookings at all.
   See `docs/BACKLOG.md`.
 - `eval/run_eval.py` — score the current model + prompt against the set.
-  Outputs overall accuracy, confusion matrix, **recall on `To-Action`**, the
+  Outputs overall accuracy, confusion matrix, **recall on `To Action`**, the
   confidence-bucket calibration table, the **calibration gap**, and
   **permutation stability**.
 
@@ -215,20 +278,23 @@ Phase 0 against each other. Every change is scored, not vibed.
 1. Is overall accuracy tolerable? (If the four archive-destined categories
    get confused with each other, that's cosmetic — see the binary action
    space argument in `DESIGN.md`.)
-2. **Is recall on `To-Action` high?** This is the one that matters. A missed
+2. **Is recall on `To Action` high?** This is the one that matters. A missed
    bill is the only error with a real cost.
 3. **Is the calibration gap meaningfully positive?** If mean confidence when
    right is no higher than when wrong, the threshold is decorative,
-   `Needs-Review` will sit empty, and nothing should be allowed to remove
+   `Needs Review` will sit empty, and nothing should be allowed to remove
    `INBOX` until a working signal exists. This is the screen that killed
    self-reported confidence in Phase 0.
 4. **Is permutation stability high?** If the predicted category moves when
    only the letter mapping changes, the distribution is measuring alphabet
    position rather than content. Mitigation is permutation averaging, at a
    multiple of the latency.
-5. **What are the actual threshold values?** 0.8 and a 0.15 `p(To-Action)`
+5. **What are the actual threshold values?** 0.8 and a 0.15 `p(To Action)`
    floor are placeholders. The calibration table replaces them with measured
-   ones, and those go back into `DESIGN.md`.
+   ones, and those go back into `DESIGN.md`. **They are coupled:** the pair
+   must sum to less than 1 or the asymmetric rule becomes unreachable, so
+   raising the confidence threshold means lowering the floor to match.
+   `Config` refuses to start on a pair that breaks this.
 
 **If the gate fails:** stop and fix it here. Everything downstream is
 plumbing around a classifier; plumbing around a bad classifier is wasted
@@ -243,14 +309,26 @@ work, and this is the cheapest possible place to discover it.
 **Build, in this order — the order is the point:**
 1. `scripts/setup_labels.py` — idempotent label creation, all seven labels
    plus `Agent/Error`
-2. **Re-auth to `gmail.modify`.** The project can now do damage.
-3. **`scripts/undo_run.py` — before anything writes in anger.** Required
+2. **Verify the label queries against the real nested labels.** Label names
+   contain spaces and are nested under `Agent/`. That `label:` resolves a
+   multi-word name by longest match is measured (see `DESIGN.md` → Label
+   naming), but only against a *top-level* label — nested-plus-space could not
+   be tested before the labels existed. So, once created: confirm
+   `label:"Agent/To Action"` and the `UNPROCESSED_TERMS` negations return the
+   counts they should, before any query is trusted to decide what gets
+   processed. A wrong queue query does not error, it silently changes which
+   mail the agent sees.
+3. **Re-auth to `gmail.modify`.** The project can now do damage.
+4. **`scripts/undo_run.py` — before anything writes in anger.** Required
    time-window argument, no default. Test it by hand-applying `Agent/`
    labels to five throwaway messages and confirming it strips them cleanly.
-4. `app/gmail_client.py` — fetch, and the single atomic `messages.modify`
+   **It must sweep `{label:"Agent/Processed" label:"Agent/Error"}`, not just
+   `Processed`** — see Phase 1's findings on the three mailbox states. Build
+   the query from `STOP_LABELS`; an undo that covers one branch is incomplete.
+5. `app/gmail_client.py` — fetch, and the single atomic `messages.modify`
    call
-5. `app/agent.py` — `classify_and_label()`, honouring `dry_run`
-6. A thin CLI entry point to run one pass over N messages. **Not the webapp
+6. `app/agent.py` — `classify_and_label()`, honouring `dry_run`
+7. A thin CLI entry point to run one pass over N messages. **Not the webapp
    yet** — a UI at this stage is a second thing that can be broken while I'm
    trying to establish whether the first thing works.
 
@@ -276,10 +354,10 @@ is a plan, not a safety net.
 
 **Build:**
 - The poll loop in `app/agent.py`, with start/stop as function calls
-- The Needs-Review reconciliation step
+- The Needs Review reconciliation step
 - `app/backfill.py` — pagination, resumability, per-category `batchModify`
   bucketing, progress counters
-- Poison-pill handling: failure counts from the log, `Agent/Error` after N
+- Dead-lettering: failure counts from the log, `Agent/Error` after N
 
 **Gate:**
 - **Full backfill in dry-run first.** Inspect the log via `run_eval`-style
@@ -287,9 +365,9 @@ is a plan, not a safety net.
   off a second time, because I can compare predicted category distribution
   against expectations.
 - Then the live backfill. Expect hours; it's serial local inference.
-- Poller left running for a day. Mail lands in the right places, `Needs-Review`
+- Poller left running for a day. Mail lands in the right places, `Needs Review`
   is non-empty but not overwhelming, `Agent/Error` is empty.
-- Manually re-file something out of `Needs-Review` and confirm the next cycle
+- Manually re-file something out of `Needs Review` and confirm the next cycle
   strips the label and writes a correction record.
 
 ---

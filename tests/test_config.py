@@ -18,6 +18,14 @@ def test_defaults():
     assert c.max_failures_before_error == 3
 
 
+def test_body_chars_default_and_bounds():
+    """The dominant latency lever, and one of the three knobs Phase 2 tunes."""
+    assert Config().body_chars == 1500
+    assert Config(body_chars=0).body_chars == 0   # subject-only is a valid test
+    with pytest.raises(ValidationError):
+        Config(body_chars=-1)
+
+
 def test_dry_run_defaults_true():
     """A fresh install must not be able to write to the inbox by accident."""
     assert Config().dry_run is True
@@ -49,7 +57,7 @@ def test_rejects_out_of_range(field, value):
     """These are silent behavioural bugs, not crashes, if they get through.
 
     A threshold of 1.5 is valid Python - it just quietly routes 100% of mail
-    to Needs-Review.
+    to Needs Review.
     """
     with pytest.raises(ValidationError):
         Config(**{field: value})
@@ -57,8 +65,51 @@ def test_rejects_out_of_range(field, value):
 
 def test_accepts_boundary_values():
     assert Config(confidence_threshold=0.0).confidence_threshold == 0.0
-    assert Config(confidence_threshold=1.0).confidence_threshold == 1.0
     assert Config(poll_interval_seconds=10).poll_interval_seconds == 10
+    # 1.0 is a valid probability on its own but not a valid *pair* with any
+    # floor, since the two must sum to less than 1 - see below.
+    assert Config(
+        confidence_threshold=0.95, to_action_floor=0.04
+    ).confidence_threshold == 0.95
+
+
+@pytest.mark.parametrize(
+    "threshold,floor",
+    [
+        (0.9, 0.15),    # the realistic Phase 2 mistake: tune T up, leave F
+        (0.85, 0.15),   # sums to exactly 1.0 - reachable only at a single
+                        # exact point, which no real distribution lands on
+        (0.8, 0.25),
+        (1.0, 0.0),
+    ],
+)
+def test_rejects_thresholds_that_make_the_asymmetric_rule_unreachable(
+    threshold, floor
+):
+    """The two thresholds are coupled and nothing else in the system says so.
+
+    The rule needs one category above `threshold` and To Action above `floor`
+    in the same distribution, which sums to 1 - so if the thresholds sum to 1
+    or more, no message can satisfy both. It would fail silently: mail keeps
+    flowing, Needs Review keeps working, and the only protection against a
+    missed bill has quietly stopped existing.
+    """
+    with pytest.raises(ValidationError, match="asymmetric"):
+        Config(confidence_threshold=threshold, to_action_floor=floor)
+
+
+@pytest.mark.parametrize(
+    "threshold,floor", [(0.8, 0.15), (0.9, 0.05), (0.7, 0.29), (0.5, 0.1)]
+)
+def test_accepts_threshold_pairs_that_leave_room(threshold, floor):
+    config = Config(confidence_threshold=threshold, to_action_floor=floor)
+    assert config.confidence_threshold + config.to_action_floor < 1.0
+
+
+def test_the_shipped_defaults_leave_room():
+    """The defaults are the pair that matters most - guard them explicitly."""
+    c = Config()
+    assert c.confidence_threshold + c.to_action_floor < 1.0
 
 
 def test_save_then_load_round_trip():

@@ -6,8 +6,9 @@ buckets using a locally-run LLM (Ollama).
 - **[DESIGN.md](DESIGN.md)** — what it does and why every decision was made
 - **[docs/PLAN.md](docs/PLAN.md)** — phased build order and gates
 
-Currently in **Phase 0** (foundations). Read-only: the OAuth scope is
-`gmail.readonly` and stays that way until Phase 3.
+Read-only: the OAuth scope is `gmail.readonly` and stays that way until
+Phase 3, which makes damaging the inbox structurally impossible for the first
+half of the build rather than merely unlikely.
 
 ## Setup
 
