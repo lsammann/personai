@@ -5,17 +5,23 @@ description = "Personal Gmail classification agent using a local LLM"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi",
-    "uvicorn[standard]",
+    # Plain uvicorn, not uvicorn[standard]: the extra pulls uvloop, httptools,
+    # watchfiles and websockets, none of which this app uses.
+    "uvicorn",
     "google-api-python-client",
     "google-auth-oauthlib",
-    "httpx",
+    # Free - fastapi requires pydantic regardless, so hand-writing the config
+    # validation would be more code for the same dependency.
     "pydantic",
 ]
+# Ollama is called with stdlib urllib, as the Phase 0 spikes did. At ~10s per
+# request against localhost, connection pooling and async buy nothing.
 
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "pytest-asyncio",
+    # Not imported by our code; fastapi.testclient needs it.
+    "httpx",
     "ruff",
 ]
 

@@ -7,6 +7,31 @@ Personal Gmail classification agent. Read `DESIGN.md` for what and why,
 where the project is - `docs/PLAN.md` describes the phases and records what
 each one found, but never claims which is current.
 
+## How we work
+
+This project is a learning exercise as much as a tool. The point is to
+understand custom AI systems well enough to defend every decision, so
+throughput is not the goal and generated code I have not reasoned about is
+worth nothing here.
+
+- **Plan before code. Always.** Propose the design - module boundaries,
+  function signatures, the decision logic, what gets tested - and get
+  agreement before writing anything. No jumping from "shall we start?" to a
+  finished file.
+- **Plan before each phase**, not just each file. `docs/PLAN.md` says what a
+  phase contains; the plan says how it will be built and why.
+- **Strictly pair programming.** Architecture and reasoning first,
+  implementation second. Explain trade-offs and name the alternatives that
+  were rejected. Surface design questions rather than quietly deciding them
+  while writing code.
+- **Justify every third-party library.** State specifically what the standard
+  library cannot do, or does badly enough to matter. "It's conventional" is
+  not a reason. This applies to dependencies already present as much as to
+  new ones.
+- **Never run git commits.** Every commit is made by the human, after reading
+  the diff. Do not stage, commit, push, or amend. Report what changed and
+  leave it in the working tree.
+
 ## Hard rules
 
 - **Scope is `gmail.readonly` until Phase 3.** Do not request or use

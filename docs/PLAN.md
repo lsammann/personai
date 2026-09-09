@@ -152,18 +152,22 @@ network. This is where the "testable pure function" claim in `DESIGN.md` gets
 earned rather than asserted.
 
 **Build:**
-- `app/rules.py` — `(distribution, thresholds) -> (labels_to_add,
+- `app/categories.py` — the six categories, their letter mapping, and the
+  `Agent/` label names. Shared constants, so `rules` and `classifier` do not
+  have to depend on each other.
+- `app/rules.py` — `(distribution, config) -> (labels_to_add,
   labels_to_remove)`. The whole decision table including the asymmetric
-  `p(To-Action)` rule, plus the renormalisation of a raw top-20 logprob list
-  into a probability distribution. No I/O, no network — the most-tested file
-  in the project.
-- `app/config.py` — load/save, defaults, in-memory source of truth
+  `p(To-Action)` rule. No I/O, no network — the most-tested file in the
+  project.
+- `app/config.py` — load/save, defaults, in-memory source of truth *(done in
+  Phase 0; auth needed it)*
 - `app/logbook.py` — append/read the JSONL classification log
 - `app/prefilter.py` — sender-domain allowlist matching
-- `app/classifier.py` — **split the parsing from the calling.** A pure
-  `parse_response(raw: str) -> Classification` that can be tested against
-  malformed JSON, missing fields, and out-of-enum categories without Ollama
-  running.
+- `app/classifier.py` — **split interpreting the model from calling it.** The
+  pure half turns a raw top-20 logprob list into a normalised distribution
+  over the six categories, and is testable against a partial top-20, tokens
+  with leading whitespace, and a response containing no valid category letter
+  at all. The impure half is the Ollama HTTP call, mocked in tests.
 - `tests/` covering all of the above
 
 **Gate:** `pytest` passes, and the test suite covers every row of the label
