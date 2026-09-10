@@ -8,7 +8,8 @@ be true before Phase 3. This document says *how* it gets built.
 > Code transcript on disk (`~/.claude/projects/<slug>/*.jsonl`, the
 > `ExitPlanMode` record of session `1ee31ef6`). The body below is that plan,
 > amended where the build has since diverged from it. Amendments are listed
-> immediately below and marked **[amended 2026-09-10]** where they appear.
+> immediately below and marked **[amended]** where they appear. A1-A3 date
+> from 2026-09-10; A4 from 2026-09-11.
 
 ## Amendment log
 
@@ -35,6 +36,23 @@ are not comparable. It is recorded alongside `model`, `prompt_id` and
 `text_plain` and silently classify HTML-only mail — 23% of the mailbox — on an
 empty body. The default made a structural guarantee conventional. §5 unaffected;
 noted here because it changes the signature the harness calls.
+
+**A4 — The frame is pinned to absolute dates.** `newer_than:1y` is evaluated
+relative to the moment the query runs, so the frame moved every day: mail
+arrived at the front, a day aged off the back, and `--seed 7` drew from a
+different population on each run. The "byte-identical twice" criterion passed
+only because the CLI reused the cached frame listing — and that listing lives
+in `data/`, which is gitignored, so `eval/sample.jsonl` would have been
+committed and auditable while the population it came from existed on one
+laptop. Replaced with `FrameSpec`, which pins `after:`/`before:` at sample
+time and records the window in `strata.json`. Widening becomes "the band
+immediately older than the frame", which is disjoint from it by construction
+rather than by filtering afterwards — that also removes the
+`frame_query.replace("newer_than:1y", ...)` string surgery, which silently
+no-opped on a custom window. The `--frame` flag is replaced by `--end` and
+`--window-years`. Deletion is still not covered — a deleted message leaves
+the frame whatever the query says — and remains handled downstream by
+`data/eval_cache/`. Found in review, not planned.
 
 ---
 
@@ -73,7 +91,7 @@ The outcome this phase produces:
 
 | Decision | Choice |
 |---|---|
-| Sampling frame | `newer_than:1y -in:sent -in:drafts -in:chats` (~6,300) |
+| Sampling frame | one year of received mail, ~6,300 (pinned to absolute dates — see A4) |
 | Rare-class mining | May reach beyond 1y, in its own stratum, excluded from the weighted estimate |
 | Label budget | 200 + a 20-message blind recheck |
 | Dev / holdout | 140 / 60, split at **score** time, not predict time |
@@ -490,6 +508,130 @@ accuracy tolerable; `To Action` recall *and* retention high; calibration gap
 meaningfully positive; permutation stability high; and measured values for
 `confidence_threshold` / `to_action_floor` that satisfy `T + F < 1`, confirmed
 by `Config` accepting them.
+
+---
+
+## Step 2 implementation — `label_eval.py sample`
+
+Agreed 2026-09-10. Resolves six things §2 left open; the resolutions amend §2
+where they conflict with it.
+
+**Scope.** Produces `eval/sample.jsonl` and `eval/strata.json` (committed) plus
+`data/eval_frame.jsonl` (gitignored). No labelling, no fetching, no Ollama —
+and **zero `messages.get` calls**, which is what dropping `internal_date`
+bought.
+
+### Module boundaries
+
+```
+app/evalset.py          pure: strata, assignment, drawing, splits, weights
+scripts/label_eval.py   CLI only: argparse, progress output
+app/gmail_client.py     one addition, below
+eval/                   data only
+```
+
+Logic lives in `app/` rather than `scripts/` because `scripts/` is not
+importable — `pyproject.toml` has `packages = ["app"]`, `tests/conftest.py`
+adds no path shim, and `measure_bodies.py` copies `spike_extract` rather than
+importing it for exactly this reason. §6 asks for unit tests on disjointness,
+`w_h` derivation and the content-leak guard, none of which can be written
+against a script. It is also not throwaway: `docs/PLAN.md` Phase 5 has
+`app/metrics.py` aggregating "the log **and the eval results**".
+
+**`gmail_client` addition.** `search_ids` discards `threadId`, which `S_human`
+needs. Inverted rather than duplicated:
+
+```python
+def search_refs(svc, query, limit=None) -> list[tuple[str, str]]:  # (id, thread_id)
+def search_ids(svc, query, limit=None) -> list[str]:               # now a wrapper
+```
+
+`messages.list` returns both fields already, so this costs nothing at the API
+and keeps one pagination loop.
+
+### Sampling algorithm
+
+0. **Pin the window** — `FrameSpec.ending()` resolves `--end` (default today,
+   local date) and `--window-years` into `after:YYYY/MM/DD before:YYYY/MM/DD`,
+   recorded in `strata.json`. See A4: a relative window makes the sample
+   irreproducible the next day.
+1. **Enumerate the frame once** into `data/eval_frame.jsonl` as
+   `{message_id, thread_id}`, ~6,300 rows, ~13 list calls, with the frame
+   query as a header line so a cache built for another window is not reused.
+   Reused unless `--refresh`, so re-sampling never re-hits the API.
+2. **Resolve mined membership** in full (not sampled — `N_h` must be exact).
+   `S_action` and `S_txn` are the frame query AND a subject clause. `S_human`
+   is `is:starred` within the frame, plus the `thread_id`s of `from:me`
+   intersected against the frame's — sent mail is not in the frame, so the
+   thread is the bridge, and it needs no `get`.
+3. **Partition the frame** by ordered assignment `S_action → S_human → S_txn →
+   Residual`, first match wins. This is the partition the weights need and is
+   independent of what gets sampled.
+4. **Draw `R` first** — 100 uniform over the whole frame. The
+   representativeness anchor, and the reason `S_other` is gone.
+5. **Top up each mined stratum** to target from `(stratum ∩ frame) − taken`.
+6. **Extension on shortfall** — re-query the band immediately older than the
+   frame, reaching back 2, 3 then 4 years. Disjoint from the frame by
+   construction. Marked `draw="extension"` and excluded from the weighted
+   estimate. Any residual shortfall goes to `R`, drawn **from inside the
+   frame**: `R` never extends, or the mailbox estimate stops describing the
+   mailbox.
+7. **Split 70/30 dev/holdout within each stratum**, drawn from a derived seed
+   so `--seed 7` reproduces it. Assigned here, applied at score time.
+
+**Budget change:** `S_other` is dropped as redundant with `R`, and its 20
+labels move to `R` rather than to the mined strata — `R` 100, `S_action` 35,
+`S_human` 35, `S_txn` 30, total 200. `S_other`'s purpose was "promo bulk",
+which `R` already delivers in proportion, so the 20 buy a tighter mailbox
+estimate instead of more of the commonest class.
+
+**Why `n_h` stays valid:** a uniform draw from a stratum, followed by a further
+uniform draw from that stratum minus the first, is a simple random sample of
+the stratum at the combined size. So `n_h` = R's members landing in `h` plus
+the top-up, and `w_h = N_h/n_h` holds.
+
+**Determinism:** ids are `sorted()` immediately before every draw. Python
+randomises string hashing per process, so `set` iteration order differs
+between runs and `random.sample` picks by position — seeding alone does not
+give a reproducible sample. This is the mechanism behind the "byte-identical
+twice" criterion.
+
+### Schema amendments to §2
+
+`eval/sample.jsonl` — `internal_date` **dropped** (`messages.list` does not
+return it; it is free at label time from the cache, and nothing reads it at
+sample time). `draw` **added**, because §2 conflated two things:
+
+```json
+{"message_id":"18f2...","stratum":"S_action","draw":"mined","split":"dev","seed":7}
+```
+
+`stratum` is the partition cell, used for weights. `draw` is provenance —
+`R` / `mined` / `extension` — so the honest `To Action` number in §3 is the
+one filtered to `draw == "R"`, keyword-mined examples being the ones that say
+"overdue" on the tin.
+
+`eval/strata.json` records `frame_query`, `frame_size`, `seed`, and per
+stratum `name`, `query`, `window_years`, `N_h`, `n_h`, `n_extension`.
+Extension rows are counted in `n_extension` only, keeping `w_h = N_h/n_h`
+defined over the frame.
+
+### Tests — pure, no Gmail
+
+Partition is disjoint and `Σ N_h == frame_size`; first-match-wins ordering;
+`R` from the whole frame and top-ups from the residual with nothing sampled
+twice; byte-identical output for a repeated seed, including a fake frame whose
+set order differs; shortfall → extension → flagged and excluded → residual
+shortfall tops up `R` inside the frame; `R` never extends; split is 70/30
+within each stratum and reproducible; `S_human` thread intersection both ways;
+key-allowlist guard on both committed files; frame cache reused, `--refresh`
+re-queries.
+
+### Verification
+
+`--seed 7` twice is byte-identical; `Σ N_h == count(frame_query)`; every id in
+exactly one stratum; `git status` shows the two `eval/` files and not
+`data/eval_frame.jsonl`.
 
 ---
 

@@ -227,26 +227,41 @@ def _execute(request):
     raise AssertionError("unreachable: the final attempt either returns or raises")
 
 
-def search_ids(svc, query: str, limit: int | None = None) -> list[str]:
-    """Message ids matching a Gmail query, paginating until `limit` or the end.
+def search_refs(svc, query: str, limit: int | None = None) -> list[tuple[str, str]]:
+    """(message_id, thread_id) pairs matching a Gmail query, paginating.
 
-    Ids only. Enumerating the whole eval frame this way is thirteen calls and
-    a few seconds, where fetching those messages would be thousands.
+    `messages.list` returns both fields on every row, so the thread id is free
+    - and the eval sampler's `S_human` stratum needs it. Sent mail is excluded
+    from the frame, so the only way to find the received messages in threads I
+    replied to is to match thread ids, and doing that from `get` calls would
+    cost one request per message instead of one per five hundred.
+
+    Ids only, never bodies. Enumerating the whole eval frame this way is
+    thirteen calls and a few seconds, where fetching those messages would be
+    thousands.
     """
-    ids: list[str] = []
+    refs: list[tuple[str, str]] = []
     page_token = None
     while True:
-        page_size = 500 if limit is None else min(500, limit - len(ids))
+        page_size = 500 if limit is None else min(500, limit - len(refs))
         response = _execute(
             svc.users()
             .messages()
             .list(userId="me", q=query, maxResults=page_size, pageToken=page_token)
         )
-        ids += [message["id"] for message in response.get("messages", [])]
+        refs += [
+            (message["id"], message.get("threadId", ""))
+            for message in response.get("messages", [])
+        ]
         page_token = response.get("nextPageToken")
-        if not page_token or (limit is not None and len(ids) >= limit):
+        if not page_token or (limit is not None and len(refs) >= limit):
             break
-    return ids if limit is None else ids[:limit]
+    return refs if limit is None else refs[:limit]
+
+
+def search_ids(svc, query: str, limit: int | None = None) -> list[str]:
+    """Message ids matching a Gmail query. `search_refs` without the thread ids."""
+    return [message_id for message_id, _ in search_refs(svc, query, limit)]
 
 
 def count(svc, query: str) -> int:
