@@ -279,6 +279,51 @@ spikes and their findings are recorded in `docs/PLAN.md`.
   median of 7,445 characters, so 2000 covers only the 28th percentile. See
   `docs/BACKLOG.md`.
 
+**Body extraction: prefer plain text, fall back to stripped HTML.** Measured
+in Phase 2 (`scripts/measure_bodies.py`, and `docs/BACKLOG.md` → Body
+structure): **23% of mail carries no `text/plain` part at all**, and the
+original extractor's fallback returned raw HTML source for those — so nearly a
+quarter of messages spent their entire truncation budget on `<td style="...">`
+and reached the model carrying no readable words. The rule is now:
+
+- Walk the MIME tree, keeping the **longest** `text/plain` and `text/html`
+  leaves — longest rather than first, as a tie-break when one message emits
+  several parts of the same type.
+- **An attached message (`message/rfc822`, a forward "as attachment") is
+  appended after the covering note**, with a forwarded-message divider,
+  never merged into it and never allowed to lead. Gmail's default Forward
+  inlines the original into the same part, note first — 100% of the forwards
+  in this mailbox — so reading only the note would make one user action
+  classify differently depending on which button was pressed. Order carries
+  the meaning: truncation cuts from the start, so a friend forwarding a
+  promotion stays `Personal`, while a friend forwarding an invoice keeps
+  "invoice" and "due" in reach. Measured at 0 of 250 sampled messages, so this
+  is consistency rather than a fix to an observed failure.
+- Prefer `text/plain`.
+- **Stub fallback:** a `text/plain` part under 200 characters sitting beside
+  stripped HTML more than twice its length is a "view this in your browser"
+  stub, not a body — use the HTML. 1.3% of mail, and it fails silently
+  otherwise, since the result is indistinguishable from a short email.
+- HTML-only mail uses the stripped HTML.
+- Stripping is a stdlib `HTMLParser` subclass — tags removed,
+  `script`/`style`/`head` *content* dropped, entities decoded, whitespace
+  collapsed. No dependency: `html2text` and BeautifulSoup buy table layout and
+  link reference lists, all of which the truncation discards anyway.
+
+This is model-input policy, not transport, so it lives in
+`app/message_body.py` as a pure function rather than in `gmail_client`, and
+`extraction_version` is recorded alongside `model`, `prompt_id` and
+`body_chars` — a change to the stub threshold silently changes every
+prediction, which makes runs either side of it incomparable.
+
+**Known limit — attachments are invisible.** Gmail returns an `attachmentId`
+rather than data for non-text parts, and the walk skips them, so nothing
+binary enters the app. The cost is that a bill existing only as an attached
+PDF is structurally undetectable: the classifier sees only the covering note.
+In practice the covering note usually says "Invoice", which is enough — but
+where it doesn't, that is a `To Action` false negative no prompt or model
+change can fix. PDF text extraction is in Future Enhancements.
+
 **Rejected in Phase 0: self-reported confidence.** The original design asked
 the model to emit `{reasoning, category, confidence}` as schema-constrained
 JSON, with `reasoning` first to ground the number. The schema mechanism works
@@ -893,6 +938,15 @@ the eval set rather than asserted in tests.
   possible.
 - **Auto-growing sender allowlist** — suggest new promotional domains based
   on repeated corrections.
+- **PDF attachment text extraction** — a bill that exists only as an attached
+  PDF is currently invisible to the classifier, which sees only the covering
+  note (see Classification logic → Known limit). Extracting the first page of
+  `application/pdf` parts would close the one `To Action` false-negative class
+  that no prompt or model change can reach. Cut from v1 because it needs a new
+  dependency, a second Gmail call per message to fetch the attachment body,
+  and a decision about how PDF text shares the truncation budget with the
+  email body — three things whose cost should be justified by a measured miss
+  rate from the Phase 2 eval, not assumed up front.
 
 ### Genuinely agentic versions
 Both of these replace the fixed pipeline with a loop where the *model*

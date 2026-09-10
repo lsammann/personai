@@ -138,10 +138,30 @@ def test_system_prompt_lists_every_category_with_its_letter():
 
 
 def test_user_message_truncates_the_body():
-    message = classifier.build_user_message("a@b.com", "Subject", "x" * 5000, 100)
+    message = classifier.build_user_message("a@b.com", "Subject", "x" * 5000, "", 100)
     assert message.count("x") == 100
     assert "From: a@b.com" in message
     assert "Subject: Subject" in message
+
+
+def test_user_message_selects_the_body_rather_than_trusting_the_caller():
+    """The single-path guarantee: no caller can hand the model its own body.
+
+    An HTML-only message reaches the model as readable text without anything
+    outside this function having made a choice. Before the split, 23% of real
+    mail arrived here as raw markup - see docs/BACKLOG.md -> Body structure.
+    """
+    message = classifier.build_user_message(
+        "shop@example.com",
+        "Invite",
+        "",
+        "<html><head><style>p{color:red}</style></head>"
+        "<body><p>You have been invited</p></body></html>",
+        1500,
+    )
+    assert "You have been invited" in message
+    assert "<p>" not in message
+    assert "color:red" not in message
 
 
 # --- the Ollama call, mocked ----------------------------------------------

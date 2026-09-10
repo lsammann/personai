@@ -31,6 +31,7 @@ from app.categories import (
     category_letters,
     letter_map,
 )
+from app.message_body import select_body
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
@@ -170,21 +171,34 @@ def build_system_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
     )
 
 
-def build_user_message(sender: str, subject: str, body: str, body_chars: int) -> str:
-    """Sender, subject, and a truncated body.
+def build_user_message(
+    sender: str, subject: str, text_plain: str, text_html: str, body_chars: int
+) -> str:
+    """Sender, subject, and a selected, truncated body.
+
+    **This is the only place model input is constructed.** DESIGN.md makes
+    input consistency a hard requirement - the poller and the backfill must
+    build the model's input from the same fields, fetched the same way - and
+    taking the raw text parts rather than a finished body is what makes that
+    structural instead of a line in a document. A caller cannot reach the model
+    having picked its own body, because picking happens in here.
 
     Truncation is the dominant performance lever, not a detail: the call emits
     a single token, so latency is essentially prompt length divided by the
-    prompt-eval rate. Real bodies have a median of ~7,400 characters - see
-    docs/BACKLOG.md - so this cut is doing most of the work.
+    prompt-eval rate. Real prose runs to a median of ~5,100 characters for
+    plain-text mail and ~1,600 for stripped HTML (docs/BACKLOG.md -> Body
+    structure), so one `body_chars` is doing two rather different jobs and the
+    Phase 2 sweep is what settles it.
     """
+    body = select_body(text_plain, text_html).text
     return f"From: {sender}\nSubject: {subject}\n\n{body[:body_chars]}"
 
 
 def classify(
     sender: str,
     subject: str,
-    body: str,
+    text_plain: str,
+    text_html: str = "",
     *,
     model: str,
     body_chars: int,
@@ -209,7 +223,9 @@ def classify(
             {"role": "system", "content": build_system_prompt(order)},
             {
                 "role": "user",
-                "content": build_user_message(sender, subject, body, body_chars),
+                "content": build_user_message(
+                    sender, subject, text_plain, text_html, body_chars
+                ),
             },
         ],
         "stream": False,
