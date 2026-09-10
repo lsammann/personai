@@ -198,7 +198,7 @@ def classify(
     sender: str,
     subject: str,
     text_plain: str,
-    text_html: str = "",
+    text_html: str,
     *,
     model: str,
     body_chars: int,
@@ -216,6 +216,13 @@ def classify(
     Raises rather than retrying: retry-with-delay is per-message orchestration
     and belongs to the caller, which also decides when repeated failures tip a
     message into the dead-letter path.
+
+    `text_html` is deliberately not defaulted. Both text parts are required so
+    that the single-path guarantee in `build_user_message` is structural rather
+    than conventional: with a default, a caller holding a `Message` could pass
+    only `text_plain` and silently classify the 23% of HTML-only mail on an
+    empty body - the exact failure `message_body` exists to prevent, reachable
+    by omission. An explicit `""` is the caller stating there is no HTML part.
     """
     payload = {
         "model": model,

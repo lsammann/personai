@@ -202,6 +202,7 @@ def call(payload_or_error):
             "billing@octopus.energy",
             "Your bill is ready",
             "payment due 15 October",
+            "",
             model="llama3.1:8b",
             body_chars=1500,
         )
@@ -264,7 +265,7 @@ def test_non_json_response_becomes_ollama_error():
         patch("urllib.request.urlopen", fake_urlopen),
         pytest.raises(OllamaError, match="invalid JSON"),
     ):
-        classifier.classify("a@b.com", "s", "b", model="m", body_chars=100)
+        classifier.classify("a@b.com", "s", "b", "", model="m", body_chars=100)
 
 
 def test_http_error_status_becomes_ollama_error():

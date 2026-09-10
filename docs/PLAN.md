@@ -245,6 +245,9 @@ whether the parser is broken.
 
 ## Phase 2 — Eval harness
 
+> How it gets built, and what has diverged from that as it was built:
+> `docs/PHASE2_PLAN.md`.
+
 **Goal:** an accuracy number. This is the go/no-go gate for the whole project
 and the single highest-value phase for interview purposes.
 
