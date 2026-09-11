@@ -3,6 +3,15 @@
 Companion to `docs/PLAN.md`, which says what Phase 2 contains and what has to
 be true before Phase 3. This document says *how* it gets built.
 
+**Start at [Build order](#build-order).** It says which step is current and
+what each finished one produced. Then read the amendment log below, which
+lists every place the build knowingly departed from the agreed design.
+
+How to read the rest: **§1-§6 are the plan as originally agreed**, amended in
+place where the build diverged. The **`Step N implementation` sections near
+the end are the current, detailed plans** for individual steps, written just
+before each is built. Where the two disagree, the step section is newer.
+
 > **Provenance.** Agreed in a planning session on 2026-09-09 that was lost
 > before it could be written down. Recovered on 2026-09-10 from the Claude
 > Code transcript on disk (`~/.claude/projects/<slug>/*.jsonl`, the
@@ -458,9 +467,11 @@ whether the HTML path classifies as well as the plain path, and whether a
 1. ~~`app/gmail_client.py` (read half) + tests, incl. the no-write assertion~~
    **Done — `03110e6`.** Split into `gmail_client` + `message_body` per A1;
    222 tests, ruff clean, no new dependencies.
-2. **← next.** `label_eval.py sample` → `eval/sample.jsonl`,
-   `eval/strata.json` (committed)
-3. `label_eval.py label` + cache → ~1.5–2 hours of hand-labelling
+2. ~~`label_eval.py sample` → `eval/sample.jsonl`, `eval/strata.json`~~
+   **Done.** `app/evalset.py` + thin CLI; the frame pinned to absolute dates
+   per A4; 258 tests, ruff clean, no new dependencies. The sample itself is
+   not yet drawn against the real mailbox.
+3. **← next.** `label_eval.py label` + cache → ~1.5–2 hours of hand-labelling
 4. `prompt_id` migration in `classifier.py` and `logbook.py` + the `PROMPTS`
    registry
 5. `eval/run_eval.py` — predict/score split, all metrics, `eval/results/`
@@ -632,6 +643,165 @@ re-queries.
 `--seed 7` twice is byte-identical; `Σ N_h == count(frame_query)`; every id in
 exactly one stratum; `git status` shows the two `eval/` files and not
 `data/eval_frame.jsonl`.
+
+---
+
+## Step 3 implementation — `label_eval.py label`
+
+Agreed 2026-09-11. The long pole of the phase: steps 5 onward are blocked on
+the labels existing.
+
+**Scope.** `label` and `verify` subcommands, the message cache, and 200
+hand-labelled messages. Produces `eval/labeled.jsonl` (committed) and
+`data/eval_cache/` (gitignored).
+
+### Module boundaries
+
+```
+app/evallabel.py        pure: records, corrections, deferrals, progress, rendering
+scripts/label_eval.py   the keypress loop and terminal I/O
+```
+
+A new module rather than growing `evalset.py` (already ~560 lines), on the
+same line as before: anything testable without a terminal lives in `app/`.
+
+### Decisions taken
+
+| Decision | Choice |
+|---|---|
+| Presentation order | Randomised across strata, `Random(seed + 2)`, deterministic so resume keeps the order |
+| Stratum in the UI | **Never shown.** `S_action` on screen is a direct hint at `To Action` |
+| `b` (back) | Appends a correction; last row in file order wins, **within a pass** |
+| Fetch | Batches of 50, cached at fetch time; `--batch` flag to lower it |
+| `unsure` | `u` defers, re-presented after the main pass; pass 1 must reach 200 |
+| Blind recheck | Pass 2, only after pass 1 is complete. `verify` refuses otherwise |
+| Unclassifiable mail | Not skipped - it is a taxonomy signal. See below |
+
+**Why batches of 50 and no throttle.** `docs/BACKLOG.md` measured a rate limit
+between 150 and 175 consecutive `messages.get`. Fifty is ~25 seconds and well
+under it, and the ~25 minutes of human labelling between batches resets the
+window entirely. Caching at fetch rather than label time means quitting after
+ten leaves the other forty on disk, so resuming costs nothing.
+
+**Corrections never cross passes.** Step 7's recheck writes `pass=2` rows, and
+those are a separate measurement of self-consistency, not corrections to
+pass 1. Resolution is last-row-wins *within* a pass. File order, not
+timestamp - two appends in the same second would tie.
+
+**An unclassifiable email is a finding, not a skip.** `docs/PLAN.md` already
+lists the `Personal` category and the taxonomy as Phase 2 checkpoints where
+reality is expected to argue back. `s` remains in the UI as an escape hatch
+and `verify` reports any unlabelled id loudly. Adding a category touches
+`categories.py` (member, description, letter mapping), the prompt,
+`KEEPS_INBOX`, and a new `Agent/` label - but **step 3 is the cheapest moment
+for it**, because no eval run has happened yet, so there is no `prompt_hash`
+to invalidate and no historical results to re-score.
+
+### Signatures
+
+```python
+@dataclass(frozen=True)
+class LabelRecord:
+    message_id: str; label: str; unsure: bool; labelled_at: str; pass_no: int
+
+@dataclass(frozen=True)
+class Cached:
+    message_id: str; sender: str; subject: str
+    internal_date: str; text_plain: str; text_html: str
+
+def ordering(sample: Sequence[Sampled], seed: int) -> list[str]
+def resolve(records: Sequence[LabelRecord], pass_no: int = 1) -> dict[str, LabelRecord]
+def pending(order, resolved, deferred) -> list[str]
+def render(message: Cached, body_chars: int, show_full: bool) -> str
+def append_record(record: LabelRecord, path: Path) -> None      # flushed per write
+def load_records(path: Path) -> list[LabelRecord]               # tolerant read
+def cache_put(message: Message, directory: Path) -> None
+def cache_get(message_id: str, directory: Path) -> Cached | None
+```
+
+### The UI
+
+```
+[47/200]                                          2026-03-11  (6 months ago)
+From:     no-reply@booking.com
+Subject:  Your reservation is confirmed
+
+Thank you for booking. Your stay at ... [1,500 of 4,207 chars — m for more]
+
+1 To Action  2 Bookings  3 Receipts  4 Promotions  5 Updates  6 Personal
+u unsure (defer)   s skip   b back   m more   q save and quit
+```
+
+Body shown is `message_body.select_body()` output - what the model will
+actually read. **The truncation marker is informational only**: ground truth
+is what the email *is*, not what the model can see, or every `body_chars`
+change would silently redefine the target. Stated in the CLI help alongside
+the arrived-at rule.
+
+Single keypress via stdlib `termios`/`tty` - 200 messages is 200 spurious
+Enters otherwise - falling back to line mode when stdin is not a tty, so tests
+need no pty.
+
+### Input fidelity — the cache is exactly what the model reads
+
+Both paths call the same function with the same four arguments, so the eval
+measures the pipeline that will actually run:
+
+```
+LIVE (Phase 3)                      EVAL (step 5)
+gmail_client.fetch(svc, id)         cache_get(id)
+  → sender, subject,                  → sender, subject,
+    text_plain, text_html               text_plain, text_html
+        └──────────► classifier.classify(...)
+                       → build_user_message
+                         → select_body(...).text[:body_chars]
+```
+
+Those four fields are necessary and sufficient; nothing else in `Message`
+reaches the model. This is why A1 stores raw text parts rather than a finished
+body - `select_body` runs fresh at eval time, so an `EXTRACTION_VERSION` bump
+is re-scorable against the same cache - and why A3 removed the `text_html`
+default.
+
+`internal_date` is the one cached field the model never sees. It exists for
+the arrived-at rule in the UI, and the cache docstring says so, so it cannot
+drift into `predict` later.
+
+### Two notes against step 5
+
+**Prefilter hits never reach the model.** `app/prefilter.py` routes a
+sender-domain allowlist match straight to `Agent/Promotions` with no LLM call,
+and `decision.decide_prefilter_hit()` records `confidence=None` deliberately.
+`docs/BACKLOG.md` estimates this covers roughly a third of the backlog, so
+scoring the model's answer on those messages measures something the live
+system would never do. Nothing extra needs caching - `sender` is already
+there, so `run_eval` computes the hits at score time from `load_allowlist()`.
+They get their own bucket in the report (a rule is right or wrong, with no
+confidence) and are **excluded from the calibration table and the threshold
+sweep**.
+
+**`w_h` comes from labelled counts, not sampled counts.** `strata.json`
+records what was *sampled*. If any message ends up unlabelled, `n_h` is
+smaller than that, and weighting by the sampled figure would be wrong in
+proportion to the gap. `run_eval` derives `n_h` from `labeled.jsonl ∩
+sample.jsonl`; `verify` reports the difference.
+
+### Tests
+
+Resume skips done ids and preserves order; a correction supersedes by file
+position; corrections do not cross passes; deferred messages re-present after
+the main pass and not before; the shuffle is deterministic from the seed and
+independent of input order; `render` truncates and marks, and never prints the
+stratum; unknown category rejected on write; key-allowlist guard on
+`labeled.jsonl`; cache round-trip; tolerant read of a half-written trailing
+line; `verify` catches a labelled id missing from the sample or the cache, and
+refuses a pass 2 that starts before pass 1 is complete.
+
+### Verification
+
+Label 10, `Ctrl-C`, re-run - resumes at 11, no duplicates, no lost rows. Label
+one, `b`, relabel - `resolve` returns the second. `git status` shows
+`eval/labeled.jsonl` and not `data/eval_cache/`.
 
 ---
 
