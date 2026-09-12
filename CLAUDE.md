@@ -5,13 +5,16 @@ Personal Gmail classification agent. Read `DESIGN.md` for what and why,
 plan - `docs/PHASE2_PLAN.md` - for how this phase is being built and where the
 code has deliberately diverged from it.
 
-**Current phase: 2 (eval harness), step 3 of 8.**
+**Current phase: 2 (eval harness), step 4 of 8.**
 
 This file is the single source of truth for which **phase** is current;
 `docs/PHASE2_PLAN.md` → Build order is the single source of truth for which
 **step**, and records what each finished step produced. Check the build order
-before planning anything - steps 1 and 2 are built and committed, and the
-phase plan's §1-§6 describe the phase as originally agreed, not as it stands.
+before planning anything - steps 1-3 are built (the 200 hand-labelled
+messages exist), and the phase plan's §1-§6 describe the phase as originally
+agreed, not as it stands. Step 3 also added a **labelling rules** section,
+which is the decision procedure ground truth was built with and the one step
+7's recheck has to reapply.
 
 Start there rather than at the top of `DESIGN.md`: the phase plan's
 **amendment log** lists every place the build knowingly departed from the

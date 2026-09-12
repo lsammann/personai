@@ -581,6 +581,43 @@ def save_sample(plan: SamplePlan, path: Path = SAMPLE_PATH) -> None:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def load_sample(path: Path = SAMPLE_PATH) -> tuple[list[Sampled], int]:
+    """The committed sample, and the seed that drew it.
+
+    The seed comes back with the rows rather than from a CLI flag, because the
+    labelling order is derived from it (`evallabel.ordering`). Taking it from
+    anywhere else would let the order drift from the sample it orders - a
+    session resumed with a different `--seed` would present a different
+    sequence, and `b` (back) would point at the wrong message.
+
+    Strict where the frame cache is tolerant. A malformed sample row is not a
+    recoverable loss like a half-written log line: it is one of the 200
+    messages the whole phase is measured on, and silently dropping it would
+    shrink `n_h` without saying so.
+    """
+    rows: list[Sampled] = []
+    seeds: set[int] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        rows.append(
+            Sampled(
+                record["message_id"],
+                record["stratum"],
+                record["draw"],
+                record["split"],
+            )
+        )
+        seeds.add(int(record["seed"]))
+    if len(seeds) > 1:
+        raise ValueError(
+            f"sample rows disagree on the seed: {sorted(seeds)} - the file is "
+            "a mix of two draws and the presentation order is undefined"
+        )
+    return rows, seeds.pop() if seeds else DEFAULT_SEED
+
+
 def strata_document(plan: SamplePlan) -> dict[str, object]:
     """The manifest `run_eval` derives `w_h = N_h/n_h` from at score time.
 

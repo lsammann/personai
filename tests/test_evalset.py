@@ -528,3 +528,31 @@ def test_a_frame_cached_for_another_window_is_not_reused(tmp_path):
     other = FrameSpec(dt.date(2024, 1, 1), dt.date(2025, 1, 1))
     assert evalset.load_frame(other, path) == []
     assert len(evalset.load_frame(SPEC, path)) == 5
+
+
+# --- reading the sample back ---------------------------------------------
+
+
+def test_sample_round_trips_with_its_seed(tmp_path):
+    """The seed travels with the rows: `evallabel.ordering` derives from it."""
+    path = tmp_path / "sample.jsonl"
+    plan = evalset.build_plan(frame(300), {}, seed=7, spec=SPEC)
+    evalset.save_sample(plan, path)
+
+    rows, seed = evalset.load_sample(path)
+    assert seed == 7
+    assert [r.message_id for r in rows] == [r.message_id for r in plan.sampled]
+    assert rows[0].stratum and rows[0].draw and rows[0].split
+
+
+def test_a_sample_mixing_two_seeds_is_refused(tmp_path):
+    """Two draws in one file leaves the presentation order undefined."""
+    path = tmp_path / "sample.jsonl"
+    path.write_text(
+        json.dumps({"message_id": "a", "stratum": "Residual", "draw": "R",
+                    "split": "dev", "seed": 7}) + "\n"
+        + json.dumps({"message_id": "b", "stratum": "Residual", "draw": "R",
+                      "split": "dev", "seed": 9}) + "\n"
+    )
+    with pytest.raises(ValueError, match="disagree on the seed"):
+        evalset.load_sample(path)

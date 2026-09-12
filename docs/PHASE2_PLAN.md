@@ -18,7 +18,7 @@ before each is built. Where the two disagree, the step section is newer.
 > `ExitPlanMode` record of session `1ee31ef6`). The body below is that plan,
 > amended where the build has since diverged from it. Amendments are listed
 > immediately below and marked **[amended]** where they appear. A1-A3 date
-> from 2026-09-10; A4 from 2026-09-11.
+> from 2026-09-10; A4 from 2026-09-11; A5-A6 from 2026-09-12.
 
 ## Amendment log
 
@@ -34,7 +34,7 @@ meant to control for it. See `app/message_body.py:1-23` and `DESIGN.md` →
 Classification logic → Body extraction. §1 and §6 rewritten accordingly.
 
 **A2 — `extraction_version` joins the run manifest.** Direct consequence of
-A1: `EXTRACTION_VERSION` (`app/message_body.py:38`, currently `"v2"`) is now
+A1: `EXTRACTION_VERSION` (`app/message_body.py`, currently `"v4"` — see A7) is now
 one of the inputs that changes predictions, so two runs either side of a bump
 are not comparable. It is recorded alongside `model`, `prompt_id` and
 `body_chars`, and it belongs in the list of things that force re-inference.
@@ -62,6 +62,56 @@ no-opped on a custom window. The `--frame` flag is replaced by `--end` and
 `--window-years`. Deletion is still not covered — a deleted message leaves
 the frame whatever the query says — and remains handled downstream by
 `data/eval_cache/`. Found in review, not planned.
+
+**A5 — `u` records a flag rather than deferring.** The Step 3 section defined
+`u` as "defer, re-presented after the main pass", with `unsure` set when the
+message came back round. That made `u` mechanically identical to `s` until the
+end of a sitting, and left the flag living in session state: quitting with
+deferrals outstanding lost it, and persisting it meant either a label-less row
+in `labeled.jsonl` — breaking both the key allowlist and the reject-unknown-
+category rule — or a second file in `data/`. As built, `u` toggles "unsure" for
+the message on screen and the following digit writes the row with
+`unsure=True`, so the judgement and the flag are recorded in the same instant.
+The deferred queue disappears and `pending()` takes the sitting's skipped ids
+in its place. `s` is unchanged: no row, reported loudly by `verify`. The flag
+itself is kept because "the human was not sure either" is a different finding
+from "the model is wrong", and those rows are the ones expected to flip in the
+step 7 recheck. Raised by the human in review.
+
+**A6 — labelling UI surface.** Digit keys derive from `tuple(Category)` —
+`1 To Action  2 Receipts  3 Bookings  4 Updates  5 Promotions  6 Personal` —
+so there is no second ordering list to drift from the enum; the mock below had
+Receipts and Bookings the other way round. `--stratum`, carried over from §2,
+is dropped: `label --stratum S_action` tells the labeller that everything they
+are about to see was mined for action keywords, which is the same leak the
+Step 3 section removed from the screen. `--limit` stays.
+
+**A7 — Extraction `v3`, found while labelling.** A newsletter reached the
+labelling UI with no content in it: the plain part said only "this email is
+only available in HTML", and the stub rule missed it *twice over* — 707
+characters (361 of them one tracking URL) against a ratio of 1.5 (deflated by
+104 zero-width spacers in the HTML). Neither half of the rule could have been
+retuned into catching it, because both were measuring padding. `v3` therefore
+measures both tests over **informative** characters (URLs and zero-width
+discounted), lets an explicit "only available in HTML" declaration waive the
+*length* test while still facing the ratio guard, and rewrites URLs in the
+selected body down to their host — a median 28% of a body, over 90% of the
+budget at the extreme, and worst-case tokenisation on a CPU-only box.
+**`v4`, an hour later**, strips a `text/plain` part that is really an HTML
+document (1 of 64 cached messages — 120,567 characters of markup the old rule
+preferred over the real body) and adds U+034F to the spacer set, which
+outnumbers the character `v3` added by five to one in this mailbox. Bumped
+rather than folded into the unused `v3` because one version label meaning two
+rules is the failure the field exists to prevent. Four source flips across the
+cache, each inspected by hand; the clearest is a Skyscanner mailout whose plain
+part is 99.2% tracking URL, leaving 52 characters of words.
+
+`STUB_MAX_CHARS` is deliberately **unchanged**: whether 200 is the right number
+needs a distribution, and the eval cache is the instrument once it is full.
+Verified over the 22 messages cached so far — two source flips, both inspected
+by hand, both improvements. Built now rather than deferred at the human's call:
+no eval run exists, so the bump costs nothing, and a known bug left in the tree
+is a bug that gets forgotten. §1 amended.
 
 ---
 
@@ -177,18 +227,22 @@ test guarding `app/decision.py`.
 ### `app/message_body.py` — model-input policy, pure
 
 ```python
-BodySource = Literal["plain", "html", "stub_fallback", "none"]
+BodySource = Literal["plain", "plain_markup", "html", "stub_fallback", "none"]
 
 @dataclass(frozen=True)
 class Selection:
     text: str; source: BodySource; parsed_ok: bool
 
-EXTRACTION_VERSION = "v2"
+EXTRACTION_VERSION = "v4"          # v2 as agreed; see A7
 STUB_MAX_CHARS = 200
 STUB_HTML_RATIO = 2.0
+STUB_MARKERS = (...)               # A7
+ZERO_WIDTH = {...}                 # A7
 
 def strip_html(html: str) -> tuple[str, bool]: ...
 def select_body(text_plain: str, text_html: str) -> Selection: ...
+def shorten_urls(text: str) -> str: ...          # A7
+def informative_length(text: str) -> int: ...    # A7
 ```
 
 Measured over 150 messages from the eval frame
@@ -430,6 +484,7 @@ now, with no real log rows written; annoying after a backfill).
 | `v4-format` | one line describing the input shape (`From:`, `Subject:`, blank line, body) | nothing currently tells the model what it is reading | accuracy |
 | `v5-truncation` | "the body may be truncated mid-sentence; classify from what is shown" | already an open question in memory; weak prior — it can't recover unseen text, only stop an abrupt ending reading as a different genre | `To Action` recall at low `body_chars` |
 | `v7-asymmetric` | "when genuinely torn between To Action and anything else, choose To Action" | a prompt-level thumb on the scale beside the floor | `to_action_retention` **and** the calibration gap, since it will distort the distribution |
+| `v8-updates` | `Updates` described as "informational; no action ever needed", dropping **"low-priority"** | the description welds a structural claim to a judgement about the reader's interest, and only the first is the taxonomy's business. A serious, high-interest, no-action email - the MEAA/CGA statement to actors - reads as excluded by its own category | accuracy on the `Updates` row, and the `Updates`/`Personal` cell in particular: the hypothesis is that "low-priority" pushes substantive bulk mail toward `Personal`, which *keeps `INBOX`* and is therefore not a free error |
 
 ---
 
@@ -471,9 +526,16 @@ whether the HTML path classifies as well as the plain path, and whether a
    **Done.** `app/evalset.py` + thin CLI; the frame pinned to absolute dates
    per A4; 258 tests, ruff clean, no new dependencies. The sample itself is
    not yet drawn against the real mailbox.
-3. **← next.** `label_eval.py label` + cache → ~1.5–2 hours of hand-labelling
-4. `prompt_id` migration in `classifier.py` and `logbook.py` + the `PROMPTS`
-   registry
+3. ~~`label_eval.py label` + cache → ~1.5–2 hours of hand-labelling~~
+   **Done.** `app/evallabel.py` + the keypress loop and `verify`; `--relabel`
+   added when `b` proved to be sitting-local. **200/200 labelled**, `verify`
+   clean, `n_h == sampled` in every stratum. 318 tests, ruff clean, no new
+   dependencies. Ground truth: `Promotions` 79, `Receipts` 42, `To Action` 37,
+   `Updates` 23, `Personal` 14, `Bookings` 5; 10 flagged `unsure`. Labelling
+   found two extraction bugs invisible to the test suite (A7) and produced the
+   labelling rules recorded below.
+4. **← next.** `prompt_id` migration in `classifier.py` and `logbook.py` + the
+   `PROMPTS` registry
 5. `eval/run_eval.py` — predict/score split, all metrics, `eval/results/`
 6. Baseline run → `body_chars` × model sweep → prompt sweep
 7. `label_eval.py recheck` — the self-consistency ceiling
@@ -658,7 +720,7 @@ hand-labelled messages. Produces `eval/labeled.jsonl` (committed) and
 ### Module boundaries
 
 ```
-app/evallabel.py        pure: records, corrections, deferrals, progress, rendering
+app/evallabel.py        pure: records, corrections, progress, the cache, rendering
 scripts/label_eval.py   the keypress loop and terminal I/O
 ```
 
@@ -671,9 +733,9 @@ same line as before: anything testable without a terminal lives in `app/`.
 |---|---|
 | Presentation order | Randomised across strata, `Random(seed + 2)`, deterministic so resume keeps the order |
 | Stratum in the UI | **Never shown.** `S_action` on screen is a direct hint at `To Action` |
-| `b` (back) | Appends a correction; last row in file order wins, **within a pass** |
+| `b` (back) | Appends a correction; last row in file order wins, **within a pass**. Reaches back through the current sitting only - `--relabel <id>` covers earlier ones |
 | Fetch | Batches of 50, cached at fetch time; `--batch` flag to lower it |
-| `unsure` | `u` defers, re-presented after the main pass; pass 1 must reach 200 |
+| `unsure` | `u` flags the message on screen; the next digit writes `unsure=True` **[A5]** |
 | Blind recheck | Pass 2, only after pass 1 is complete. `verify` refuses otherwise |
 | Unclassifiable mail | Not skipped - it is a taxonomy signal. See below |
 
@@ -702,7 +764,7 @@ to invalidate and no historical results to re-score.
 ```python
 @dataclass(frozen=True)
 class LabelRecord:
-    message_id: str; label: str; unsure: bool; labelled_at: str; pass_no: int
+    message_id: str; label: Category; unsure: bool; labelled_at: str; pass_no: int
 
 @dataclass(frozen=True)
 class Cached:
@@ -711,13 +773,32 @@ class Cached:
 
 def ordering(sample: Sequence[Sampled], seed: int) -> list[str]
 def resolve(records: Sequence[LabelRecord], pass_no: int = 1) -> dict[str, LabelRecord]
-def pending(order, resolved, deferred) -> list[str]
-def render(message: Cached, body_chars: int, show_full: bool) -> str
+def pending(order, resolved, skipped=()) -> list[str]
+def render(message: Cached, body_chars: int, show_full: bool, *, now, position, total) -> str
 def append_record(record: LabelRecord, path: Path) -> None      # flushed per write
-def load_records(path: Path) -> list[LabelRecord]               # tolerant read
+def load_records(path: Path) -> tuple[list[LabelRecord], int]   # tolerant read
 def cache_put(message: Message, directory: Path) -> None
 def cache_get(message_id: str, directory: Path) -> Cached | None
+def cache_missing(ids: Iterable[str], directory: Path) -> list[str]
+def unfinished(records, sample_ids, pass_no=1) -> list[str]     # the pass-2 guard
+def counts_by_stratum(sample, resolved) -> dict[str, dict[str, int]]
 ```
+
+Five refinements to that list, made while building and none of them design
+changes. `label` is typed `Category` rather than `str`, which is how "unknown
+category rejected on write" becomes unrepresentable rather than a check that
+could be forgotten. `load_records` returns a count of unreadable lines beside
+the rows, mirroring `logbook.read_all` exactly, so `verify` can report damage
+instead of silently reading past it. `pending` takes the sitting's skipped ids
+where it used to take deferrals **[A5]**. `cache_missing` is what lets the
+fetch loop ask for a chunk without re-reading every file. `unfinished` and
+`counts_by_stratum` are the two things `verify` reports that nothing else
+computes — the second being the labelled-not-sampled `n_h` that step 5 weights
+by.
+
+Paths are parameters here with no defaults, and `scripts/label_eval.py` supplies
+them. The pure module cannot then write into the real `data/` because a test
+forgot to redirect it.
 
 ### The UI
 
@@ -728,8 +809,8 @@ Subject:  Your reservation is confirmed
 
 Thank you for booking. Your stay at ... [1,500 of 4,207 chars — m for more]
 
-1 To Action  2 Bookings  3 Receipts  4 Promotions  5 Updates  6 Personal
-u unsure (defer)   s skip   b back   m more   q save and quit
+1 To Action  2 Receipts  3 Bookings  4 Updates  5 Promotions  6 Personal
+u unsure (flag)    s skip   b back   m more   q save and quit
 ```
 
 Body shown is `message_body.select_body()` output - what the model will
@@ -738,9 +819,246 @@ is what the email *is*, not what the model can see, or every `body_chars`
 change would silently redefine the target. Stated in the CLI help alongside
 the arrived-at rule.
 
+`--relabel <id> ...` re-presents already-labelled messages instead of
+continuing the queue. Needed because `b` walks back only through the current
+sitting, while `pending()` filters out every resolved id - so without it a
+decision made on a previous day is unreachable, and a rule refined at message
+150 cannot be applied to something labelled at message 20. It appends a
+correction like `b` does, and leaves the pending queue untouched.
+
 Single keypress via stdlib `termios`/`tty` - 200 messages is 200 spurious
 Enters otherwise - falling back to line mode when stdin is not a tty, so tests
 need no pty.
+
+### The labelling rules — how a hard case gets decided
+
+Derived while labelling, each from a real message. Written down because step 7
+measures self-consistency: a rule applied differently on message 20 and message
+180 shows up as labeller noise and eats into the ceiling the model is scored
+against. A rule that is *wrong* but consistent is far cheaper - it appears as a
+clean confusion-matrix cell that can be seen and argued with.
+
+**Before any of them: never label to what the model is expected to manage.**
+A paid invoice is `Receipts`, even if the model will probably read "invoice"
+and say `To Action`. Labelling it `To Action` to match that expectation bakes
+the model's weakness into the target, and three things break at once: whether
+it can tell becomes unmeasurable, because the target agrees with the error; a
+better model that *does* understand "paid" scores worse; and every comparison
+in step 6 is anchored to the capability assumed at labelling time. This is the
+truncation-marker rule one level up - ground truth is what the email *is*, not
+what the model can see, and equally not what it can understand. Labelled
+correctly, the question becomes a `Receipts` -> `To Action` cell in the
+confusion matrix and a prompt fix that can be scored.
+
+There is a sampling reason too. `S_action` is mined on
+`subject:(invoice OR "payment due" OR overdue ...)`. If ground truth follows
+those same keywords, the eval measures whether the model can spot the words
+used to *select* the messages rather than whether it understands them. The
+strata are defined by observable queries and never by a guess at the label, to
+stop the label leaking into the frame; labelling by keyword leaks it in from
+the other end.
+
+A note on `Updates` while labelling: its description reads "low-priority
+informational content, no action ever needed". Only the second half is a rule.
+A serious, high-interest, no-action email is still `Updates` - what the label
+decides is whether the message stays in the inbox, not whether it is worth
+reading, and `Agent/Updates` is a shelf rather than a bin. The wording is a
+prompt candidate in §5 (`v8-updates`) because the model is given it too.
+
+Alongside the arrived-at rule (label what it should have been **when it
+arrived**), four questions, in order:
+
+**1. Does the email demand something of you, or inform you?** Informing is
+`Updates`, even when the subject matter might prompt work of your own. A Sentry
+weekly error digest for a hobby app informs; nobody is waiting on a reply, and
+next week's digest supersedes it. The trap is reading `To Action` as "concerns
+something I might work on", which makes every newsletter on a topic you care
+about actionable and empties the category of meaning.
+
+**2. If it demands, does ignoring it cost *you* anything?** A bill, a renewal,
+an expiring verification - ignoring those costs you, so `To Action`. A review
+request, a survey, an NPS prompt - ignoring those costs you nothing and the
+sender wants your time, so `Promotions`. Solicitation is not obligation.
+
+The case to slow down for is a matter of your own that is **blocked on your
+reply**: "confirm your details so we can continue" stalls something you
+started, so it is `To Action`, while "how did we do?" from the same support
+thread in the same week is a survey. Arriving inside a thread you opened is not
+what decides it, and neither is a human-looking sender - a CSAT survey fires on
+ticket closure and is automated mail, so it is not `Personal` either, which
+matters because `Personal` keeps the inbox.
+
+Noted against the gate: this is the first place rule 2 and a category
+*description* disagree - "marketing content trying to sell something" describes
+a Hostelworld review request better than a Google support survey, and `Updates`
+reads more naturally for the latter. Taken as `Promotions` for consistency,
+since the underlying act is identical and the error is free. If several more
+land this way, the taxonomy is the thing to revisit, not the labels.
+
+**3. A deadline only counts when the thing expiring is already yours.** Your
+subscription lapsing or your domain needing renewal is a real deadline:
+`To Action`. A free trial you never asked for, or 50% off ending Sunday, is a
+marketing urgency device: `Promotions`. Note the near neighbour from the same
+sender - "your trial ends in 3 days and your card will be charged" *is*
+`To Action`, because something of yours expires and money moves.
+
+**Boilerplate is not a demand.** Delivery mail is the test case, being both
+high-volume and time-sensitive. "Out for delivery" informs, so `Updates`; "be
+home Tuesday 9-11 or it returns to the depot" is a specific act at a specific
+time on something already yours, so `To Action`. But most carriers append "a
+signature may be required" to *every* notification, and counting that would
+drag the whole class into `To Action` and flood the inbox. The test is a named
+window, a reschedule link or an address confirmation - not a footer mentioning
+presence. (`Updates` vs `Bookings` for a parcel is a free error; a parcel in
+transit is not a reservation, but both archive.)
+
+This class also tests the arrived-at rule harder than any other. A delivery
+notification is inert within hours, and by labelling time the parcel arrived
+weeks ago. It was `To Action` **when it arrived**. Letting hindsight decide
+collapses every time-sensitive message into `Updates` and measures `To Action`
+recall against a target that quietly excludes the most urgent mail in the
+mailbox.
+
+**Money: tense is the discriminator.** Periodic statements - investing,
+banking, betting - are `Receipts`. The operative half of that category's
+description is "record-keeping only", not "a transaction", and the functional
+argument is stronger still: a label is only worth anything if the set it
+produces is the set you would go looking in. Statements scattered into
+`Updates` make `Receipts` incomplete for its single job.
+
+The rule is *not* "anything to do with money", which reads on both sides of the
+expensive boundary. Money that has already moved - receipts, statements,
+payment confirmations - is `Receipts`. Money being demanded of you - invoices,
+bills, failed payments, a card about to be declined - is `To Action`.
+
+**Money scheduled to move automatically is also `To Action`**: "your membership
+will auto-renew on November 28" is a pre-billing notice, and the only moment at
+which the charge can be stopped. It is strictly worse than an ordinary bill,
+because the default outcome is payment rather than a reminder. Note this is the
+*opposite* tense from the renewal receipts filed under `Receipts` - the
+discriminator is before-or-after the charge, not how large it is. A change you
+cannot prevent and that costs nothing (Cursor's "we're auto-upgrading to
+Composer 2") stays `Updates`. Missed in the first draft of this rule and caught
+by the human while relabelling. A bill
+filed as `Receipts` is a missed bill, which is the only error in this system
+that costs anything. Where a statement carries an actual demand ("confirm your
+risk profile"), rule 2 takes over and the statement wrapper does not matter.
+
+**`Personal` is mode of address, not importance.** A joint MEAA/CGA statement
+to actors about misconduct allegations is sincere, human-written, serious and
+directly relevant - and it is `Updates`, because it opens "Dear Actors" and
+goes to a whole membership. The definition is "written by a real person
+directly to the reader, not automated or bulk mail", and the test is whether
+someone wrote *to you*, not how much the content matters.
+
+Load-bearing, because `Personal` is one of the two categories in
+`KEEPS_INBOX`. If weighty bulk mail qualifies, the inbox fills with every
+important-sounding announcement and the category stops meaning "a human wrote
+to me", which is the only thing that makes it worth keeping visible. Bulk
+announcements from an organisation you belong to - union, guild, club, school,
+body corporate - are `Updates` regardless of gravity.
+
+`docs/PLAN.md` names `Personal` as a Phase 2 checkpoint where reality is
+expected to argue back. The rule held here. Repeatedly *wanting* `Personal` for
+serious bulk mail would be evidence the taxonomy is missing something, not
+evidence of bad labelling.
+
+**The order lifecycle, once, because it recurs constantly.** `S_txn` is mined
+on `subject:(receipt OR order OR booking OR reservation OR confirmation)` and
+contributes 34 of the 200, so consistency here shapes a whole stratum:
+
+| message | label |
+|---|---|
+| "Order received / confirmed", with number and total | `Receipts` |
+| "Shipped" / "out for delivery" / "delivered" | `Updates` |
+| "Be home Tuesday 9-11 or it returns to the depot" | `To Action` |
+| "Rate your purchase" | `Promotions` |
+
+The discriminator between the first two is whether the email *is* the record or
+merely reports on it. Hence the edge case: "we have received your enquiry"
+carries no money and no reference worth keeping, so `Updates`.
+
+**Precedence, for labelling: a human wrote it -> `Personal`**, even when the
+message is also a booking or also a demand. A person writing "confirmed for
+Tuesday 6pm, wear black" is `Personal`; the platform's automated confirmation
+sitting in the same thread is `Bookings`. The question is who typed it, which
+is a fact rather than a judgement and therefore survives 200 repetitions - and
+it keeps `Personal` from eroding into "human mail with nothing asked of it".
+
+The decisive argument is learnability, raised by the human while relabelling:
+"did a person write this?" is detectable from the text - salutation, signature
+block, reply chain, non-bulk phrasing - whereas "does this human email demand
+something?" requires reading intent and has a genuinely fuzzy boundary. Two
+real examples a sentence apart in tone, "it is important that your clearance is
+completed" and "it may be best for yourself to raise this directly", would sit
+on opposite sides of it. Split that way the model is penalised for failing a
+distinction that changes nothing; kept together, `Personal` is a clean class
+and `To Action` stays coherent as *automated* actionable mail.
+
+Nothing is lost operationally: `Personal` is in `KEEPS_INBOX`, so a friend's
+payment request still counts as saved under `to_action_retention`. Where the
+model calls such a message `To Action` against a `Personal` target, the 6x6
+matrix records a confusion while the collapsed 2x2 action matrix scores it
+correct - both keep the inbox, and the metric with consequences absorbs it. `Personal`
+vs `To Action` is therefore a **free error** on any human-written message; the
+consequential mistake is `Bookings`, which archives it. The cost to note is
+that `to_action_recall` becomes a measurement over *automated* actionable mail
+- arguably the honest number, since human mail gets noticed regardless and the
+agent's value is in the automated pile.
+
+This is the contradiction §5's `v2-ordered` candidate exists to resolve in the
+prompt. The labelling rule above and that candidate's ordering agree
+deliberately, so ground truth and the winning prompt are not pulling in
+opposite directions.
+
+**Something you initiated that has not completed is `To Action`** - bounce
+notices, failed sends, declined payments, stalled submissions. "Delay" and
+"Failure" are the mail server's vocabulary, not yours: a real pair in the eval
+set shows a Gmail *delay* notice carrying a hard `550` ("the account or domain
+may not exist") followed two days later by the *failure* for the same
+recipient. The delay notice was two days of runway to reach a travel supplier
+another way; labelling it `Updates` on the strength of the word "delay" would
+have thrown that away. Split on what happened to you, not on the term the
+system used.
+
+**The justification for a label has to be visible in the message.** Platform
+activity notifications - streaks, "your post got 26 impressions", "14 others
+reacted", year-in-review recaps - are `Updates`. They report a fact about what
+you did; nothing is offered and nothing is sold. Calling them `Promotions`
+because streak mechanics exist to drive retention appeals to how apps make
+money, which is not in the email - and the model only sees the text, so the
+target would be trained on evidence the input does not contain.
+
+Contrast the casting call, which is `To Action` on textual evidence: a shoot
+date, a rate, "submit for ONE role". Knowing the agency works for you helps
+explain the label; it is not what carries it.
+
+**4. A conditional demand is judged on the cost of being wrong, not on how
+often it needs acting on.** "Changes were made to your Apple account - respond
+if this wasn't you" needs nothing ninety-nine times in a hundred, which by
+frequency alone reads as `Updates`. The hundredth is an account takeover with a
+window measured in hours, and the expected cost is dominated entirely by it.
+`To Action`.
+
+This is not an exception to the rules above but the argument the system is
+already built on: `to_action_floor` keeps `INBOX` when `p(To Action)` clears a
+*low* bar even against a different argmax, precisely because the error is
+asymmetric. Security notifications are therefore `To Action` as a class - new
+device sign-in, password changed, recovery email added, 2FA disabled, "was this
+you?" - which removes the case-by-case judgement that would otherwise drift
+across 200 messages.
+
+Phishing imitates this genre, and the taxonomy has nowhere sensible to put it.
+It should not arise: `messages.list` defaults `includeSpamTrash` to false and
+`gmail_client.search_refs` never overrides it, so anything Gmail already caught
+is outside the frame by construction. If one does appear in the sample, that is
+a taxonomy finding worth raising rather than a label to force.
+
+The rules line up with the only error in this system that costs anything. A
+missed bill is a real loss; a missed promotion is not a loss at all. Where a
+rule is uncertain, the question to ask is which side of `KEEPS_INBOX` the
+message belongs on - `Updates` vs `Promotions` is a free error, because both
+archive, while either of those against `To Action` is not.
 
 ### Input fidelity — the cache is exactly what the model reads
 
@@ -779,6 +1097,18 @@ there, so `run_eval` computes the hits at score time from `load_allowlist()`.
 They get their own bucket in the report (a rule is right or wrong, with no
 confidence) and are **excluded from the calibration table and the threshold
 sweep**.
+
+**Score prefilter hits on the action, not the 6-way label.** The rule can only
+ever emit `Agent/Promotions` (`decision.decide_prefilter_hit`), so a
+prefiltered message whose true label is `Updates` counts as an error under
+6-way scoring while being entirely correct operationally - both archive. Found
+while labelling a LinkedIn job digest from `jobs-listings@linkedin.com`, a
+plausible allowlist entry whose ground truth is `Updates`; bulk `Updates` mail
+is common enough that 6-way scoring would report the prefilter as badly wrong
+when it is doing exactly its job. Its bucket is therefore reported against the
+collapsed keeps-INBOX / archived matrix, with the 6-way breakdown shown
+separately and read as "which category the allowlist is absorbing" rather than
+as accuracy.
 
 **`w_h` comes from labelled counts, not sampled counts.** `strata.json`
 records what was *sampled*. If any message ends up unlabelled, `n_h` is

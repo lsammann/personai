@@ -299,11 +299,29 @@ and reached the model carrying no readable words. The rule is now:
   promotion stays `Personal`, while a friend forwarding an invoice keeps
   "invoice" and "due" in reach. Measured at 0 of 250 sampled messages, so this
   is consistency rather than a fix to an observed failure.
-- Prefer `text/plain`.
-- **Stub fallback:** a `text/plain` part under 200 characters sitting beside
-  stripped HTML more than twice its length is a "view this in your browser"
-  stub, not a body — use the HTML. 1.3% of mail, and it fails silently
-  otherwise, since the result is indistinguishable from a short email.
+- Prefer `text/plain` — **unless it is really an HTML document.** Some senders
+  ship the same markup under both MIME types; preferring plain then spends the
+  whole budget on `<meta>` tags. A plain part opening with a doctype is
+  stripped like HTML and recorded as its own `body_source`, `plain_markup`.
+  1 of 64 sampled messages.
+- **Stub fallback:** a `text/plain` part that is either under 200 *informative*
+  characters, or declares itself ("this email is only available in HTML"),
+  sitting beside more than twice its informative length in stripped HTML, is a
+  placeholder rather than a body — use the HTML. It fails silently otherwise,
+  since the result is indistinguishable from a short email.
+
+  **Informative** means URLs and zero-width padding discounted. Measuring raw
+  length measured neither side honestly: one real message carried 707 plain
+  characters of which 361 were two tracking URLs, against 1,061 stripped HTML
+  characters of which 104 were invisible preheader spacers — failing both the
+  length test and the ratio test at once, so no threshold could have recovered
+  it. The threshold itself remains at 200 and unmeasured; whether it should
+  move is a question for the eval cache.
+- **URLs are rewritten to their host** in the selected body. They are a median
+  28% of a body and can exceed 90% of the visible budget, they tokenize close
+  to worst-case, and on CPU-only inference prompt length *is* latency. The host
+  survives because `account.proton.me` says something a `?qs=ABB7...` tracking
+  token never can.
 - HTML-only mail uses the stripped HTML.
 - Stripping is a stdlib `HTMLParser` subclass — tags removed,
   `script`/`style`/`head` *content* dropped, entities decoded, whitespace

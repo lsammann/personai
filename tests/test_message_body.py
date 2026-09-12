@@ -14,6 +14,7 @@ from app.message_body import (
     EXTRACTION_VERSION,
     STUB_MAX_CHARS,
     Selection,
+    informative_length,
     select_body,
     strip_html,
 )
@@ -177,6 +178,124 @@ def test_surrounding_whitespace_is_stripped_but_internal_structure_is_kept():
 def test_a_failed_html_parse_is_carried_on_the_selection():
     selection = select_body("", "<p>ok</p>")
     assert selection.parsed_ok is True
+
+
+# --- v3: informative length, declarations, and URLs ------------------------
+
+
+def test_zero_width_padding_is_removed():
+    """Preheader spacers: invisible, meaningless, and 10% of one real budget."""
+    selection = select_body("", "<p>Here's what to do" + "\u200c " * 100 + "</p>")
+    assert "\u200c" not in selection.text
+    assert selection.text.startswith("Here's what to do")
+
+
+def test_zero_width_padding_is_removed_from_plain_too():
+    assert select_body("Amount\u200b due", "").text == "Amount due"
+
+
+def test_a_url_is_rewritten_to_its_host():
+    """The host says what kind of mail this is; the tracking token cannot."""
+    selection = select_body(
+        "Confirm here https://click.email.seek.com.au/?qs=ABB7InYiOjEsImQiOjQ4NTR9", ""
+    )
+    assert selection.text == "Confirm here click.email.seek.com.au"
+
+
+def test_urls_are_rewritten_on_the_html_path_as_well():
+    selection = select_body("", '<a href="#">see</a> https://account.proton.me/x?y=1')
+    assert "account.proton.me" in selection.text
+    assert "?y=1" not in selection.text
+
+
+def test_a_url_with_no_host_does_not_vanish_silently():
+    assert select_body("go to https:///nowhere", "").text == "go to link"
+
+
+def test_informative_length_ignores_urls_and_padding():
+    assert informative_length("hi\u200c there https://example.com/" + "x" * 500) == 8
+
+
+def test_a_plain_part_that_is_mostly_tracking_url_is_a_stub():
+    """The measured SEEK failure: 707 characters, 361 of them one URL.
+
+    Under raw lengths this passed neither test - too long, and a ratio of 1.5
+    deflated by the HTML's own padding. It is a stub by every reading except
+    the arithmetic.
+    """
+    plain = (
+        "This email is only available in HTML. To see the full message, "
+        "please view it in your browser https://click.email.x.com/?qs="
+        + "A" * 400
+    )
+    html = "<p>" + "The interview questions employers cannot ask you. " * 12 + "</p>"
+    selection = select_body(plain, html)
+    assert selection.source == "stub_fallback"
+    assert "interview questions" in selection.text
+
+
+def test_a_declaration_waives_the_length_test():
+    """No threshold can be low enough to catch a declaration wrapped in a footer."""
+    plain = "This email is only available in HTML. " + "Footer boilerplate. " * 20
+    html = "<p>" + "Real content here. " * 60 + "</p>"
+    assert select_body(plain, html).source == "stub_fallback"
+
+
+def test_a_declaration_does_not_waive_the_ratio_guard():
+    """The guard applies to both routes in - otherwise the phrase alone could
+    throw away a body the HTML does not actually carry."""
+    plain = "This email is only available in HTML. " + "Real content. " * 30
+    assert select_body(plain, "<p>tiny</p>").source == "plain"
+
+
+def test_a_human_note_containing_a_link_keeps_its_plain_text():
+    """The case the ratio guard exists for, now that URLs stop inflating it."""
+    note = "yeah that works, details here https://calendar.google.com/e?eid=abc123"
+    selection = select_body(note, f"<div>{note}</div>")
+    assert selection.source == "plain"
+    assert selection.text.endswith("calendar.google.com")
+
+
+# --- v4: markup mis-declared as plain text --------------------------------
+
+
+def test_a_plain_part_that_is_an_html_document_is_stripped():
+    """Measured on a Collingwood FC mailout: 120,567 characters of `<meta>`.
+
+    Preferring plain would otherwise feed the model a stylesheet - the exact
+    failure DESIGN.md records for the old extractor, returning through a
+    mis-declared content type rather than a missing part.
+    """
+    plain = (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<style>.a{color:red}</style>"
+        "</head>\n<body><p>A message for the Magpie Army</p></body></html>"
+    )
+    selection = select_body(plain, "")
+    assert selection.source == "plain_markup"
+    assert selection.text == "A message for the Magpie Army"
+
+
+def test_markup_mis_declared_as_plain_is_reported_as_its_own_cohort():
+    """`body_source` is what the eval segments accuracy by - unanswerable later."""
+    selection = select_body("<html><body>hi there</body></html>", "")
+    assert selection.source == "plain_markup"
+
+
+def test_a_plain_part_merely_mentioning_a_tag_is_not_markup():
+    """The declaration is the test, not tag density: markup quoted inside a
+    real plain-text email is a different thing and must stay plain."""
+    note = "use <b>bold</b> for the heading, it reads better than <i>italics</i>"
+    selection = select_body(note, "")
+    assert selection.source == "plain"
+    assert selection.text == note
+
+
+def test_the_combining_grapheme_joiner_is_stripped():
+    """U+034F, 3,081 occurrences across 64 cached messages - the commonest
+    spacer in this mailbox, and missed on the first pass."""
+    selection = select_body("", "<p>A message" + "\u034f " * 50 + "for you</p>")
+    assert "\u034f" not in selection.text
+    assert selection.text == "A message for you"
 
 
 # --- the version constant -------------------------------------------------
