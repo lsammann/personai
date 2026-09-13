@@ -325,6 +325,83 @@ that from a long email.
 Body sources across the cache afterwards: `plain` 48, `html` 12,
 `stub_fallback` 3, `plain_markup` 1.
 
+### The n=200 audit — `v2` vs `v4`, against labels
+
+Run 2026-09-13 by `scripts/measure_extraction.py` over all 200 cached eval
+messages, each with a hand label attached. Offline: no Gmail, no Ollama.
+This is the re-run the two sections above asked for.
+
+**Seven source flips out of 200, and none on a `Personal` message** — the only
+category where picking the wrong part costs something, since `Personal` keeps
+the inbox. Each was read individually rather than counted:
+
+| label | v2 | v4 | message |
+|---|---|---|---|
+| Promotions | plain 707 | stub_fallback 853 | SEEK — the declared-HTML-only case |
+| Promotions | plain 1,725 | stub_fallback 5,238 | Qantas Travel Insider |
+| Promotions | plain 18,620 | stub_fallback 1,132 | Skyscanner — 99.2% tracking URL |
+| Promotions | plain 95,852 | plain_markup 360 | Collingwood "Flash sale" |
+| Promotions | plain 101,188 | plain_markup 635 | Collingwood "Magpie Mega Draw" |
+| Promotions | plain 120,567 | plain_markup 371 | Collingwood "Magpie Army" |
+| To Action | plain 193 | stub_fallback 232 | SerpApi confirmation |
+
+Two things the wider sample changed. **The markup-as-plain bug is 3 in 200, not
+1 in 64** — all three Collingwood, each previously spending the whole budget on
+CSS. And the Qantas flip validates the declaration test specifically: its plain
+part is 596 informative characters of pure chrome ("having trouble viewing",
+"update preferences", "unsubscribe", "online help") with no content at all, so
+no value of `STUB_MAX_CHARS` could have caught it while the ratio test measured
+raw length.
+
+**`STUB_MAX_CHARS` stays at 200, and the question is retired.** Raising it
+would newly capture seven messages — six marketing plus a LinkedIn digest, no
+human mail. Lowering it changes nothing. The one `Personal` message the stub
+rule *does* fire on (a 39-character reply, "Hi Luke, Thank you! Kind regards,
+Paula") comes out better for it: the HTML opens with those same 39 characters
+and then adds a signature, a company name and the quoted thread, where the
+plain part alone is nearly contentless. Not provably optimal — but no candidate
+value changes anything that matters in this mailbox, which is a more useful
+answer than leaving it open.
+
+### Body length under `v4` — the input to the `body_chars` sweep
+
+| cohort | n | p10 | p50 | p90 |
+|---|---|---|---|---|
+| all | 200 | 466 | **1,678** | 5,335 |
+| plain | 146 | 525 | 1,947 | 6,266 |
+| html | 44 | 376 | 1,182 | 3,692 |
+| stub_fallback | 7 | 232 | 1,065 | 5,238 |
+| plain_markup | 3 | 360 | 371 | 635 |
+
+**The distribution has collapsed.** The old selected-body figures were p50
+3,874 and p90 23,332; they are now 1,678 and 5,335 — a 57% drop at the median
+and 77% at p90, from URL rewriting and markup stripping together.
+
+| body_chars | sent whole | chars per 200-message run |
+|---|---|---|
+| 0 | 0% | 0 |
+| 300 | 4.5% | 59,151 |
+| 800 | 25.0% | 144,863 |
+| 1500 | **44.5%** | 236,661 |
+| 3000 | **72.5%** | 356,110 |
+
+Consequences for step 6:
+
+- **The planned candidates `{0, 300, 800, 1500, 3000}` still straddle the
+  distribution well** — each step moves whole-message coverage materially
+  (0 → 4.5 → 25 → 44.5 → 72.5%), so no run is spent on a knob that is not
+  moving. Going above 3,000 would be: p90 is 5,335, so 3,000 already truncates
+  only the top quarter.
+- **"One `body_chars` doing two jobs" has largely healed.** The old gap between
+  plain (p50 5,637) and stripped HTML (p50 1,598) was 3.5x; under `v4` it is
+  1,947 vs 1,182, or 1.6x. Most of that gap was tracking URLs in plain parts.
+- **Two `body_source` cohorts are too small to carry a conclusion.**
+  `plain_markup` has 3 members and `stub_fallback` 7. Step 5 reports accuracy
+  by source; those two rows must be shown with their n and read as anecdote.
+- **One thin body in 200**: a 62-character `Personal` note ("CV & Cover Letter
+  for EY Role"), which is simply a short email. Nothing systemic reaching the
+  model as sender-and-subject only.
+
 ## Forwarded mail and reply chains
 
 - **`message/rfc822` (forward "as attachment"): 0 of 250, 0.0%** — 95% upper
@@ -450,7 +527,7 @@ Nothing here needs acting on now. It should be read at these points:
 - Sender concentration across the whole backlog rather than a recent sample.
 - Body-length distribution on a larger sample; 40 messages is thin for
   percentiles as skewed as these.
-- **Stub detection, against the eval cache** — the `v3` candidate above. The
-  cache is the right instrument: 200 real messages with raw text parts on
-  disk, so every candidate rule can be scored offline and the flips inspected
-  by hand before anything is bumped.
+- ~~Stub detection, against the eval cache~~ **Done 2026-09-13** — see The
+  n=200 audit above. `scripts/measure_extraction.py` re-runs it in one command
+  whenever an extraction rule changes, which is the point at which it should
+  be re-run.
