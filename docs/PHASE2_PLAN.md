@@ -18,7 +18,8 @@ before each is built. Where the two disagree, the step section is newer.
 > `ExitPlanMode` record of session `1ee31ef6`). The body below is that plan,
 > amended where the build has since diverged from it. Amendments are listed
 > immediately below and marked **[amended]** where they appear. A1-A3 date
-> from 2026-09-10; A4 from 2026-09-11; A5-A6 from 2026-09-12.
+> from 2026-09-10; A4 from 2026-09-11; A5-A6 from 2026-09-12; A7-A8 from
+> 2026-09-12 and 2026-09-13.
 
 ## Amendment log
 
@@ -112,6 +113,16 @@ Verified over the 22 messages cached so far — two source flips, both inspected
 by hand, both improvements. Built now rather than deferred at the human's call:
 no eval run exists, so the bump costs nothing, and a known bug left in the tree
 is a bug that gets forgotten. §1 amended.
+
+**A8 — The harness is `app/` code, not `eval/` code.** §3 put predict/score in
+`eval/run_eval.py`. That cannot be tested: `pyproject.toml` packages only
+`app`, `tests/conftest.py` adds no path shim, and §6 asks specifically for
+`score()` end to end with no mocks plus tests for weighting, Wilson intervals,
+TV distance and calibration boundaries. Step 2 hit the identical problem and
+its own module-boundary block already says `eval/  data only`, which §3
+contradicted. As built: `app/evalscore.py` (pure), `app/evalrun.py` (Ollama and
+disk), `scripts/run_eval.py` (CLI). `eval/` holds `sample.jsonl`,
+`labeled.jsonl`, `strata.json`, `results/` and `RESULTS.md`, and no code.
 
 ---
 
@@ -530,14 +541,21 @@ whether the HTML path classifies as well as the plain path, and whether a
    **Done.** `app/evallabel.py` + the keypress loop and `verify`; `--relabel`
    added when `b` proved to be sitting-local. **200/200 labelled**, `verify`
    clean, `n_h == sampled` in every stratum. 318 tests, ruff clean, no new
-   dependencies. Ground truth: `Promotions` 79, `Receipts` 42, `To Action` 37,
-   `Updates` 23, `Personal` 14, `Bookings` 5; 10 flagged `unsure`. Labelling
-   found two extraction bugs invisible to the test suite (A7) and produced the
-   labelling rules recorded below.
-4. **← next.** `prompt_id` migration in `classifier.py` and `logbook.py` + the
-   `PROMPTS` registry
-5. `eval/run_eval.py` — predict/score split, all metrics, `eval/results/`
-6. Baseline run → `body_chars` × model sweep → prompt sweep
+   dependencies. Ground truth after a full review pass (24 corrections via
+   `--relabel`): `Promotions` 82, `Receipts` 42, `To Action` 33, `Updates` 21,
+   `Personal` 16, `Bookings` 6; 6 flagged `unsure`. Labelling found two
+   extraction bugs invisible to the test suite (A7, audited at n=200 in
+   `docs/BACKLOG.md`) and produced the labelling rules recorded below.
+4. ~~`prompt_id` migration in `classifier.py` and `logbook.py` + the `PROMPTS`
+   registry~~ **Done.** `PROMPT_VERSION: int` → `DEFAULT_PROMPT_ID: str` plus
+   `PROMPTS`, `system_prompt()` and `prompt_hash()`; `logbook.Record`
+   field renamed. Registry holds `v1` only; variants land with the run that
+   tests them.
+5. ~~`eval/run_eval.py` — predict/score split, all metrics, `eval/results/`~~
+   **Done** as `app/evalscore.py` + `app/evalrun.py` + `scripts/run_eval.py`
+   per A8. 372 tests, ruff clean, no new dependencies. Verified end to end
+   against real Ollama on a 10-message slice.
+6. **← next.** Baseline run → `body_chars` × model sweep → prompt sweep
 7. `label_eval.py recheck` — the self-consistency ceiling
 8. Open the lock-box **once**; write measured thresholds and the model
    decision back into `DESIGN.md`, findings into `docs/PLAN.md`
@@ -1132,6 +1150,131 @@ refuses a pass 2 that starts before pass 1 is complete.
 Label 10, `Ctrl-C`, re-run - resumes at 11, no duplicates, no lost rows. Label
 one, `b`, relabel - `resolve` returns the second. `git status` shows
 `eval/labeled.jsonl` and not `data/eval_cache/`.
+
+---
+
+## Step 4 implementation — `prompt_id` and the `PROMPTS` registry
+
+Built 2026-09-13. A small refactor, done before step 5 because `predict()`
+records `prompt_id` in the manifest and passes it to `classify()`.
+
+```python
+PROMPTS: dict[str, Callable[[tuple[Category, ...]], str]] = {"v1": build_system_prompt}
+DEFAULT_PROMPT_ID = "v1"
+
+def system_prompt(prompt_id, order=DEFAULT_ORDER) -> str
+def prompt_hash(prompt_id, order=DEFAULT_ORDER) -> str    # sha256[:12] of the text
+```
+
+Three decisions worth keeping:
+
+**`v1` IS `build_system_prompt`, not a copy of its text.** The baseline has to
+be the shipped prompt or it is not a baseline, and a copy would drift the first
+time either was edited.
+
+**An unknown id raises rather than defaulting to `v1`.** The failure it
+prevents is silent: a typo in a sweep that fell back would file a run under the
+wrong label, and neither the results file nor the report would look wrong.
+
+**`prompt_hash` is the backstop for the id.** `categories.DESCRIPTIONS` *is*
+the prompt, so editing one line changes what every model sees. Filed under the
+same id, two such runs would look comparable. A test edits a description and
+asserts the hash moves.
+
+**Registry holds `v1` only.** Variants from §5 are written immediately before
+the run that tests them, so the text is fresh alongside its hypothesis and
+step 4 stayed a short job. `v8-updates` was added to the §5 table during
+labelling and is not yet written.
+
+`logbook.Record.prompt_version: int | None` became `prompt_id: str | None` -
+renamed, not just retyped, since `"v3-letters"` under a key called
+`prompt_version` reads as a mistake and the log has no real rows in it yet.
+`DESIGN.md`'s log-schema table and the comment in `categories.py` follow.
+
+---
+
+## Step 5 implementation — the eval harness
+
+Built 2026-09-13. §3 stands on what the harness reports; this records how it is
+put together and what §3 could not have known, having been written before the
+labels existed.
+
+### Module boundaries — see A8
+
+```
+app/evalscore.py      pure: metrics, intervals, sweeps, weighting, comparison
+app/evalrun.py        predict: cache -> classify -> rows; the results file
+scripts/run_eval.py   CLI: predict / score / compare
+eval/results/         data only, committed
+```
+
+`evalscore` imports neither `json` nor `pathlib` - reading a results file is
+`evalrun`'s job - so its purity is a property of the module rather than of
+which functions happen to behave. A test parses its imports against an
+allowlist, the same guard `app/decision.py` has. It *does* import
+`decision.decide`: `to_action_retention` asks whether a message would have kept
+`INBOX`, and a second copy of the threshold logic would measure the copy.
+
+### The results file
+
+Manifest as line 1, the idiom `evalset.save_frame` already uses - in the file
+rather than a sidecar, because a results file that has lost its manifest is a
+column of numbers whose meaning is unrecoverable. It carries `run_id`, `model`,
+`prompt_id`, `prompt_hash`, `body_chars`, `extraction_version`, `orders`,
+`sample_hash`, `git_commit`, `created_at` and **`n_messages`**.
+
+`n_messages` was not in the plan. Added after the first smoke run, when a
+`--limit 10` file turned out to be indistinguishable from a full run in its
+manifest - a reader scoring it later would have seen n=10 with nothing saying
+why.
+
+One row per **(message, letter order)** rather than three distributions per
+row, so `score()` filters by `order_name` and a run without `--permutations` is
+simply a file where every row says `"default"`. Rows carry ids, probabilities
+and timings; a key allowlist is checked on write, as in `evalset` and
+`evallabel`.
+
+### Decisions §3 left open
+
+**A failed call is recorded, never re-raised and never scored as wrong.** It
+gets a row with `error` set and no category, and is excluded from every
+accuracy denominator. `decision.py` draws the same line for the same reason:
+scoring an unreachable Ollama as a misclassification blames the model for the
+network.
+
+**Calibration buckets are half-open, so 0.8 lands in `[0.8,0.9)`.** §6 asked
+for this pinned; an off-by-one moves the threshold read off the table, and that
+number ends up in `DESIGN.md`.
+
+**Wilson, not the normal approximation.** At n=140 near 0.9 the normal
+approximation reports upper bounds above 1.0, and the per-stratum and
+per-source breakdowns are much smaller than that.
+
+**McNemar uses the exact binomial**, not chi-square: the discordant count is
+routinely under 25, where the approximation is anti-conservative.
+
+**`unsure` rows are reported both ways** - headline over everything, plus a
+second accuracy excluding them. Nothing is hidden, and if the model's errors
+cluster where the labeller was unsure that is a finding about the ceiling
+rather than the model. Decided with the human; §3 predates the flag existing.
+
+**The floor sweep skips values where `T + F >= 1`** rather than printing them
+as zero, since the asymmetric rule is unreachable there and
+`config._asymmetric_rule_must_be_reachable` refuses to start on such a pair.
+
+**Permutation orders are fixed** - one rotation, one reversal - not random. Two
+runs have to be comparable, and a random shuffle would make the stability
+number depend on which permutation came up.
+
+### Verification, as run
+
+`score` on a synthetic file reproduces accuracy, recall and the confusion
+matrix computed by hand (`tests/test_evalscore.py`). Then, against real Ollama:
+a 10-message `predict` at `body_chars=1500` (~8.7s per call), re-scored at a
+different threshold in **0.29 seconds** hitting neither Ollama nor Gmail; a
+second run at `body_chars=300` (~2.2s per call); and `compare` between them
+reporting 0 fixed / 1 broken. The latency difference between the two is the
+truncation lever visible in one line.
 
 ---
 

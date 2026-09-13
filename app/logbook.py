@@ -86,7 +86,12 @@ class Record(BaseModel):
     # mixed log cannot be segmented and the eval numbers become uninterpretable
     # the first time something changes mid-run.
     model: str | None = None
-    prompt_version: int | None = None
+    # A string id (`"v1"`, `"v3-letters"`), not the integer version this
+    # started as. Phase 2 sweeps named prompt variants, and a row saying
+    # `prompt_version: 3` cannot be read back against a table of hypotheses.
+    # Renamed rather than merely retyped while the log has no real rows in it -
+    # cheap now, painful after a backfill.
+    prompt_id: str | None = None
     body_chars: int | None = None
 
     # The thresholds in force, so a past decision can be recomputed against the

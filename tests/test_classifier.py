@@ -291,3 +291,61 @@ def test_both_failure_modes_share_a_base_class():
     """The caller retries on either, so it should not have to name both."""
     assert issubclass(NoCategoryLetter, classifier.ClassifierError)
     assert issubclass(OllamaError, classifier.ClassifierError)
+
+
+# --- the prompt registry --------------------------------------------------
+
+
+def test_v1_is_the_committed_prompt_not_a_copy_of_it():
+    """The baseline has to BE the shipped prompt, or it is not a baseline."""
+    assert classifier.system_prompt("v1") == classifier.build_system_prompt()
+    assert classifier.PROMPTS["v1"] is classifier.build_system_prompt
+
+
+def test_an_unknown_prompt_id_raises_rather_than_defaulting():
+    """A typo in a sweep must not file a run under the wrong label.
+
+    Falling back to v1 would be silent: nothing in the results file or the
+    report would look wrong, and every comparison drawn from it would be
+    invalid.
+    """
+    with pytest.raises(KeyError, match="unknown prompt_id"):
+        classifier.system_prompt("v9-typo")
+
+
+def test_the_default_prompt_id_is_in_the_registry():
+    assert classifier.DEFAULT_PROMPT_ID in classifier.PROMPTS
+
+
+def test_prompt_hash_is_stable_and_short():
+    first = classifier.prompt_hash("v1")
+    assert first == classifier.prompt_hash("v1")
+    assert len(first) == 12
+
+
+def test_editing_a_category_description_moves_the_prompt_hash(monkeypatch):
+    """The guard that catches a prompt change made without a new id.
+
+    `categories.DESCRIPTIONS` IS the prompt - editing one line changes what
+    every model sees - so two runs either side of an edit are incomparable.
+    Filed under the same `prompt_id` they would look comparable, and nothing
+    about the output would say otherwise.
+    """
+    before = classifier.prompt_hash("v1")
+    edited = dict(classifier.DESCRIPTIONS)
+    edited[Category.RECEIPTS] = "a transaction already completed, plus VAT"
+    monkeypatch.setattr(classifier, "DESCRIPTIONS", edited)
+
+    assert classifier.prompt_hash("v1") != before
+
+
+def test_prompt_hash_differs_between_letter_orders():
+    """Permutation runs are different runs; the manifest must say so."""
+    rotated = classifier.DEFAULT_ORDER[1:] + classifier.DEFAULT_ORDER[:1]
+    assert classifier.prompt_hash("v1") != classifier.prompt_hash("v1", rotated)
+
+
+def test_classify_builds_its_system_message_through_the_registry():
+    _, request = call(ollama_reply([entry("A", 0.9), entry("B", 0.1)]))
+    body = json.loads(request.data)
+    assert body["messages"][0]["content"] == classifier.system_prompt("v1")

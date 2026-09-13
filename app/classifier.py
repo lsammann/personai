@@ -16,10 +16,11 @@ emitted 0.900 for every email. See DESIGN.md -> Classification logic.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import urllib.request
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 from app.categories import (
@@ -39,10 +40,12 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 # probability 0 and the log records that it happened.
 TOP_LOGPROBS = 20
 
-# Bump on every prompt or category-definition edit, including a change to
-# DESCRIPTIONS in `categories`. Logged on every row, so a mixed log can be
-# segmented by which prompt produced it.
-PROMPT_VERSION = 1
+# Which prompt to build when a caller does not say. A string id rather than the
+# integer version this started as: Phase 2 step 6 sweeps named variants, and a
+# results file saying `prompt_version: 3` cannot be read back against a table
+# of hypotheses. Logged on every row, so a mixed log can be segmented by which
+# prompt produced it.
+DEFAULT_PROMPT_ID = "v1"
 
 # Measured identical to three decimal places at 0.5, 1.0 and 2.0 in Phase 0 -
 # reported logprobs are pre-temperature on this stack. Pinned anyway to
@@ -171,6 +174,56 @@ def build_system_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
     )
 
 
+# Prompt templates by id. DESIGN.md names `classifier` as their home, and the
+# Phase 2 sweep needs them addressable by name: a results file saying
+# `prompt_id: "v3-letters"` can be read back against the hypothesis table in
+# docs/PHASE2_PLAN.md, where `prompt_version: 3` cannot.
+#
+# `v1` is `build_system_prompt` itself rather than a copy of its text, so the
+# baseline is literally the committed prompt and cannot drift from it.
+# Variants are added immediately before the run that tests them - writing all
+# eight now would leave untested prompt strings in the tree for days, attached
+# to hypotheses that the baseline numbers may well revise.
+PROMPTS: dict[str, Callable[[tuple[Category, ...]], str]] = {
+    "v1": build_system_prompt,
+}
+
+
+def system_prompt(
+    prompt_id: str, order: tuple[Category, ...] = DEFAULT_ORDER
+) -> str:
+    """Build a prompt by id. An unknown id raises rather than defaulting.
+
+    Loudly, because the failure it prevents is silent: a typo in a sweep that
+    fell back to `v1` would file a run under the wrong label, and nothing in
+    the results file or the report would look wrong. Every conclusion drawn
+    from the comparison afterwards would be invalid.
+    """
+    try:
+        template = PROMPTS[prompt_id]
+    except KeyError:
+        raise KeyError(
+            f"unknown prompt_id {prompt_id!r}; known: {sorted(PROMPTS)}"
+        ) from None
+    return template(order)
+
+
+def prompt_hash(
+    prompt_id: str, order: tuple[Category, ...] = DEFAULT_ORDER
+) -> str:
+    """A short digest of the built prompt text, for the eval run manifest.
+
+    The id says which template; this says what that template actually produced.
+    They come apart the moment `categories.DESCRIPTIONS` is edited without
+    bumping the id - the category definitions ARE the prompt - and the result
+    is two incomparable runs filed under one label, which invalidates every
+    conclusion after it. Recorded beside `model`, `body_chars` and
+    `extraction_version` for exactly the same reason each of those is.
+    """
+    text = system_prompt(prompt_id, order)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 def build_user_message(
     sender: str, subject: str, text_plain: str, text_html: str, body_chars: int
 ) -> str:
@@ -185,10 +238,13 @@ def build_user_message(
 
     Truncation is the dominant performance lever, not a detail: the call emits
     a single token, so latency is essentially prompt length divided by the
-    prompt-eval rate. Real prose runs to a median of ~5,100 characters for
-    plain-text mail and ~1,600 for stripped HTML (docs/BACKLOG.md -> Body
-    structure), so one `body_chars` is doing two rather different jobs and the
-    Phase 2 sweep is what settles it.
+    prompt-eval rate. Measured over the 200-message eval cache under
+    EXTRACTION_VERSION v4 (docs/BACKLOG.md -> Body length under v4), the
+    selected body has a median of 1,947 characters for plain-text mail and
+    1,182 for stripped HTML. Those were 5,637 and 1,598 before URL rewriting,
+    so the gap that had one `body_chars` doing two rather different jobs has
+    largely closed - but which value is right is still what the Phase 2 sweep
+    settles.
     """
     body = select_body(text_plain, text_html).text
     return f"From: {sender}\nSubject: {subject}\n\n{body[:body_chars]}"
@@ -202,6 +258,7 @@ def classify(
     *,
     model: str,
     body_chars: int,
+    prompt_id: str = DEFAULT_PROMPT_ID,
     order: tuple[Category, ...] = DEFAULT_ORDER,
     url: str = OLLAMA_URL,
     timeout: int = DEFAULT_TIMEOUT,
@@ -223,11 +280,15 @@ def classify(
     only `text_plain` and silently classify the 23% of HTML-only mail on an
     empty body - the exact failure `message_body` exists to prevent, reachable
     by omission. An explicit `""` is the caller stating there is no HTML part.
+
+    `prompt_id` and `order` are the two knobs the Phase 2 sweep turns here.
+    Both are recorded in the eval run manifest, because a prediction is only
+    comparable to another made under the same pair.
     """
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": build_system_prompt(order)},
+            {"role": "system", "content": system_prompt(prompt_id, order)},
             {
                 "role": "user",
                 "content": build_user_message(

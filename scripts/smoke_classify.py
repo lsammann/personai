@@ -12,7 +12,7 @@ The questions it answers are about plumbing, not accuracy:
   - does an HTML-only email reach the model as readable words rather than
     as markup? That is 23% of real mail; see docs/BACKLOG.md.
 
-Worth re-running whenever the model, the prompt or `PROMPT_VERSION` changes -
+Worth re-running whenever the model, the prompt or `prompt_id` changes -
 it is the cheapest way to catch a prompt that a new model simply ignores.
 Accuracy is measured by `eval/run_eval.py` against real hand-labelled mail;
 these six synthetic emails prove nothing about it.
@@ -112,11 +112,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=cfg.ollama_model)
     parser.add_argument("--body-chars", type=int, default=cfg.body_chars)
+    parser.add_argument("--prompt", default=classifier.DEFAULT_PROMPT_ID)
     args = parser.parse_args()
 
     print(
         f"model={args.model}  body_chars={args.body_chars}  "
-        f"prompt_version={classifier.PROMPT_VERSION}  "
+        f"prompt={args.prompt} ({classifier.prompt_hash(args.prompt)})  "
         f"T={cfg.confidence_threshold}  F={cfg.to_action_floor}\n"
     )
 
@@ -126,6 +127,7 @@ def main() -> None:
             result = classifier.classify(
                 sender, subject, plain, html,
                 model=args.model, body_chars=args.body_chars,
+                prompt_id=args.prompt,
             )
         except classifier.ClassifierError as exc:
             print(f"{name}\n   FAILED: {type(exc).__name__}: {exc}\n")

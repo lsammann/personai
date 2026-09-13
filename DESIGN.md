@@ -490,7 +490,7 @@ the Metrics view silently averages across two models.
 | `distribution` | **all six probabilities.** The runner-up drives the asymmetric `To Action` rule, and a saturated distribution is only visible here |
 | `retained_mass` | share of the returned top-20 that sat on category letters at all, before renormalising — the only thing separating a confident answer from a barely-engaged one |
 | `model` | which Ollama model produced the row |
-| `prompt_version` | bump on every prompt or category-definition edit |
+| `prompt_id` | which prompt template produced the row (`"v1"`), from `classifier.PROMPTS`. A **string**, not the integer version this started as: Phase 2 sweeps named variants, and `3` cannot be read back against a table of hypotheses. A category-definition edit is a prompt change and needs a new id; `classifier.prompt_hash()` is the backstop |
 | `body_chars` | truncation length actually used |
 | `confidence_threshold`, `to_action_floor` | the thresholds in force, so a past decision can be recomputed |
 | `action` | labels added and removed — **always populated**, including on a dry run |
@@ -533,7 +533,7 @@ before it, including the full dry-run backfill most worth segmenting.
 becomes possible later. `undo_run.py` keeps its required time window with no
 default regardless.
 
-`model`, `prompt_version` and `body_chars` are the three tuning knobs Phase 2
+`model`, `prompt_id` and `body_chars` are the three tuning knobs Phase 2
 iterates on. Without them in the row, a mixed log cannot be segmented and the
 eval numbers become uninterpretable the first time something changes
 mid-run.

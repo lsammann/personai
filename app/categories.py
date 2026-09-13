@@ -47,8 +47,10 @@ class Category(StrEnum):
 
 
 # One line each. These are the category definitions the model is given, so
-# editing any of them is a prompt change and must bump PROMPT_VERSION in
-# `classifier`.
+# editing any of them is a prompt change: it needs a new `prompt_id` in
+# `classifier.PROMPTS`. `classifier.prompt_hash()` is the backstop that
+# catches an edit made without one - two incomparable eval runs filed under
+# the same label would invalidate every conclusion drawn from them.
 DESCRIPTIONS: Mapping[Category, str] = {
     Category.TO_ACTION: (
         "requires a decision, payment, reply, or click from the reader, "

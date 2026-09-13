@@ -22,7 +22,7 @@ def record(**overrides):
         "confidence": 0.91,
         "distribution": dict.fromkeys(Category, 0.0) | {Category.TO_ACTION: 0.91},
         "model": "llama3.1:8b",
-        "prompt_version": 1,
+        "prompt_id": "v1",
         "body_chars": 1500,
         "confidence_threshold": 0.8,
         "to_action_floor": 0.15,
