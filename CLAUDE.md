@@ -5,7 +5,7 @@ Personal Gmail classification agent. Read `DESIGN.md` for what and why,
 plan - `docs/PHASE2_PLAN.md` - for how this phase is being built and where the
 code has deliberately diverged from it.
 
-**Current phase: 2 (eval harness), step 7 of 8.**
+**Current phase: 2 (eval harness), step 8 of 8.**
 
 This file is the single source of truth for which **phase** is current;
 `docs/PHASE2_PLAN.md` → Build order is the single source of truth for which

@@ -577,10 +577,15 @@ whether the HTML path classifies as well as the plain path, and whether a
    **Harness built**, 2026-09-13: `recheck` + `--report`, the pinned draw per
    A9, `verify --pass 2` checking against that draw, and the keypress loop
    shared with `label` rather than copied. 393 tests, ruff clean, no new
-   dependencies. **The sitting itself is outstanding** — 30 messages of human
-   judgement, then the ceiling gets written into "Step 7 results" below.
-8. Open the lock-box **once**; write measured thresholds and the model
-   decision back into `DESIGN.md`, findings into `docs/PLAN.md`
+   dependencies. **Done 2026-09-14**: ceiling 28/30 six-way, **30/30 on
+   keeps-INBOX**; both flips were one unevenly-applied precedence rule, which a
+   nine-row `S_human` sweep then corrected in seven places; all fourteen runs
+   re-scored and `eval/RESULTS.md` rewritten. The selected configuration
+   survived — see "Step 7 results" below.
+8. **← next.** Open the lock-box **once**; write measured thresholds and the
+   model decision back into `DESIGN.md`, findings into `docs/PLAN.md`. Score
+   `20260913T113909-f1f3a4` on `--holdout`, against a ceiling of 28/30
+   [0.79, 0.98] six-way and 30/30 [0.89, 1.00] on keeps-INBOX.
 
 Per `CLAUDE.md`, each of these is planned before it is written, and nothing is
 committed by Claude — changes are left in the working tree and reported.
@@ -1069,9 +1074,18 @@ because streak mechanics exist to drive retention appeals to how apps make
 money, which is not in the email - and the model only sees the text, so the
 target would be trained on evidence the input does not contain.
 
-Contrast the casting call, which is `To Action` on textual evidence: a shoot
-date, a rate, "submit for ONE role". Knowing the agency works for you helps
-explain the label; it is not what carries it.
+Contrast the casting call, whose textual evidence is a shoot date, a rate and
+"submit for ONE role". Knowing the agency works for you helps explain a label;
+it is not what carries it.
+
+**[amended 2026-09-14, step 7]** That message was `To Action` when this rule
+was written and is now `Personal`: the precedence rule above - a human wrote
+it, so `Personal`, even when the message also demands something - takes it
+first, and precedence outranks the demand test by construction. The point the
+paragraph is making is unchanged, since the evidence is still in the text
+either way. Recorded rather than quietly rewritten, because a worked example
+that disagrees with `eval/labeled.jsonl` is exactly the drift this section
+exists to prevent.
 
 **4. A conditional demand is judged on the cost of being wrong, not on how
 often it needs acting on.** "Changes were made to your Apple account - respond
@@ -1306,6 +1320,14 @@ Run 2026-09-13. Sixteen prediction runs, ~3,400 model calls, zero failures.
 Every run is in `eval/RESULTS.md` with a one-line what-changed; the raw rows
 are in `eval/results/` and re-scorable forever.
 
+> **Read with step 7.** Every number in this section was computed against
+> ground truth as it stood on 2026-09-13. Step 7's recheck corrected seven
+> labels, and all fourteen runs were re-scored on 2026-09-14 — see "The
+> `S_human` sweep, and what the re-score moved" under step 7, and the corrected
+> table in `eval/RESULTS.md`. **The configuration selected here did not
+> change**; three of the conclusions below did, and the numbers quoted in this
+> section are the originals unless marked.
+
 ### The configuration this phase selected
 
 | knob | value | how it was decided |
@@ -1318,7 +1340,9 @@ are in `eval/results/` and re-scorable forever.
 | `KEEPS_INBOX` | +`Bookings` | every costly error was a `Bookings` prediction |
 
 Dev (n=140): action accuracy **0.900**, `To Action` retention **24/24**, one
-message archived that should have been kept.
+message archived that should have been kept. **[re-scored 2026-09-14:** action
+accuracy **0.900** and one costly error, both unchanged; retention **20/20**;
+six-way accuracy 0.800 -> **0.771**.**]**
 
 ### `body_chars`: only the first 300 characters matter
 
@@ -1435,11 +1459,14 @@ over-prediction) whose intermediate quantity moved as predicted, twice: 21 ->
 
 ### The soft spot to watch on the holdout
 
-`To Action` recall is 18/24 overall but **5/9 on `draw == "R"`**, the uniform
-draw, against 13/15 on the keyword-mined strata. Retention covers it at 9/9 -
-but that is `Needs Review` and `KEEPS_INBOX` doing the work, not the model
-recognising a bill. The mined figure is flattering because those messages say
-"overdue" on the tin.
+**[re-scored 2026-09-14]** `To Action` recall is 14/20 overall but **5/9 on
+`draw == "R"`**, the uniform draw, against 9/11 on the keyword-mined strata.
+The `R` figure did not move at all under the corrections - every message that
+left the class was mined - so the soft spot is exactly as it was, and is now a
+larger share of a smaller denominator. Retention covers it at 9/9 - but that is
+`Needs Review` and `KEEPS_INBOX` doing the work, not the model recognising a
+bill. The mined figure is flattering because those messages say "overdue" on
+the tin.
 
 ### Dev exposure
 
@@ -1456,6 +1483,10 @@ that can say how much. This is the reason step 8 opens the box **once**.
   reader would ever bulk-delete one and not the other.
 - **`DESIGN.md` updates** - `body_chars`, `T`, the dormant floor, and
   `KEEPS_INBOX` - deliberately deferred to step 8, after the holdout.
+- **`Personal` recall is 4/14 on dev, every error free.** Closed for this
+  phase with the measurement behind it - see "No prompt round for `Personal`"
+  under step 7. Revisit only if the shelf proves unreliable in live use, and
+  score it against a holdout that has not been spent.
 
 ---
 
@@ -1598,6 +1629,127 @@ against the pinned draw. Then: `--report` reprints without labelling, `--n 35`
 extends the draw and resumes at [31/35] with the recorded 30 standing, `--seed
 7` and `--n 20` are both refused. Nothing in the real `eval/` was touched — the
 draw there is unpinned until the sitting starts.
+
+### Step 7 results — the ceiling, measured 2026-09-14
+
+Written down **before** any correction was applied, because a `--relabel` makes
+pass 1 agree with pass 2 by construction and `recheck --report` would then
+print a different, wrong number from the same draw.
+
+| ceiling | agree | rate | 95% CI |
+|---|---|---|---|
+| 6-way, bounds `accuracy` | 28/30 | 0.933 | [0.79, 0.98] |
+| keeps-INBOX, bounds action accuracy | **30/30** | **1.000** | [0.89, 1.00] |
+
+`unsure` in either pass: 2/30, both agreed.
+
+**The operational ceiling is clean.** Thirty of thirty judgements were
+reproduced on the axis that decides whether a message is archived, so the dev
+action accuracy of 0.900 is measured against a target with no detectable noise
+in the dimension that costs anything.
+
+**Both six-way flips are one rule, one direction, one stratum.** `To Action` ->
+`Personal` on two human-written replies, both in `S_human`: an AGSVA clearances
+officer and a KHOO accounts reply. That is the **precedence rule** - a human
+wrote it, so `Personal`, even when the message also demands something - which
+was itself refined *during* labelling, so early rows predate it. Not labeller
+noise but a rule applied unevenly: the cheap kind, visible and fixable, exactly
+as the step 3 rules section predicted it would appear.
+
+Both flips are free by construction, which is why keeps-INBOX is 30/30. §3's
+labelling rules called this cell in advance: "`Personal` vs `To Action` is
+therefore a free error on any human-written message."
+
+**Against the pre-registration, honestly: only half of it holds.** Agreement
+cleared 0.90, but the disagreements were *not* on the `unsure` rows - both of
+those were reproduced, and both flips came from rows the labeller was confident
+about twice. At n=2 that is barely evidence, but the flag did not locate where
+ground truth was soft, and it was expected to.
+
+### The `S_human` sweep, and what the re-score moved
+
+The two flips were not the whole of it. Nine `S_human` rows carried
+`To Action`; the precedence rule was reapplied to all nine together, thread
+mates adjacent - pass 1 randomised its order so repeated judgements would not
+drift together, but this was a rule-application sweep rather than fresh
+judgement, and there consistency is the point. **Seven moved to `Personal`**:
+both AGSVA human replies, the KHOO invoicing reply, the casting call, and
+three more. Two stayed `To Action` - the mailer-daemon delay/failure pair, per
+"something you initiated that has not completed" - as did the AGSVA
+`donotreply` overdue notice, the KHOO invoicing *opener* and the Payoneer auto
+reply, all three automated. The thread split is the case §3 already
+contemplates: a human's reply is `Personal` while the platform's own message in
+the same thread is not.
+
+`To Action` 33 -> 29, `Personal` 16 -> 20. All fourteen runs re-scored - free,
+no re-inference, `eval/results/` untouched.
+
+| dev metric, `v9b-bookings` | before | after |
+|---|---|---|
+| accuracy | 0.800 | **0.771** [0.70, 0.83] |
+| `To Action` recall | 18/24 | 14/20 (`R` draw 5/9, unchanged) |
+| `To Action` retention | 23/24 | **20/20** |
+| action accuracy | 0.900 | **0.900** |
+| costly / clutter | 1 / 13 | **1 / 13** |
+| calibration gap | +0.162 | +0.157 |
+
+**The action matrix did not move by a single message.** Every corrected row was
+a `To Action` -> `Personal` move, both sides of which keep the inbox, so the
+six-way number absorbed the entire cost while the metric with consequences was
+untouched. That is the free-error property of the taxonomy, measured rather
+than argued.
+
+**Three step 6 conclusions changed, and none of them changed the decision:**
+
+1. **`0 -> 300` is no longer significant overall** - p=0.009 became p=0.064.
+   What survives is the subgroup that matters: **8 fixed / 0 broken on the 20
+   `To Action` messages, p=0.008**. The claim narrows from "the body lifts
+   accuracy" to "the body catches bills", which is the claim worth having.
+2. **`v2-ordered` now has the highest six-way accuracy of any run** (0.779
+   against `v9b`'s 0.771) and is still rejected: clutter 24 against 13, action
+   accuracy 0.821 against 0.900. The clearest demonstration in the phase that
+   six-way accuracy is not the metric that decides.
+3. **Every prompt `p`-value got weaker** - `v9b` vs `v1` is 6 fixed / 3 broken,
+   p=0.508, and `v9b` vs `v9` is 3/3, p=1.000. The selection rests entirely on
+   the pre-registered `Bookings` mechanism and on action accuracy, with no
+   support at all from significance. Step 6 already said the effect size was
+   not significant; it is now less so.
+
+`v9-bookings`' supporting note that `Personal` "lands exactly on 16" is
+withdrawn - truth is 20. `eval/RESULTS.md` carries the corrected table.
+
+### No prompt round for `Personal`, and the measurement that settles it
+
+The recheck raised the obvious question - the model reads the precedence rule
+poorly, so should the prompt say it louder? Measured on dev with all
+corrections applied: true `Personal` 14, predicted correctly **4**, mean
+`p(Personal)` on true `Personal` 0.302. Genuinely weak.
+
+**And every one of the 10 misses is free**: 6 to `To Action`, 4 to `Bookings`,
+all three in `KEEPS_INBOX`. **No human-written message was archived on dev at
+all** - zero `Personal` -> `Receipts`/`Updates`/`Promotions`. The failure is a
+shelf label, not a lost email.
+
+The upside is bounded and free - fixing all 10 moves six-way accuracy 0.771 ->
+0.842 and action accuracy by exactly zero - while the downside crosses
+`KEEPS_INBOX`: the model already predicts `Personal` on 7 dev messages of which
+2 are true `Updates`, bulk mail pulled into the inbox. And the experiment has
+already been run. **`v2-ordered` is precisely this change**: precedence as an
+explicit numbered order took `Personal` predictions to 25 against a truth of
+16, clutter 17 -> 24, action accuracy down. A measured failure, not a
+hypothetical one.
+
+Three further reasons, recorded so the question does not get reopened by
+instinct: the dev set has already absorbed six variants and a threshold sweep,
+and a seventh round aimed at the cheapest prize spends what is left of it; the
+`To Action` / `Personal` boundary is where the *human* wobbled twice in 30, so
+tuning toward it is tuning toward noise; and the taxonomy already covers the
+operational need, since `Personal` mail stays in the inbox under whichever of
+the three labels it lands on.
+
+**What would reopen it:** human-written mail predicted `Receipts`, `Updates` or
+`Promotions`. That crosses into the archive, and a missed human email is a real
+loss. There are none on dev.
 
 ### The policy on disagreements, agreed before the sitting
 
