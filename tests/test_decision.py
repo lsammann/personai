@@ -23,9 +23,10 @@ from app.categories import ERROR, INBOX, NEEDS_REVIEW, PROCESSED, Category, labe
 T = 0.8
 F = 0.15
 
+# Bookings is NOT here: it joined KEEPS_INBOX in Phase 2, on the measurement
+# that every costly eval error was a message the model had called Bookings.
 ARCHIVED = [
     Category.RECEIPTS,
-    Category.BOOKINGS,
     Category.UPDATES,
     Category.PROMOTIONS,
 ]
@@ -102,6 +103,30 @@ def test_low_confidence_with_to_action_signal_still_just_needs_review():
     result = decide(dist(Category.RECEIPTS, 0.5, p_to_action=0.4))
     assert result.labels_add == tuple(sorted([NEEDS_REVIEW, PROCESSED]))
     assert result.labels_remove == ()
+
+
+def test_bookings_keeps_the_inbox():
+    """Changed in Phase 2 and worth pinning, because it inverts an assumption
+    the earlier design leaned on.
+
+    Every message the eval lost - one that should have stayed visible and was
+    archived - had been classified Bookings, across four prompt variants.
+    Three rounds of prompt work took the over-prediction from 21 of 200 to 10
+    and moved none of them. Keeping Bookings visible removes the failure mode
+    by construction.
+    """
+    result = decide(dist(Category.BOOKINGS, 0.99))
+    assert result.labels_remove == ()
+    assert not result.needs_review
+    assert result.labels_add == tuple(sorted([label_for(Category.BOOKINGS), PROCESSED]))
+
+
+def test_the_archive_half_is_now_three_categories():
+    """So "Receipts vs Bookings is a free error" no longer holds - an argument
+    several Phase 2 labelling decisions were made on."""
+    from app.categories import KEEPS_INBOX
+    assert set(ARCHIVED) == set(Category) - KEEPS_INBOX
+    assert len(ARCHIVED) == 3
 
 
 # --- boundaries -----------------------------------------------------------

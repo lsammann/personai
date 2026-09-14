@@ -349,3 +349,47 @@ def test_classify_builds_its_system_message_through_the_registry():
     _, request = call(ollama_reply([entry("A", 0.9), entry("B", 0.1)]))
     body = json.loads(request.data)
     assert body["messages"][0]["content"] == classifier.system_prompt("v1")
+
+
+# --- the step 6 prompt variants -------------------------------------------
+
+
+def test_every_registered_prompt_keeps_the_output_contract():
+    """A variant that forgets "reply with one character" breaks the whole
+    confidence mechanism, not just its own accuracy."""
+    for prompt_id in classifier.PROMPTS:
+        text = classifier.system_prompt(prompt_id)
+        assert "exactly one character" in text
+        assert "A, B, C, D, E, F" in text
+
+
+def test_every_registered_prompt_names_all_six_categories():
+    for prompt_id in classifier.PROMPTS:
+        text = classifier.system_prompt(prompt_id)
+        for category in Category:
+            assert category.value in text, f"{prompt_id} drops {category}"
+
+
+def test_v2_changes_only_the_precedence_block():
+    """One variable per variant, or a win cannot be attributed."""
+    v1 = classifier.system_prompt("v1")
+    v2 = classifier.system_prompt("v2-ordered")
+    assert classifier._definitions(classifier.DEFAULT_ORDER) in v1
+    assert classifier._definitions(classifier.DEFAULT_ORDER) in v2
+    assert "choose the FIRST that applies" in v2
+    assert "Precedence when an email fits two categories" not in v2
+
+
+def test_v9_changes_only_the_bookings_description():
+    v9 = classifier.system_prompt("v9-bookings")
+    assert "confirmation of something scheduled or reserved" not in v9
+    assert classifier.BOOKINGS_NARROWED in v9
+    # The precedence block is untouched, so a win is attributable to the
+    # description alone.
+    assert "Precedence when an email fits two categories" in v9
+
+
+def test_the_variants_hash_differently_from_the_baseline():
+    hashes = {prompt_id: classifier.prompt_hash(prompt_id)
+              for prompt_id in classifier.PROMPTS}
+    assert len(set(hashes.values())) == len(hashes)

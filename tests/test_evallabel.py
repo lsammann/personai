@@ -380,3 +380,135 @@ def test_digit_keys_cover_every_category_in_enum_order():
     """Derived from `Category`, so there is no second ordering to drift."""
     assert list(evallabel.KEYS.values()) == list(Category)
     assert evallabel.KEYS["1"] is Category.TO_ACTION
+
+
+# --- the blind recheck ---------------------------------------------------
+
+
+def test_the_draw_is_deterministic_from_the_seed():
+    ids = [row.message_id for row in sampled(200)]
+    assert evallabel.recheck_draw(ids, 30, 99) == evallabel.recheck_draw(ids, 30, 99)
+    assert evallabel.recheck_draw(ids, 30, 99) != evallabel.recheck_draw(ids, 30, 7)
+
+
+def test_the_draw_does_not_depend_on_input_order():
+    """Sorted before the shuffle: string hashing is randomised per process."""
+    ids = [row.message_id for row in sampled(200)]
+    assert evallabel.recheck_draw(ids, 30, 99) == evallabel.recheck_draw(
+        list(reversed(ids)), 30, 99
+    )
+
+
+def test_the_draw_is_a_subset_of_the_sample_with_no_repeats():
+    ids = [row.message_id for row in sampled(200)]
+    drawn = evallabel.recheck_draw(ids, 30, 99)
+    assert len(drawn) == len(set(drawn)) == 30
+    assert set(drawn) <= set(ids)
+
+
+def test_a_larger_draw_extends_the_smaller_one():
+    """The prefix property: extending an ambiguous ceiling keeps the rows already
+    recorded, so it costs ten more messages rather than a fresh thirty."""
+    ids = [row.message_id for row in sampled(200)]
+    assert evallabel.recheck_draw(ids, 40, 99)[:30] == evallabel.recheck_draw(
+        ids, 30, 99
+    )
+
+
+def test_a_draw_larger_than_the_sample_is_the_whole_sample():
+    ids = [row.message_id for row in sampled(10)]
+    assert sorted(evallabel.recheck_draw(ids, 30, 99)) == sorted(ids)
+
+
+def test_agreement_counts_exact_matches():
+    first = {"a": record("a", Category.RECEIPTS), "b": record("b", Category.UPDATES)}
+    second = {"a": record("a", Category.RECEIPTS, pass_no=2),
+              "b": record("b", Category.PROMOTIONS, pass_no=2)}
+    result = evallabel.agreement(first, second)
+    assert (result.n, result.n_agree) == (2, 1)
+    assert [d.message_id for d in result.disagreements] == ["b"]
+    assert (result.disagreements[0].first, result.disagreements[0].second) == (
+        Category.UPDATES, Category.PROMOTIONS,
+    )
+
+
+def test_agreement_is_measured_only_over_the_rows_pass_two_reached():
+    """A partial recheck is scored over what it visited, not over all 200."""
+    first = {f"m{i}": record(f"m{i}", Category.UPDATES) for i in range(200)}
+    second = {"m0": record("m0", Category.UPDATES, pass_no=2)}
+    assert evallabel.agreement(first, second).n == 1
+
+
+def test_a_free_error_agrees_on_the_action_and_a_costly_one_does_not():
+    """`To Action` and `Personal` both keep INBOX; `Bookings` and `Receipts`
+    sit either side of it, which is the disagreement with consequences."""
+    first = {"a": record("a", Category.TO_ACTION), "b": record("b", Category.BOOKINGS)}
+    second = {"a": record("a", Category.PERSONAL, pass_no=2),
+              "b": record("b", Category.RECEIPTS, pass_no=2)}
+    result = evallabel.agreement(first, second)
+    assert (result.n_agree, result.n_action_agree) == (0, 1)
+    crossings = {d.message_id: d.crosses_inbox for d in result.disagreements}
+    assert crossings == {"a": False, "b": True}
+
+
+def test_unsure_in_either_pass_is_attributed():
+    """The flagged rows are the ones expected to flip; whether they did is the
+    difference between a noisy ceiling and a known-noisy handful of rows."""
+    first = {"a": record("a", Category.RECEIPTS, unsure=True),
+             "b": record("b", Category.UPDATES),
+             "c": record("c", Category.UPDATES)}
+    second = {"a": record("a", Category.BOOKINGS, pass_no=2),
+              "b": record("b", Category.UPDATES, unsure=True, pass_no=2),
+              "c": record("c", Category.UPDATES, pass_no=2)}
+    result = evallabel.agreement(first, second)
+    assert (result.n_unsure, result.n_unsure_agree) == (2, 1)
+    assert result.disagreements[0].unsure is True
+
+
+def test_a_pass_two_row_with_no_pass_one_row_raises():
+    """Damage, not a message to skip. Dropping it would shrink the denominator
+    and flatter the ceiling by exactly the rows lost."""
+    with pytest.raises(ValueError, match="ghost"):
+        evallabel.agreement({}, {"ghost": record("ghost", Category.UPDATES, pass_no=2)})
+
+
+def test_agreement_over_identical_passes_is_total():
+    first = {"a": record("a", Category.PERSONAL)}
+    second = {"a": record("a", Category.PERSONAL, pass_no=2)}
+    result = evallabel.agreement(first, second)
+    assert (result.n_agree, result.n_action_agree) == (1, 1)
+    assert result.disagreements == ()
+
+
+def test_the_draw_round_trips(tmp_path):
+    path = tmp_path / "recheck.json"
+    draw = evallabel.RecheckDraw(2, 99, "2026-09-14T10:00:00+00:00", ("a", "b"))
+    evallabel.save_draw(draw, path)
+    assert evallabel.load_draw(path) == draw
+
+
+def test_the_draw_file_carries_ids_and_provenance_only(tmp_path):
+    path = tmp_path / "recheck.json"
+    evallabel.save_draw(
+        evallabel.RecheckDraw(1, 99, "2026-09-14T10:00:00+00:00", ("a",)), path
+    )
+    assert set(json.loads(path.read_text())) == evallabel.RECHECK_KEYS
+
+
+def test_a_draw_that_was_never_made_is_none(tmp_path):
+    assert evallabel.load_draw(tmp_path / "nothing.json") is None
+
+
+def test_an_unreadable_draw_raises_rather_than_reading_as_absent(tmp_path):
+    """Unlike the cache: treating damage as "never drawn" would replace the
+    measurement plan with a fresh one mid-recheck."""
+    path = tmp_path / "recheck.json"
+    path.write_text('{"seed": 99}')
+    with pytest.raises(ValueError):
+        evallabel.load_draw(path)
+
+
+def test_the_recheck_seed_is_not_the_sample_seed():
+    """One number reproduces the plan, and no draw reshuffles another."""
+    assert evallabel.DEFAULT_RECHECK_SEED != 7
+    assert evallabel.RECHECK_PASS == 2

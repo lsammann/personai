@@ -23,7 +23,8 @@ Paths are parameters with no defaults. `scripts/label_eval.py` supplies them,
 which means nothing here can write into the real `data/` because a test forgot
 to redirect it.
 
-See `docs/PHASE2_PLAN.md` -> Step 3 implementation.
+See `docs/PHASE2_PLAN.md` -> Step 3 implementation for the labelling pass
+and Step 7 for the blind recheck, which is pass 2 over the same file.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.categories import Category
+from app.categories import KEEPS_INBOX, Category
 from app.evalset import EVAL_DIR, Sampled
 from app.gmail_client import Message
 from app.message_body import select_body, strip_html
@@ -54,6 +55,20 @@ LABEL_KEYS = frozenset({"message_id", "label", "unsure", "labelled_at", "pass"})
 # reproduces the whole plan, and changing one draw cannot silently reshuffle
 # the other.
 ORDER_SEED_OFFSET = 2
+
+# Step 7's blind recheck. Its own seed, distinct from the sample's, for the
+# reason `ORDER_SEED_OFFSET` exists: one number reproduces the whole plan and no
+# draw can silently reshuffle another. 30 rather than the 20 §2 sketched - at
+# n=20 the Wilson interval on the ceiling is about +/-0.15, and a uniform draw
+# that size would likely contain no `Bookings` at all.
+RECHECK_PATH = EVAL_DIR / "recheck.json"
+RECHECK_PASS = 2
+DEFAULT_RECHECK_N = 30
+DEFAULT_RECHECK_SEED = 99
+
+# Ids and provenance, no content - the same rule as `LABEL_KEYS`, asserted on
+# write for the same reason.
+RECHECK_KEYS = frozenset({"n", "seed", "created_at", "message_ids"})
 
 # Digit -> category, derived from the enum rather than listed again here. A
 # second ordering would be free to drift from `Category`, and the drift would
@@ -206,6 +221,172 @@ def counts_by_stratum(
         if row.message_id in resolved:
             cell["labelled"] += 1
     return counts
+
+
+# --- the blind recheck ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RecheckDraw:
+    """Which messages pass 2 re-presents, pinned to disk.
+
+    Pinned rather than recomputed from the CLI defaults every time, for A4's
+    reason one level down: a draw derived from flags is a draw that moves
+    silently the day someone types a different `--n`, and `verify --pass 2`
+    would then check completeness against a set nobody labelled.
+    """
+
+    n: int
+    seed: int
+    created_at: str
+    message_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Disagreement:
+    """One message the two passes labelled differently.
+
+    `crosses_inbox` is the expensive kind: the two judgements disagree about
+    whether the message stays in the inbox, so the disagreement bounds action
+    accuracy and not just the 6-way number. A `To Action` / `Personal` flip
+    does not cross; `Bookings` / `Receipts` does.
+    """
+
+    message_id: str
+    first: Category
+    second: Category
+    unsure: bool
+    crosses_inbox: bool
+
+
+@dataclass(frozen=True)
+class Agreement:
+    """The self-consistency ceiling, as counts. Intervals are the caller's job.
+
+    Two ceilings rather than one, because the harness reports two headline
+    numbers: `n_agree / n` bounds `accuracy`, and `n_action_agree / n` bounds
+    the collapsed action accuracy, which is the metric with consequences.
+    """
+
+    n: int
+    n_agree: int
+    n_action_agree: int
+    n_unsure: int
+    n_unsure_agree: int
+    disagreements: tuple[Disagreement, ...]
+
+
+def recheck_draw(sample_ids: Iterable[str], n: int, seed: int) -> list[str]:
+    """`n` of the sample, uniformly at random. Shuffle first, then take.
+
+    Uniform over the whole sample, not stratified by the pass-1 label and not
+    restricted to the dev split. Stratifying would over-represent the rare
+    categories and bias the headline in a direction nothing here could
+    correct for; restricting to dev would measure a procedure that was applied
+    identically to both splits and then not apply to the holdout, which is the
+    instrument step 8 needs it for.
+
+    Shuffle-then-take rather than `sample`, so the draw has the **prefix
+    property**: `n=40` is the `n=30` draw plus ten more. Extending an
+    ambiguous result then costs ten messages instead of a fresh draw, and the
+    rows already recorded stay valid.
+
+    `sorted` first, as everywhere else here: string hashing is randomised per
+    process, so any order inherited from a set or a file read is not stable.
+    """
+    ids = sorted(sample_ids)
+    random.Random(seed).shuffle(ids)
+    return ids[:n]
+
+
+def agreement(
+    first: Mapping[str, LabelRecord], second: Mapping[str, LabelRecord]
+) -> Agreement:
+    """Compare two independent passes over the same messages.
+
+    Raw agreement, deliberately: it is the quantity that directly bounds
+    accuracy, which is what the ceiling is for. Cohen's kappa was rejected -
+    it corrects for chance using the estimated marginals, and at n=30 over six
+    categories those marginals are noisier than the statistic they adjust.
+
+    A pass-2 id with no pass-1 row raises rather than being skipped. That
+    condition means `labeled.jsonl` is damaged, and quietly shrinking the
+    denominator would flatter the ceiling by exactly the number of rows lost.
+    """
+    orphans = sorted(set(second) - set(first))
+    if orphans:
+        raise ValueError(
+            f"pass-2 rows with no pass-1 row: {' '.join(orphans)}"
+        )
+
+    disagreements: list[Disagreement] = []
+    n_agree = n_action_agree = n_unsure = n_unsure_agree = 0
+    for message_id, later in second.items():
+        earlier = first[message_id]
+        same = earlier.label == later.label
+        unsure = earlier.unsure or later.unsure
+        crosses = (earlier.label in KEEPS_INBOX) != (later.label in KEEPS_INBOX)
+
+        n_agree += same
+        n_action_agree += not crosses
+        n_unsure += unsure
+        n_unsure_agree += unsure and same
+        if not same:
+            disagreements.append(
+                Disagreement(
+                    message_id=message_id,
+                    first=earlier.label,
+                    second=later.label,
+                    unsure=unsure,
+                    crosses_inbox=crosses,
+                )
+            )
+
+    return Agreement(
+        n=len(second),
+        n_agree=n_agree,
+        n_action_agree=n_action_agree,
+        n_unsure=n_unsure,
+        n_unsure_agree=n_unsure_agree,
+        disagreements=tuple(disagreements),
+    )
+
+
+def save_draw(draw: RecheckDraw, path: Path) -> None:
+    """Pin the draw. Ids and provenance only, checked on write."""
+    row = {
+        "n": draw.n,
+        "seed": draw.seed,
+        "created_at": draw.created_at,
+        "message_ids": list(draw.message_ids),
+    }
+    extra = set(row) - RECHECK_KEYS
+    if extra:
+        raise ValueError(f"refusing to write non-allowlisted keys: {sorted(extra)}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(row, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load_draw(path: Path) -> RecheckDraw | None:
+    """The pinned draw, or None if it was never made.
+
+    Unreadable **raises** here, where an unreadable cache entry reads as
+    absent. The cache is derived data and refetching costs a second; the draw
+    is the measurement plan, and treating damage as "never drawn" would
+    silently replace it with a fresh one and reset the recheck mid-sitting.
+    """
+    if not path.exists():
+        return None
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+        return RecheckDraw(
+            n=int(row["n"]),
+            seed=int(row["seed"]),
+            created_at=str(row["created_at"]),
+            message_ids=tuple(row["message_ids"]),
+        )
+    except (ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"{path} is unreadable: {error}") from error
 
 
 # --- rendering -----------------------------------------------------------

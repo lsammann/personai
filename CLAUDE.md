@@ -5,14 +5,17 @@ Personal Gmail classification agent. Read `DESIGN.md` for what and why,
 plan - `docs/PHASE2_PLAN.md` - for how this phase is being built and where the
 code has deliberately diverged from it.
 
-**Current phase: 2 (eval harness), step 6 of 8.**
+**Current phase: 2 (eval harness), step 7 of 8.**
 
 This file is the single source of truth for which **phase** is current;
 `docs/PHASE2_PLAN.md` → Build order is the single source of truth for which
 **step**, and records what each finished step produced. Check the build order
-before planning anything - steps 1-5 are built (the 200 hand-labelled
-messages exist and the harness runs end to end), and the phase plan's §1-§6
-describe the phase as originally agreed, not as it stands. Step 3 also added a **labelling rules** section,
+before planning anything - steps 1-6 are done (200 hand-labelled messages, a
+working harness, and the sweeps finished), and the phase plan's §1-§6 describe
+the phase as originally agreed, not as it stands. **Step 6 results** near the
+end of that document holds the measured configuration and three findings that
+change the design: the `to_action_floor` is inert on this model, `Bookings`
+now keeps `INBOX`, and `body_chars` should be 300 rather than 1500. Step 3 also added a **labelling rules** section,
 which is the decision procedure ground truth was built with and the one step
 7's recheck has to reapply.
 

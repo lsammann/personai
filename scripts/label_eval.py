@@ -4,6 +4,7 @@
     label_eval.py sample --seed 7      fix which 200 messages get labelled
     label_eval.py label                hand-label them, resumable
     label_eval.py verify               check the set is whole and consistent
+    label_eval.py recheck              re-label a blind subset: the ceiling
 
 Sampling and labelling are separate subcommands on purpose. The frame is then
 fixed and auditable, and resuming a labelling session is `sampled - labelled`
@@ -34,9 +35,10 @@ import sys
 import termios
 import tty
 from collections import Counter, deque
+from dataclasses import replace
 from pathlib import Path
 
-from app import evallabel, evalset, gmail_client
+from app import evallabel, evalscore, evalset, gmail_client
 from app.evallabel import KEYS
 
 CACHE_DIR = evalset.DATA_DIR / "eval_cache"
@@ -177,8 +179,47 @@ def cmd_label(args: argparse.Namespace) -> int:
             print("pass 1 is complete. Run `verify`.")
             return 0
 
+    skipped = label_loop(
+        queue,
+        resolved,
+        pass_no=1,
+        total=total,
+        body_chars=args.body_chars,
+        limit=args.limit,
+        batch=args.batch,
+    )
+
+    print(f"\n{len(resolved)}/{total} labelled this pass.")
+    if skipped:
+        print(f"{len(skipped)} skipped this sitting: {' '.join(sorted(skipped))}")
+    print(f"{evallabel.LABELED_PATH} is up to date - commit it.")
+    return 0
+
+
+def label_loop(
+    queue: deque,
+    resolved: dict,
+    *,
+    pass_no: int,
+    total: int,
+    body_chars: int,
+    limit: int | None,
+    batch: int,
+) -> set[str]:
+    """The keypress loop. Mutates `resolved`, returns the sitting's skips.
+
+    One loop for both passes rather than a copy per subcommand. The copy would
+    be the code that writes ground truth, and two of those drift - `b` fixed in
+    one and not the other is a silent misfire that survives into the labels.
+
+    `pass_no` is the only difference between a labelling sitting and the blind
+    recheck. Nothing here reads a record from another pass, so the pass-1 label
+    cannot reach the screen: `render` takes a `Cached`, which does not carry
+    one, exactly as it does not carry a stratum.
+    """
     # Authenticated lazily: a session that finds everything already cached
-    # never touches Gmail at all, which is what makes a resume offline.
+    # never touches Gmail at all, which is what makes a resume offline - and
+    # what makes the recheck, whose 30 messages are all cached, fully offline.
     service: list = []
 
     def gmail():
@@ -191,8 +232,8 @@ def cmd_label(args: argparse.Namespace) -> int:
     decided = 0
 
     try:
-        while queue and (args.limit is None or decided < args.limit):
-            prefetch(gmail, queue, args.batch)
+        while queue and (limit is None or decided < limit):
+            prefetch(gmail, queue, batch)
             message_id = queue[0]
             message = evallabel.cache_get(message_id, CACHE_DIR)
             if message is None:
@@ -207,7 +248,7 @@ def cmd_label(args: argparse.Namespace) -> int:
                 print(
                     evallabel.render(
                         message,
-                        args.body_chars,
+                        body_chars,
                         show_full,
                         position=len(resolved) + 1,
                         total=total,
@@ -222,6 +263,7 @@ def cmd_label(args: argparse.Namespace) -> int:
                         label=KEYS[key],
                         unsure=unsure,
                         labelled_at=dt.datetime.now(dt.UTC).isoformat(),
+                        pass_no=pass_no,
                     )
                     evallabel.append_record(record, evallabel.LABELED_PATH)
                     resolved[message_id] = record
@@ -248,12 +290,7 @@ def cmd_label(args: argparse.Namespace) -> int:
                     break
     except KeyboardInterrupt:
         print("\ninterrupted")
-
-    print(f"\n{len(resolved)}/{total} labelled this pass.")
-    if skipped:
-        print(f"{len(skipped)} skipped this sitting: {' '.join(sorted(skipped))}")
-    print(f"{evallabel.LABELED_PATH} is up to date - commit it.")
-    return 0
+    return skipped
 
 
 def prefetch(gmail, queue, batch: int) -> None:
@@ -277,6 +314,184 @@ def prefetch(gmail, queue, batch: int) -> None:
     print("\r" + " " * 30 + "\r", end="")
 
 
+# --- recheck ---------------------------------------------------------------
+
+
+def cmd_recheck(args: argparse.Namespace) -> int:
+    """Pass 2: re-label a blind subset and report self-consistency.
+
+    The ceiling this measures is what the model's accuracy should be read
+    against. A labeller who reproduces 27 of 30 of their own decisions has
+    built ground truth that no classifier can score above ~0.90, however good
+    it is.
+
+    Blind in two senses. The screen never shows the pass-1 label - `render`
+    takes a `Cached`, which cannot carry one - and **the comparison prints only
+    once the draw is complete**, because learning at message 10 that you have
+    already disagreed twice changes how carefully you judge messages 11 to 30.
+    """
+    rows, _ = evalset.load_sample()
+    sample_ids = [row.message_id for row in rows]
+    records, damaged = evallabel.load_records(evallabel.LABELED_PATH)
+    if damaged:
+        print(f"warning: {damaged} unreadable row(s) in {evallabel.LABELED_PATH}")
+
+    incomplete = evallabel.unfinished(records, sample_ids, 1)
+    if incomplete:
+        print(
+            f"pass 1 is not complete - {len(incomplete)} message(s) unlabelled. "
+            "A recheck drawn from a partly-labelled set measures the order things "
+            "happened to be labelled in as much as the labeller's consistency.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        draw = pin_draw(sample_ids, args)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+
+    second = evallabel.resolve(records, evallabel.RECHECK_PASS)
+    queue = deque(evallabel.pending(draw.message_ids, second))
+    total = len(draw.message_ids)
+
+    if queue and not args.report:
+        print(f"recheck: {total} messages, {len(queue)} to go  (seed {draw.seed})")
+        print("The pass-1 label is not shown; the comparison prints when the draw is done.")
+        label_loop(
+            queue,
+            second,
+            pass_no=evallabel.RECHECK_PASS,
+            total=total,
+            body_chars=args.body_chars,
+            limit=args.limit,
+            batch=args.batch,
+        )
+        # Re-read rather than trusting the in-memory dict: `b` appends a
+        # correction, and the file is where last-row-wins is decided.
+        records, _ = evallabel.load_records(evallabel.LABELED_PATH)
+        second = evallabel.resolve(records, evallabel.RECHECK_PASS)
+
+    done = [message_id for message_id in draw.message_ids if message_id in second]
+    if len(done) < total:
+        print(f"\n{len(done)}/{total} rechecked. {evallabel.LABELED_PATH} is up to date.")
+        print("The report prints when the draw is complete - seeing the agreement rate")
+        print("part-way would change how the remaining messages are judged.")
+        return 0
+
+    recheck_report(
+        draw,
+        evallabel.resolve(records, 1),
+        {message_id: second[message_id] for message_id in draw.message_ids},
+    )
+    return 0
+
+
+def pin_draw(sample_ids, args: argparse.Namespace) -> evallabel.RecheckDraw:
+    """The pinned draw: made once, then reused. It grows, but never moves.
+
+    Growing is safe only because `recheck_draw` has the prefix property, so a
+    larger `n` at the same seed keeps every id already labelled. Anything else
+    - a different seed, a smaller `n`, a sample that has since changed - would
+    silently redefine what pass 2 measured, so it is refused rather than
+    honoured.
+    """
+    existing = evallabel.load_draw(evallabel.RECHECK_PATH)
+    wanted = tuple(evallabel.recheck_draw(sample_ids, args.n, args.seed))
+
+    if existing is None:
+        draw = evallabel.RecheckDraw(
+            n=len(wanted),
+            seed=args.seed,
+            created_at=dt.datetime.now(dt.UTC).isoformat(),
+            message_ids=wanted,
+        )
+        evallabel.save_draw(draw, evallabel.RECHECK_PATH)
+        print(f"pinned {len(wanted)} ids -> {evallabel.RECHECK_PATH} - commit it, ids only")
+        return draw
+
+    pinned = existing.message_ids
+    if existing.seed != args.seed:
+        raise ValueError(
+            f"{evallabel.RECHECK_PATH} is pinned to seed {existing.seed}, "
+            f"--seed says {args.seed}. The draw is the measurement plan; "
+            "delete the file only if you mean to start the recheck over."
+        )
+    if pinned == wanted:
+        return existing
+    if len(wanted) > len(pinned) and wanted[: len(pinned)] == pinned:
+        grown = replace(existing, n=len(wanted), message_ids=wanted)
+        evallabel.save_draw(grown, evallabel.RECHECK_PATH)
+        print(
+            f"extended the draw {len(pinned)} -> {len(wanted)}; "
+            f"the first {len(pinned)} are unchanged, so rows already recorded stand"
+        )
+        return grown
+    raise ValueError(
+        f"--n {args.n} does not extend the {len(pinned)} ids pinned in "
+        f"{evallabel.RECHECK_PATH}. A draw only ever grows: a smaller n, or a "
+        "sample that has changed since, would move what pass 2 measured."
+    )
+
+
+def recheck_report(
+    draw: evallabel.RecheckDraw, first: dict, second: dict
+) -> None:
+    """Two ceilings, their intervals, and every disagreement.
+
+    Two rather than one because the harness reports two headline numbers: the
+    6-way rate bounds `accuracy`, and the keeps-INBOX rate bounds the collapsed
+    action accuracy, which is the metric with consequences. Wilson comes from
+    `evalscore` rather than being written again here - one estimator, one
+    implementation.
+    """
+    result = evallabel.agreement(first, second)
+    print(f"\n{RULE}")
+    print(
+        f"blind recheck  {result.n} of {len(first)}  "
+        f"seed {draw.seed}  drawn {draw.created_at[:10]}"
+    )
+
+    print(f"\n{'':<14}{'agree':>9}{'rate':>8}{'95% CI':>16}")
+    for name, agreed in (
+        ("6-way", result.n_agree),
+        ("keeps-INBOX", result.n_action_agree),
+    ):
+        low, high = evalscore.wilson(agreed, result.n)
+        rate = agreed / result.n if result.n else 0.0
+        print(
+            f"{name:<14}{f'{agreed}/{result.n}':>9}{rate:>8.3f}"
+            f"{f'[{low:.2f}, {high:.2f}]':>16}"
+        )
+    print("\n6-way bounds accuracy; keeps-INBOX bounds action accuracy. Read the")
+    print("model's numbers against these, not against 1.0 - and against the interval,")
+    print("which at this n is wide enough to matter.")
+
+    print(
+        f"\nunsure in either pass: {result.n_unsure}/{result.n}, "
+        f"of which {result.n_unsure_agree} agreed"
+    )
+
+    if not result.disagreements:
+        print("\nno disagreements.")
+        return
+
+    print(f"\n{len(result.disagreements)} disagreement(s), pass 1 -> pass 2:")
+    for item in result.disagreements:
+        flags = "  [unsure]" if item.unsure else ""
+        flags += "  [CROSSES KEEPS_INBOX]" if item.crosses_inbox else ""
+        print(f"  {item.message_id}  {item.first} -> {item.second}{flags}")
+        message = evallabel.cache_get(item.message_id, CACHE_DIR)
+        if message:
+            print(f"      from: {message.sender}")
+            print(f"      subj: {message.subject}")
+    print("\nSender and subject are terminal-only and reach no committed file.")
+    print("Where pass 2 found a genuine pass-1 error, fix it with `label --relabel <id>`")
+    print("and re-run `run_eval.py score` - scoring is free, no re-inference. The")
+    print("ceiling above is measured BEFORE those fixes and is not re-measured here.")
+
+
 # --- verify ---------------------------------------------------------------
 
 
@@ -286,24 +501,56 @@ def cmd_verify(args: argparse.Namespace) -> int:
     resolved = evallabel.resolve(records, args.pass_no)
     sample_ids = [row.message_id for row in rows]
 
-    missing = evallabel.unfinished(records, sample_ids, args.pass_no)
-    stray = sorted(set(resolved) - set(sample_ids))
+    # Pass 1 is checked against the whole sample; pass 2 against the pinned
+    # draw. Checking the recheck against all 200 would report the 170 messages
+    # it was never meant to visit as missing, and bury the ones that are.
+    expected, where = sample_ids, "sample"
+    draw = None
+    if args.pass_no != 1:
+        try:
+            draw = evallabel.load_draw(evallabel.RECHECK_PATH)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 1
+        where = "draw"
+        expected = list(draw.message_ids) if draw else sorted(resolved)
+
+    missing = evallabel.unfinished(records, expected, args.pass_no)
+    stray = sorted(set(resolved) - set(expected))
     uncached = [m for m in resolved if evallabel.cache_get(m, CACHE_DIR) is None]
 
     print(f"sample   {len(sample_ids)} messages, seed {seed}")
     print(f"labelled {len(resolved)} in pass {args.pass_no}")
+    if args.pass_no != 1:
+        if draw:
+            print(f"draw     {len(expected)} messages, seed {draw.seed}")
+        else:
+            print(
+                f"draw     none - no {evallabel.RECHECK_PATH}, so completeness "
+                "cannot be checked. Run `recheck` to pin one."
+            )
 
     counts = evallabel.counts_by_stratum(rows, resolved)
     n_h = {s["name"]: s["N_h"] for s in strata()["strata"]}
-    print(f"\n{'stratum':<12}{'N_h':>8}{'sampled':>9}{'labelled':>10}{'w_h':>9}")
+    # `w_h` is a pass-1 quantity: `run_eval` weights the labelled set, and it
+    # reads pass 1. For pass 2 the same column would be a weight nothing uses,
+    # so the table becomes a plain count of which strata the draw reached.
+    weighted = args.pass_no == 1
+    got = "labelled" if weighted else "rechecked"
+    header = f"{'stratum':<12}{'N_h':>8}{'sampled':>9}{got:>10}{'w_h' if weighted else '':>9}"
+    print(f"\n{header.rstrip()}")
     for name in sorted(counts):
         cell = counts[name]
         weight = f"{n_h.get(name, 0) / cell['labelled']:.1f}" if cell["labelled"] else "-"
-        print(
+        line = (
             f"{name:<12}{n_h.get(name, 0):>8}{cell['sampled']:>9}"
-            f"{cell['labelled']:>10}{weight:>9}"
+            f"{cell['labelled']:>10}{weight if weighted else '':>9}"
         )
-    print("w_h is derived from the LABELLED count - that is what run_eval weights by.")
+        print(line.rstrip())
+    if weighted:
+        print("w_h is derived from the LABELLED count - that is what run_eval weights by.")
+    else:
+        print("Which strata the draw reached. No w_h: run_eval weights pass 1, not this.")
 
     distribution = Counter(record.label.value for record in resolved.values())
     print(f"\nlabels {dict(distribution.most_common())}")
@@ -315,7 +562,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"\nPROBLEM: {damaged} unreadable row(s) in {evallabel.LABELED_PATH}")
         problems += 1
     if stray:
-        print(f"\nPROBLEM: {len(stray)} labelled id(s) not in the sample:")
+        print(f"\nPROBLEM: {len(stray)} labelled id(s) not in the {where}:")
         print(id_list(stray))
         problems += 1
     if uncached:
@@ -326,8 +573,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"\nINCOMPLETE: {len(missing)} message(s) unlabelled in pass "
               f"{args.pass_no}:")
         print(id_list(missing))
-        print("  Run `label` again. An email that cannot be labelled at all is a")
-        print("  taxonomy finding, not a skip - see docs/PHASE2_PLAN.md.")
+        command = "label" if args.pass_no == 1 else "recheck"
+        print(f"  Run `{command}` again. An email that cannot be labelled at all is")
+        print("  a taxonomy finding, not a skip - see docs/PHASE2_PLAN.md.")
         problems += 1
     elif args.pass_no == 1:
         print("\npass 1 is complete - the blind recheck (pass 2) may start.")
@@ -421,6 +669,46 @@ def main() -> int:
     verify = sub.add_parser("verify", help="check the labelled set is whole")
     verify.add_argument("--pass", dest="pass_no", type=int, default=1)
     verify.set_defaults(func=cmd_verify)
+
+    recheck = sub.add_parser(
+        "recheck",
+        help="blind pass 2 over a subset: the self-consistency ceiling",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    recheck.add_argument(
+        "--n",
+        type=int,
+        default=evallabel.DEFAULT_RECHECK_N,
+        help=(
+            "how many of the sample to re-present. The draw is pinned to "
+            "eval/recheck.json on first use; a larger n later extends it, "
+            "keeping every id already rechecked (default: %(default)s)"
+        ),
+    )
+    recheck.add_argument(
+        "--seed",
+        type=int,
+        default=evallabel.DEFAULT_RECHECK_SEED,
+        help="draw seed, its own, distinct from the sample's (default: %(default)s)",
+    )
+    recheck.add_argument(
+        "--body-chars",
+        type=int,
+        default=1500,
+        help=(
+            "as `label`, and it should match what pass 1 used: a different "
+            "value measures a different view of the message, not the labeller"
+        ),
+    )
+    recheck.add_argument("--limit", type=int, default=None)
+    recheck.add_argument("--batch", type=int, default=50)
+    recheck.add_argument(
+        "--report",
+        action="store_true",
+        help="print the comparison for a finished draw without labelling anything",
+    )
+    recheck.set_defaults(func=cmd_recheck)
 
     args = parser.parse_args()
     return args.func(args)

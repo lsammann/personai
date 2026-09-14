@@ -154,23 +154,187 @@ def build_system_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
     Without a tiebreak the model dithers and floods Needs Review with items
     where either answer was fine.
     """
+    return (
+        _preamble()
+        + _definitions(order)
+        + "\n\n"
+        + "Precedence when an email fits two categories:\n"
+        + "Anything written by a real human directly to the reader is "
+        + f"{Category.PERSONAL.value}. Otherwise {Category.TO_ACTION.value} beats "
+        + f"everything. Then {Category.BOOKINGS.value} over "
+        + f"{Category.RECEIPTS.value}. Then {Category.PROMOTIONS.value} over "
+        + f"{Category.UPDATES.value}.\n\n"
+        + _contract(order)
+    )
+
+
+def _preamble() -> str:
+    return "You classify emails into exactly one category.\n\n"
+
+
+def _definitions(
+    order: tuple[Category, ...],
+    overrides: Mapping[Category, str] | None = None,
+) -> str:
+    """The lettered category list. `overrides` lets a variant reword one line.
+
+    Overriding here rather than editing `categories.DESCRIPTIONS` keeps the
+    variant local to the prompt: `DESCRIPTIONS` is what the live system uses,
+    and a sweep must not change it until a variant has actually won.
+    """
+    descriptions = {**DESCRIPTIONS, **(overrides or {})}
     letters = category_letters(order)
-    definitions = "\n".join(
-        f"{letters[category]} = {category.value} - {DESCRIPTIONS[category]}"
+    return "\n".join(
+        f"{letters[category]} = {category.value} - {descriptions[category]}"
         for category in order
     )
+
+
+def _contract(order: tuple[Category, ...]) -> str:
     valid = ", ".join(LETTERS[: len(order)])
     return (
-        "You classify emails into exactly one category.\n\n"
-        f"{definitions}\n\n"
-        "Precedence when an email fits two categories:\n"
-        "Anything written by a real human directly to the reader is "
-        f"{Category.PERSONAL.value}. Otherwise {Category.TO_ACTION.value} beats "
-        f"everything. Then {Category.BOOKINGS.value} over "
-        f"{Category.RECEIPTS.value}. Then {Category.PROMOTIONS.value} over "
-        f"{Category.UPDATES.value}.\n\n"
         f"Reply with exactly one character: {valid}. No explanation, no "
         "punctuation, no whitespace before it."
+    )
+
+
+# The precedence as a numbered total order rather than prose. Hypothesis: the
+# rule v1 already states - "anything written by a real human is Personal" - was
+# ignored on four of the six costly errors in run 20260913T065929-6ee8cd, at
+# 0.98 confidence. Prose the model can skim past becomes a list it has to walk.
+def build_ordered_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
+    return (
+        _preamble()
+        + _definitions(order)
+        + "\n\n"
+        + "An email often fits more than one category. Work down this list and "
+        "choose the FIRST that applies:\n"
+        f"1. Written by a real person directly to you - {Category.PERSONAL.value}\n"
+        f"2. Requires you to do something - {Category.TO_ACTION.value}\n"
+        f"3. A reservation you hold for a future date - {Category.BOOKINGS.value}\n"
+        f"4. A completed transaction - {Category.RECEIPTS.value}\n"
+        f"5. Trying to sell you something - {Category.PROMOTIONS.value}\n"
+        f"6. Otherwise - {Category.UPDATES.value}\n\n"
+        + _contract(order)
+    )
+
+
+# Bookings, narrowed. Measured basis: all six costly errors in run
+# 20260913T065929-6ee8cd were predicted Bookings, and the word "confirmation"
+# appears in three of the four subject lines while the sixth arrives from
+# bookings@anaesthesia-analgesia.com.au. The category is described as
+# "confirmation of something scheduled or reserved", so the model is keying on
+# one token. Cheap to try: there are 6 true Bookings in the whole set, and a
+# Bookings/Receipts slip costs nothing because both archive.
+BOOKINGS_NARROWED = (
+    "a reservation you hold for a future date - a flight, hotel, restaurant, "
+    "event or appointment. Not every email containing the word "
+    '"confirmation"'
+)
+
+
+# v9 narrowed Bookings but listed "appointment" among the things it covers -
+# and the message it still got wrong, at 0.984 confidence, was "FW: Appointment
+# Confirmation MT WAVERLEY". The description invited the error it was written
+# to prevent.
+#
+# v9b drops that word and moves the Personal exclusion INSIDE the description.
+# Different hypothesis from v2-ordered, which made Personal globally dominant
+# and over-applied it to 25 messages against a truth of 16: state the rule at
+# the point where the category is over-firing, rather than everywhere.
+BOOKINGS_NARROWED_B = (
+    "a reservation you hold for a future date - a flight, hotel, restaurant "
+    "or event ticket. Not an email that merely mentions a booking or a "
+    'confirmation, and never something a person wrote to you directly'
+)
+
+
+def build_narrow_bookings_b_prompt(
+    order: tuple[Category, ...] = DEFAULT_ORDER,
+) -> str:
+    return (
+        _preamble()
+        + _definitions(order, {Category.BOOKINGS: BOOKINGS_NARROWED_B})
+        + "\n\n"
+        + "Precedence when an email fits two categories:\n"
+        + "Anything written by a real human directly to the reader is "
+        + f"{Category.PERSONAL.value}. Otherwise {Category.TO_ACTION.value} beats "
+        + f"everything. Then {Category.BOOKINGS.value} over "
+        + f"{Category.RECEIPTS.value}. Then {Category.PROMOTIONS.value} over "
+        + f"{Category.UPDATES.value}.\n\n"
+        + _contract(order)
+    )
+
+
+# "low-priority" in the Updates description is a judgement about the reader's
+# interest welded to a structural claim, and only the second is the taxonomy's
+# business. Raised during labelling: a serious, high-interest, no-action email
+# reads as excluded by its own category. Updates is also the most
+# under-predicted category by a distance - 5 predicted against a truth of 21.
+UPDATES_REWORDED = "informational content; no action is ever needed"
+
+
+def build_updates_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
+    return (
+        _preamble()
+        + _definitions(order, {Category.UPDATES: UPDATES_REWORDED})
+        + "\n\n"
+        + "Precedence when an email fits two categories:\n"
+        + "Anything written by a real human directly to the reader is "
+        + f"{Category.PERSONAL.value}. Otherwise {Category.TO_ACTION.value} beats "
+        + f"everything. Then {Category.BOOKINGS.value} over "
+        + f"{Category.RECEIPTS.value}. Then {Category.PROMOTIONS.value} over "
+        + f"{Category.UPDATES.value}.\n\n"
+        + _contract(order)
+    )
+
+
+# Nothing in v1 tells the model what it is looking at. Two of the hardest
+# errors in the eval are the model reading the From ADDRESS as a category: an
+# unpaid invoice from bookings@anaesthesia-analgesia.com.au called Bookings,
+# and a flight e-ticket from Receipts@united.com called Receipts, both above
+# 0.94 confidence. This names the fields and says what the address is.
+#
+# Two sentences rather than one, which stretches the one-variable-per-variant
+# rule - but they are the same intervention: orient the model to its input.
+INPUT_SHAPE = (
+    "Each email is given to you as a From: line with the sender's address, a "
+    "Subject: line, then a blank line and the body text. The address in the "
+    "From: line is where the mail came from, not what kind of mail it is.\n\n"
+)
+
+
+def build_format_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
+    """v4-format on top of v9b, the current best - so the comparison is to it."""
+    return (
+        _preamble()
+        + INPUT_SHAPE
+        + _definitions(order, {Category.BOOKINGS: BOOKINGS_NARROWED_B})
+        + "\n\n"
+        + "Precedence when an email fits two categories:\n"
+        + "Anything written by a real human directly to the reader is "
+        + f"{Category.PERSONAL.value}. Otherwise {Category.TO_ACTION.value} beats "
+        + f"everything. Then {Category.BOOKINGS.value} over "
+        + f"{Category.RECEIPTS.value}. Then {Category.PROMOTIONS.value} over "
+        + f"{Category.UPDATES.value}.\n\n"
+        + _contract(order)
+    )
+
+
+def build_narrow_bookings_prompt(
+    order: tuple[Category, ...] = DEFAULT_ORDER,
+) -> str:
+    return (
+        _preamble()
+        + _definitions(order, {Category.BOOKINGS: BOOKINGS_NARROWED})
+        + "\n\n"
+        + "Precedence when an email fits two categories:\n"
+        + "Anything written by a real human directly to the reader is "
+        + f"{Category.PERSONAL.value}. Otherwise {Category.TO_ACTION.value} beats "
+        + f"everything. Then {Category.BOOKINGS.value} over "
+        + f"{Category.RECEIPTS.value}. Then {Category.PROMOTIONS.value} over "
+        + f"{Category.UPDATES.value}.\n\n"
+        + _contract(order)
     )
 
 
@@ -186,6 +350,11 @@ def build_system_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
 # to hypotheses that the baseline numbers may well revise.
 PROMPTS: dict[str, Callable[[tuple[Category, ...]], str]] = {
     "v1": build_system_prompt,
+    "v2-ordered": build_ordered_prompt,
+    "v9-bookings": build_narrow_bookings_prompt,
+    "v9b-bookings": build_narrow_bookings_b_prompt,
+    "v8-updates": build_updates_prompt,
+    "v4-format": build_format_prompt,
 }
 
 

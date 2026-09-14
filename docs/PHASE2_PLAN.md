@@ -114,6 +114,19 @@ by hand, both improvements. Built now rather than deferred at the human's call:
 no eval run exists, so the bump costs nothing, and a known bug left in the tree
 is a bug that gets forgotten. §1 amended.
 
+**A9 — The recheck draws 30, and the draw is pinned to a file.** §2 sketched
+`recheck --n 20 --seed 99`, recomputed from flags each time. Two changes. **30
+rather than 20**, at the human's call, for variety: at n=20 the Wilson interval
+on the ceiling is about ±0.15, and a uniform draw that size stands a good
+chance of containing no `Bookings` at all. **Pinned to `eval/recheck.json`**
+(ids and provenance, committed, `RECHECK_KEYS` checked on write) rather than
+re-derived, which is A4's argument one level down: a draw computed from CLI
+defaults moves silently the day someone types a different `--n`, and
+`verify --pass 2` would then check completeness against a set nobody labelled.
+The draw only ever *grows* - a larger `n` at the same seed extends it in place,
+which is safe because `recheck_draw` shuffles then takes, so `n=40` is `n=30`
+plus ten. A different seed, or a smaller `n`, is refused. §2 amended.
+
 **A8 — The harness is `app/` code, not `eval/` code.** §3 put predict/score in
 `eval/run_eval.py`. That cannot be tested: `pyproject.toml` packages only
 `app`, `tests/conftest.py` adds no path shim, and §6 asks specifically for
@@ -555,8 +568,17 @@ whether the HTML path classifies as well as the plain path, and whether a
    **Done** as `app/evalscore.py` + `app/evalrun.py` + `scripts/run_eval.py`
    per A8. 372 tests, ruff clean, no new dependencies. Verified end to end
    against real Ollama on a 10-message slice.
-6. **← next.** Baseline run → `body_chars` × model sweep → prompt sweep
-7. `label_eval.py recheck` — the self-consistency ceiling
+6. ~~Baseline run → `body_chars` × model sweep → prompt sweep~~ **Done.**
+   16 runs, ~3,400 calls, zero failures — see **Step 6 results** below.
+   Selected: `llama3.1:8b`, `body_chars=300`, prompt `v9b-bookings`, `T=0.8`,
+   and `Bookings` added to `KEEPS_INBOX`. Dev action accuracy 0.900,
+   `To Action` retention 24/24.
+7. **← current.** `label_eval.py recheck` — the self-consistency ceiling.
+   **Harness built**, 2026-09-13: `recheck` + `--report`, the pinned draw per
+   A9, `verify --pass 2` checking against that draw, and the keypress loop
+   shared with `label` rather than copied. 393 tests, ruff clean, no new
+   dependencies. **The sitting itself is outstanding** — 30 messages of human
+   judgement, then the ceiling gets written into "Step 7 results" below.
 8. Open the lock-box **once**; write measured thresholds and the model
    decision back into `DESIGN.md`, findings into `docs/PLAN.md`
 
@@ -1275,6 +1297,320 @@ different threshold in **0.29 seconds** hitting neither Ollama nor Gmail; a
 second run at `body_chars=300` (~2.2s per call); and `compare` between them
 reporting 0 fixed / 1 broken. The latency difference between the two is the
 truncation lever visible in one line.
+
+---
+
+## Step 6 results — the sweeps
+
+Run 2026-09-13. Sixteen prediction runs, ~3,400 model calls, zero failures.
+Every run is in `eval/RESULTS.md` with a one-line what-changed; the raw rows
+are in `eval/results/` and re-scorable forever.
+
+### The configuration this phase selected
+
+| knob | value | how it was decided |
+|---|---|---|
+| model | `llama3.1:8b` | the 3B never emitted `To Action` once in 200 predictions |
+| `body_chars` | **300** | the only statistically significant result in the sweep |
+| prompt | **`v9b-bookings`** | best on every axis; p=0.180, *not* significant |
+| `confidence_threshold` | **0.8** | measured below; the placeholder turned out right |
+| `to_action_floor` | 0.15 | **inert on this model** - see below |
+| `KEEPS_INBOX` | +`Bookings` | every costly error was a `Bookings` prediction |
+
+Dev (n=140): action accuracy **0.900**, `To Action` retention **24/24**, one
+message archived that should have been kept.
+
+### `body_chars`: only the first 300 characters matter
+
+`0 -> 300` is the single significant comparison in the whole phase: 20 fixed /
+6 broken overall (p=0.009), and **11 fixed / 0 broken on the 24 `To Action`
+messages** (p=0.001). Sender-and-subject alone catches 7 of 24 bills; 300
+characters catches 18.
+
+Above 300, nothing is distinguishable - 800, 1500 and 3000 all sit within a
+handful of flips of each other and of 300 (p between 0.23 and 1.00). And 300
+runs at **2.6s per call against 7.9s at 1500**, so `DESIGN.md`'s default was
+costing 3x the latency for no measurable accuracy.
+
+Underpowered but one-directional: on the `To Action` subgroup, 300 beat the
+longer settings 4-0, 5-1 and 6-1. With four discordant pairs, p=0.125 is the
+*smallest value the test can return*, so those cannot reach significance at
+this subgroup size. Not refuted, just undetectable at n=24.
+
+### The 3B is disqualified, and Phase 0 called it
+
+| | `llama3.1:8b` | `llama3.2:3b` |
+|---|---|---|
+| accuracy | 0.743 | 0.393 |
+| `To Action` recall | 14/24 | **0/24** |
+| mean p(To Action) on real bills | 0.549 | 0.050 |
+| median confidence | 0.982 | 0.582 |
+| permutation stability | **0.850** | 0.443 |
+
+It never predicts `To Action` at all, and its output collapses onto two
+categories - 113 `Personal` against a ground truth of 16.
+
+**Phase 0's eleven-email screen predicted this to within three points.** It
+gave 9/11 = 0.818 for the 8B and 5/11 = 0.455 for the 3B; the 200-message
+figures are 0.850 and 0.443. The synthetic screens were directional, as
+`docs/PLAN.md` said - and directionally they were right.
+
+### `to_action_floor` does nothing
+
+**At F=0.15 the floor fires on zero messages.** At 0.05 it fires on two,
+neither of which needed saving.
+
+The asymmetric rule is a centrepiece of `DESIGN.md` - the one mechanism aimed
+squarely at the only error that costs money - and on this model it is inert.
+The cause is saturation: median confidence 0.982 and `retained_mass` 0.99997
+mean the first-token distribution is nearly one-hot, so a message whose argmax
+is `Receipts` essentially never carries 15% residual mass on `To Action`.
+There is nothing for a floor to catch.
+
+The protection that actually exists comes from two other places: `Needs Review`
+on low confidence, and `Bookings` keeping `INBOX`. **This must be written into
+`DESIGN.md`**, or the next reader assumes a safeguard that is not operating.
+Keep the rule - it costs nothing and a less saturated model would make it live
+again - but document it as dormant.
+
+### `confidence_threshold`: 0.8, measured
+
+| T | costly | clutter | review | action acc |
+|---|---|---|---|---|
+| 0.5 | 5 | 8 | 4% | 0.907 |
+| 0.6 | 3 | 8 | 9% | **0.921** |
+| 0.7 | 3 | 10 | 13% | 0.907 |
+| **0.8** | **1** | 13 | 18% | 0.900 |
+| 0.9 | 1 | 26 | 33% | 0.807 |
+
+A real trade: **T=0.6 maximises action accuracy** but archives three messages
+the reader wanted instead of one. The human's stated priority is that missed
+mail is the intolerable error, so 0.8 is chosen deliberately at a small cost in
+accuracy. Going higher buys nothing - the last remaining error sits at 0.970
+confidence, so T would have to exceed 0.97, putting a third of all mail into
+review.
+
+### `Bookings` joins `KEEPS_INBOX`
+
+Every costly error in every run was a message the model had called `Bookings`.
+Three rounds of prompt work took the over-prediction from 21 of 200 down to 10
+and **moved none of those messages at all**. The taxonomy change removes the
+failure mode by construction rather than by persuasion: three lost messages
+become zero, for five extra messages in the inbox per 140.
+
+It is defensible on its own terms too - an upcoming flight or appointment is
+something the reader wants in front of them. The cost is that the archive half
+is now three categories, so "Receipts vs Bookings is a free error" - an
+argument several labelling decisions leaned on - no longer holds.
+
+### Prompt variants: three of six failed, two of them usefully
+
+| id | result |
+|---|---|
+| `v2-ordered` | precedence as a numbered order. Fixed `Bookings` (21->13) but over-applied `Personal` (25 vs truth 16); clutter 17->24, action accuracy **dropped** |
+| `v9-bookings` | `Bookings` description narrowed. Costly errors 6->3 at no extra clutter |
+| **`v9b-bookings`** | v9 minus the word "appointment", `Personal` exclusion moved *inside* the description. Best overall |
+| `v8-updates` | **failed.** Dropped "low-priority"; costly errors 6->7, `Updates` predictions unchanged at 6 (truth 21) |
+| `v4-format` | **failed.** Named the input fields and stated the From address is not a category |
+
+Two failures worth keeping:
+
+**`v8-updates`** shows the "low-priority" wording was a *labelling* problem,
+not a model one. It made the human's judgement harder without affecting the
+model's - a distinction that would have been invisible without the eval.
+
+**`v4-format`** is the more interesting failure. Both messages it was written
+for - a flight e-ticket from `Receipts@united.com` called `Receipts`, an unpaid
+invoice from `bookings@anaesthesia-analgesia.com.au` called `Bookings`, both
+above 0.94 - were **unchanged**. Its apparent win of zero costly errors was an
+artefact: the calibration gap fell from +0.162 to +0.102, pushing seven more
+messages below the threshold into `Needs Review`. Fewer things were archived
+because the model hedged, not because it understood. Worth remembering as a
+pattern: *a metric improving because confidence dropped is not an improvement.*
+
+**`v9b` is not statistically significant either** - 7 fixed / 2 broken against
+v1, p=0.180. What supports it is a pre-registered mechanism (`Bookings`
+over-prediction) whose intermediate quantity moved as predicted, twice: 21 ->
+13 -> 10 against a truth of 6.
+
+### The soft spot to watch on the holdout
+
+`To Action` recall is 18/24 overall but **5/9 on `draw == "R"`**, the uniform
+draw, against 13/15 on the keyword-mined strata. Retention covers it at 9/9 -
+but that is `Needs Review` and `KEEPS_INBOX` doing the work, not the model
+recognising a bill. The mined figure is flattering because those messages say
+"overdue" on the tin.
+
+### Dev exposure
+
+Six prompt variants and a threshold sweep were selected against the same 140
+dev messages, three of the prompt rounds tuned by reading specific errors. The
+0.800 is optimistic by an unknown amount and the holdout is the only instrument
+that can say how much. This is the reason step 8 opens the box **once**.
+
+### Still open
+
+- **Merging `Promotions` and `Updates`.** 14% of remaining errors, all free
+  (both archive). Cheap version: merge only the applied Gmail label, leaving
+  the six-way enum and every measurement intact. Decision is whether the
+  reader would ever bulk-delete one and not the other.
+- **`DESIGN.md` updates** - `body_chars`, `T`, the dormant floor, and
+  `KEEPS_INBOX` - deliberately deferred to step 8, after the holdout.
+
+---
+
+## Step 7 implementation — the blind recheck
+
+Built 2026-09-13, before the sitting. `recheck` re-presents a subset of the
+sample with the pass-1 label hidden and reports how often the labeller
+reproduces their own decision. That rate is the ceiling: at 27/30 no
+classifier can score above ~0.90 against this ground truth however good it is,
+and the dev 0.800 reads as ~0.89 of what is achievable rather than 0.80 of a
+perfect target.
+
+**Pre-registered, before the number exists**, because the temptation to read it
+generously arrives with the result:
+
+| outcome | reading |
+|---|---|
+| agreement ≥ 0.90, disagreements on `unsure` rows | ceiling is sound; the flagged rows are the known noise |
+| agreement < 0.85 | the labelling rules are not deterministic enough — ground truth needs a rules pass before step 8 |
+| any disagreement crossing `KEEPS_INBOX` | matters more than the raw count: that is the ceiling on action accuracy, the metric with consequences |
+
+And the honest limit: **at n=30 the interval is roughly ±0.11**. 27/30 gives
+[0.74, 0.97]. This can separate "the rules are reproducible" from "ground truth
+is noisy" and it cannot separate 0.90 from 0.98, so the figure goes into
+`DESIGN.md` at step 8 as an interval, never as a point.
+
+### Two ceilings, not one
+
+The harness reports two headline numbers, so the recheck reports two:
+`n_agree / n` bounds `accuracy`, and agreement collapsed through `KEEPS_INBOX`
+bounds action accuracy. Post-A-Bookings that collapse is
+`{To Action, Personal, Bookings}` against `{Receipts, Updates, Promotions}`, so
+a `To Action` -> `Personal` flip agrees on the action while
+`Bookings` -> `Receipts` does not.
+
+**Cohen's kappa was rejected.** It corrects raw agreement for chance using the
+estimated marginals, and at n=30 over six categories those marginals are
+noisier than the statistic they adjust. Raw agreement is also the quantity that
+directly bounds accuracy, which is the whole point of measuring it.
+
+### Which 30
+
+Uniform over all 200: `Random(99)` shuffle of the sorted sample ids, first `n`.
+
+- **Not stratified by the pass-1 label.** It would over-represent the rare
+  categories and bias the headline in a direction nothing downstream could
+  correct for. The cost is a thin per-category breakdown, and the seed-99 draw
+  in fact contains no `Bookings` — 6 of 200 means a 40% chance of that, and
+  re-drawing until one appears would be choosing the draw by looking at the
+  labels, which is the bias the uniform draw exists to avoid.
+- **Not dev-only.** The procedure was applied identically to both splits, and
+  step 8 reads the holdout against the same ceiling. The draw came out 21 dev /
+  9 holdout, all four strata, 2 of the 6 `unsure` rows.
+- **Shuffle-then-take**, so the draw has the prefix property A9 relies on.
+
+### Blindness is structural where it can be, procedural where it cannot
+
+The loop never reads a pass-1 record, and `render` takes a `Cached`, which
+cannot carry a label — the same argument that keeps the stratum off the screen.
+The part that needed a decision is the *report*: it prints **only once the draw
+is complete**. Learning at message 10 that you have already disagreed twice
+changes how carefully you judge messages 11 to 30, so a partial sitting prints
+progress and nothing else, and `recheck --report` prints the comparison later.
+
+`--body-chars` defaults to 1500, matching pass 1. A different value would
+measure a different view of the message rather than the labeller.
+
+### Signatures
+
+```python
+# app/evallabel.py — pure
+RECHECK_PATH = EVAL_DIR / "recheck.json"     # committed, ids only
+RECHECK_PASS, DEFAULT_RECHECK_N, DEFAULT_RECHECK_SEED = 2, 30, 99
+
+@dataclass(frozen=True)
+class RecheckDraw:  n; seed; created_at; message_ids
+@dataclass(frozen=True)
+class Disagreement: message_id; first; second; unsure; crosses_inbox
+@dataclass(frozen=True)
+class Agreement:    n; n_agree; n_action_agree; n_unsure; n_unsure_agree;
+                    disagreements
+
+def recheck_draw(sample_ids, n, seed) -> list[str]
+def agreement(first, second) -> Agreement
+def save_draw(draw, path) -> None
+def load_draw(path) -> RecheckDraw | None
+```
+
+Three decisions inside those:
+
+**A pass-2 row with no pass-1 row raises.** That condition means
+`labeled.jsonl` is damaged, and skipping it would shrink the denominator and
+flatter the ceiling by exactly the rows lost.
+
+**An unreadable draw file raises, where an unreadable cache entry reads as
+absent.** The cache is derived data and refetching costs a second; the draw is
+the measurement plan, and treating damage as "never drawn" would replace it
+with a fresh one mid-recheck.
+
+**The Wilson interval comes from `evalscore.wilson`**, imported rather than
+rewritten — one estimator, one implementation. `evallabel` gains no new
+dependency edge that matters: `evalscore` is the pure module and imports
+nothing it should not.
+
+### What the CLI grew
+
+`recheck [--n 30] [--seed 99] [--body-chars 1500] [--limit] [--batch]
+[--report]`, refusing to start until `unfinished(records, sample_ids, 1)` is
+empty — the guard step 3 specified, using the function it already added. Fully
+offline: all 200 messages are cached, so `gmail()` is never called.
+
+The keypress loop was **extracted from `cmd_label` rather than copied** into
+`label_loop(queue, resolved, *, pass_no, ...)`. A copy would be the code that
+writes ground truth, and two of those drift — `b` fixed in one and not the
+other is a misfire that survives into the labels.
+
+`verify --pass 2` was **wrong before this step** and is fixed here: it compared
+pass 2 against all 200 sample ids, so a 30-message recheck would have reported
+170 messages missing. It now checks against the pinned draw, and drops the
+`w_h` column for pass 2, since that weight is a pass-1 quantity `run_eval`
+computes from pass 1 and nothing weights the recheck by.
+
+### Tests — 21 new, 393 total
+
+Draw: deterministic from the seed; independent of input order; a subset with no
+repeats; `n=40` extends `n=30`; an over-large `n` is the whole sample.
+Agreement: exact matches; measured only over the rows pass 2 reached; the free
+error agrees on the action where the costly one does not; `unsure` in either
+pass attributed; an orphan pass-2 row raises. Draw file: round-trips; carries
+only `RECHECK_KEYS`; absent is `None` and damaged raises.
+
+### Verification, as run
+
+Driven end to end against a **copy** of `eval/` in a scratch directory, with 30
+synthetic keypresses derived from the pass-1 labels and three deliberate flips
+— one crossing `KEEPS_INBOX`, one on an `unsure` row, one free. Reported 27/30
+[0.74, 0.97] 6-way and 28/30 [0.79, 0.98] on keeps-INBOX, named all three
+disagreements with sender and subject, and `verify --pass 2` came back `OK`
+against the pinned draw. Then: `--report` reprints without labelling, `--n 35`
+extends the draw and resumes at [31/35] with the recorded 30 standing, `--seed
+7` and `--n 20` are both refused. Nothing in the real `eval/` was touched — the
+draw there is unpinned until the sitting starts.
+
+### The policy on disagreements, agreed before the sitting
+
+Where pass 2 exposes a genuine pass-1 error, **fix it** with `label --relabel
+<id>` and re-run `score` on the affected runs. Leaving a known-wrong label in
+ground truth to protect comparability is the wrong trade with step 8 still
+ahead, and re-scoring is free — no re-inference, since model, prompt and
+`body_chars` are unchanged, so the cost is seconds and a `RESULTS.md` edit.
+
+The ceiling is recorded **as measured before** those fixes and is not
+re-measured from the same 30: the draw has been seen now, so a second pass over
+it would measure memory. If the ceiling needs narrowing later, `--n 40` extends
+into unseen messages.
 
 ---
 
