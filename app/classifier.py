@@ -289,6 +289,49 @@ def build_updates_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
     )
 
 
+# v10, written after step 7 flipped the cost model. v9/v9b narrowed Bookings
+# because, while Bookings ARCHIVED, every costly error was a Bookings
+# prediction. Step 6 then moved Bookings into KEEPS_INBOX, which reverses the
+# asymmetry: on run 20260913T113909-f1f3a4 all five false Bookings predictions
+# land on messages that keep the inbox anyway, so they cause zero clutter
+# errors, while the single costly error in the run is a true Bookings the model
+# called Receipts. Over-prediction is now free and under-prediction is not.
+#
+# The measured target is one message: United's "eTicket Itinerary and Receipt",
+# Receipts at 0.970 with p(Bookings) = 0.027 - against Qantas's "Confirmation
+# and E-Ticket Flight Itinerary", Bookings at 0.991. Same genre, opposite
+# answers, so the model is keying on the literal token "receipt" (in the
+# subject, and in Receipts@united.com) rather than on the itinerary.
+#
+# The fix belongs in the DESCRIPTION, not the precedence block: the prompt
+# already says "Bookings over Receipts", and it did not help because at 0.027
+# the model never had Bookings in play to apply precedence to. One added
+# sentence, so the result is attributable.
+BOOKINGS_ITINERARY = (
+    "a reservation you hold for a future date - a flight, hotel, restaurant "
+    "or event ticket. A ticket or itinerary for a trip that has not happened "
+    "yet belongs here even when the same email is also the receipt for it. "
+    "Not an email that merely mentions a booking or a confirmation, and never "
+    "something a person wrote to you directly"
+)
+
+
+def build_itinerary_prompt(order: tuple[Category, ...] = DEFAULT_ORDER) -> str:
+    """v10-itinerary on top of v9b, the current best - so the comparison is to it."""
+    return (
+        _preamble()
+        + _definitions(order, {Category.BOOKINGS: BOOKINGS_ITINERARY})
+        + "\n\n"
+        + "Precedence when an email fits two categories:\n"
+        + "Anything written by a real human directly to the reader is "
+        + f"{Category.PERSONAL.value}. Otherwise {Category.TO_ACTION.value} beats "
+        + f"everything. Then {Category.BOOKINGS.value} over "
+        + f"{Category.RECEIPTS.value}. Then {Category.PROMOTIONS.value} over "
+        + f"{Category.UPDATES.value}.\n\n"
+        + _contract(order)
+    )
+
+
 # Nothing in v1 tells the model what it is looking at. Two of the hardest
 # errors in the eval are the model reading the From ADDRESS as a category: an
 # unpaid invoice from bookings@anaesthesia-analgesia.com.au called Bookings,
@@ -355,6 +398,7 @@ PROMPTS: dict[str, Callable[[tuple[Category, ...]], str]] = {
     "v9b-bookings": build_narrow_bookings_b_prompt,
     "v8-updates": build_updates_prompt,
     "v4-format": build_format_prompt,
+    "v10-itinerary": build_itinerary_prompt,
 }
 
 

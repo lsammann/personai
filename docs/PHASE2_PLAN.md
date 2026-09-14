@@ -1766,6 +1766,124 @@ into unseen messages.
 
 ---
 
+## `v10-itinerary` — the round step 7 made necessary
+
+Written and **pre-registered 2026-09-14, before the run**. A seventh prompt
+variant against the same dev 140, which adds to the exposure recorded above and
+is taken deliberately: unlike the `Personal` question, this one targets the
+only error class in the system that costs anything.
+
+### Why the existing prompt is inconsistent with the taxonomy
+
+`v9` and `v9b` narrowed `Bookings` because, **while `Bookings` archived**,
+every costly error in the phase was a `Bookings` prediction. Step 6 then moved
+`Bookings` into `KEEPS_INBOX`, which reverses the asymmetry - and the prompt
+never caught up. Measured on `20260913T113909-f1f3a4`, dev:
+
+| | |
+|---|---|
+| true `Bookings` | 5 |
+| predicted `Bookings` | 8, of which 3 correct |
+| the 5 false positives | 4 true `Personal`, 1 true `To Action` |
+| clutter errors caused by a `Bookings` prediction | **0** |
+| the 2 misses | United e-ticket -> `Receipts` (**the run's only costly error**), a wedding countdown -> `To Action` (free) |
+
+**Over-predicting `Bookings` now costs nothing**, because its false positives
+land on messages that keep the inbox anyway; **under-predicting it costs the
+only consequential error in the run.** Narrowness is optimising against the
+current cost function.
+
+### The mechanism, and why it is in the description
+
+```
+Qantas  "Confirmation and E-Ticket Flight Itinerary"  -> Bookings  0.991
+United  "eTicket Itinerary and Receipt for Conf..."   -> Receipts  0.970
+```
+
+Same genre, opposite answers, so the model is keying on the literal token
+*receipt* - in the subject and in `Receipts@united.com` - rather than on the
+itinerary. The precedence block already says "`Bookings` over `Receipts`" and
+did not help, because at `p(Bookings) = 0.027` the model never had `Bookings`
+in play for precedence to arbitrate. The change therefore goes in the
+**description**: one added sentence, *a ticket or itinerary for a trip that has
+not happened yet belongs here even when the same email is also the receipt for
+it*. One idea, so the result is attributable.
+
+### Pre-registered decision rule
+
+**Primary, the mechanism:** the United e-ticket flips to `Bookings`, or
+`p(Bookings)` on it rises materially from 0.027.
+
+**Guards - all must hold, or `v9b` stands:**
+
+| guard | `v9b` | required |
+|---|---|---|
+| action accuracy | 0.900 | >= 0.900 |
+| costly errors | 1 | <= 1 |
+| `To Action` retention | 20/20 | 20/20 |
+| clutter | 13 | <= 13 |
+| dev `Bookings` predictions | 8 | <= 12 |
+
+The last guard is the failure mode worth naming in advance: the new sentence
+could pull true `Receipts` across, and `Receipts` archives, so that direction
+**would** create clutter where the current false positives do not.
+
+**And the `v4-format` lesson applies:** if the error count improves while the
+calibration gap falls, that is the model hedging into `Needs Review`, not
+understanding. Not an adoption.
+
+**What cannot be measured:** dev holds 5 true `Bookings` and the holdout 1, so
+`Bookings` recall has no useful precision here and no claim will be made from
+it. The evidence is the named message plus the prediction-count guards - the
+same standard `v9` and `v9b` were judged by.
+
+### Result — rejected, 2026-09-14
+
+Run `20260914T132822-bb1948`. **`v9b` stands.**
+
+| criterion | `v9b` | `v10` | |
+|---|---|---|---|
+| six-way accuracy | 0.771 | **0.800** (4 fixed / 0 broken, p=0.125) | looks like a win |
+| **action accuracy** | **0.900** | **0.857** | **fails the guard** |
+| costly errors | 1 | 0 | passes |
+| clutter | 13 | **20** | **fails the guard** |
+| `To Action` retention | 20/20 | 20/20 | passes |
+| `Bookings` predictions | 8 | 9 | passes |
+| calibration gap | +0.157 | +0.131 | the hedging signature |
+
+**The target message never flipped.** United is still `Receipts` - but at
+**0.752 rather than 0.970**, which puts it under T=0.8 and into `Needs Review`,
+where it keeps the inbox. Costly errors reached zero because the model became
+uncertain, not because it became right.
+
+**The mechanism was real and insufficient.** `p(Bookings)` on that message rose
+**0.027 -> 0.238**, ninefold. The sentence is read, and it moves mass in the
+intended direction on the intended message. It cannot overcome the literal
+token *receipt* in the subject and in `Receipts@united.com`.
+
+**The cost landed somewhere the pre-registration did not predict.** `Bookings`
+predictions barely moved (8 -> 9), so the clause did *not* pull true `Receipts`
+across as the guard anticipated. Instead it destabilised the whole `Receipts`
+class: `Needs Review` went 17.9% -> 25.7% and clutter from `Receipts`
+predictions went 2 -> 8. Uncertainty keeps the inbox, so hedging shows up as
+clutter.
+
+**Why this is the phase's best argument for the collapsed matrix.** Six-way
+accuracy rose one-directionally - 4 fixed, 0 broken, nothing traded - and the
+metric with consequences fell. Adopting on the headline number would have
+bought zero costly errors at the price of seven extra pieces of inbox clutter
+and a worse action matrix. `v2-ordered` made the same point less sharply,
+because there the six-way number and the action number moved together.
+
+**Recorded against the `Bookings` question, which was well posed:** the prompt
+*was* inconsistent with the taxonomy after `Bookings` joined `KEEPS_INBOX`, and
+narrowness *was* optimising against the old cost function. The description
+route was the right thing to try and it is now measured: it shifts the target
+distribution ninefold and still loses to one token. The residual exposure
+stays what step 7 recorded - a booking that looks like a receipt - and it
+should be written into `DESIGN.md` at step 8 as a known, measured limit rather
+than an open question.
+
 ## Open question carried into this phase
 
 **Refresh-token lifetime in Testing status** (from Phase 0). Assumed 7 days;
