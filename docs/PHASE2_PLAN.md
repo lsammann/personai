@@ -582,10 +582,17 @@ whether the HTML path classifies as well as the plain path, and whether a
    nine-row `S_human` sweep then corrected in seven places; all fourteen runs
    re-scored and `eval/RESULTS.md` rewritten. The selected configuration
    survived — see "Step 7 results" below.
-8. **← next.** Open the lock-box **once**; write measured thresholds and the
-   model decision back into `DESIGN.md`, findings into `docs/PLAN.md`. Score
-   `20260913T113909-f1f3a4` on `--holdout`, against a ceiling of 28/30
-   [0.79, 0.98] six-way and 30/30 [0.89, 1.00] on keeps-INBOX.
+8. ~~Open the lock-box **once**; write measured thresholds and the model
+   decision back into `DESIGN.md`, findings into `docs/PLAN.md`~~ **Done
+   2026-09-14. Gate PASSED.** Holdout 0.800 [0.68, 0.88] six-way, action
+   accuracy 0.900 — identical to dev — 1 costly error, retention 9/9. No
+   detectable inflation. `DESIGN.md` and `docs/PLAN.md` written; the measured
+   configuration now ships in code (`body_chars=300`,
+   `DEFAULT_PROMPT_ID="v9b-bookings"`).
+
+**Phase 2 is complete.** Phase 3 is the writer end — and its first hard rule
+stands: no write path ships before `scripts/undo_run.py` exists and has been
+run successfully against real messages.
 
 Per `CLAUDE.md`, each of these is planned before it is written, and nothing is
 committed by Claude — changes are left in the working tree and reported.
@@ -1480,9 +1487,14 @@ that can say how much. This is the reason step 8 opens the box **once**.
 - **Merging `Promotions` and `Updates`.** 14% of remaining errors, all free
   (both archive). Cheap version: merge only the applied Gmail label, leaving
   the six-way enum and every measurement intact. Decision is whether the
-  reader would ever bulk-delete one and not the other.
-- **`DESIGN.md` updates** - `body_chars`, `T`, the dormant floor, and
-  `KEEPS_INBOX` - deliberately deferred to step 8, after the holdout.
+  reader would ever bulk-delete one and not the other. **Left open
+  deliberately at the end of Phase 2** - it is a preference about how the
+  archive reads, not a measurement, and live use answers it better than the
+  eval set can. `DESIGN.md` already lists it under Future Enhancements.
+- ~~**`DESIGN.md` updates** - `body_chars`, `T`, the dormant floor, and
+  `KEEPS_INBOX` - deliberately deferred to step 8, after the holdout.~~
+  **Written 2026-09-14**, along with the model-selection section, the category
+  table, the action-space argument and the measured-configuration table.
 - **`Personal` recall is 4/14 on dev, every error free.** Closed for this
   phase with the measurement behind it - see "No prompt round for `Personal`"
   under step 7. Revisit only if the shelf proves unreliable in live use, and
@@ -1883,6 +1895,120 @@ distribution ninefold and still loses to one token. The residual exposure
 stays what step 7 recorded - a booking that looks like a receipt - and it
 should be written into `DESIGN.md` at step 8 as a known, measured limit rather
 than an open question.
+
+## Step 8 — the lock-box
+
+### Pre-registration, written 2026-09-14 before the holdout was scored
+
+**The run:** `20260913T113909-f1f3a4` - `llama3.1:8b`, `v9b-bookings`,
+`body_chars=300` - scored at **T=0.8, F=0.15** on `--holdout`, n=60. One call.
+`score` prints a threshold sweep as part of its output; **T is not re-chosen
+here.** 0.8 was measured on dev, and picking a threshold off the holdout table
+would turn the holdout into a second dev set, which is the exact failure the
+split exists to prevent.
+
+**Why the estimate is expected to be optimistic.** Seven prompt variants, a
+five-point `body_chars` sweep and a threshold sweep were all selected against
+the same dev 140, three of the prompt rounds tuned by reading specific errors.
+The dev figures are biased upward by an unknown amount and the holdout is the
+only instrument that can say by how much. A drop of a few points is the
+expected outcome, not a failure.
+
+**What the holdout can answer**, at n=60 with 16 keeps-INBOX truths against 44
+archives: overall accuracy against dev's 0.771, and the action matrix -
+costly errors and clutter - which is the pair the gate turns on.
+
+**What it cannot answer, registered now so the result is not over-read.** The
+holdout holds **9 true `To Action`**, of which 3 are `R`-draw:
+
+| recall | Wilson |
+|---|---|
+| 9/9 | [0.70, 1.00] |
+| 8/9 | [0.56, 0.98] |
+| 7/9 | [0.45, 0.94] |
+
+Those intervals overlap almost entirely, so **no claim will be made from
+holdout `To Action` recall**, and the `R`-draw soft spot (5/9 on dev) is
+untestable at n=3. Gate question 2 is answered by retention and by the dev
+recall, with the holdout figure reported for completeness only. The single
+true `Bookings` on the holdout means the same applies there.
+
+**Read against the ceiling, not against 1.0:** 28/30 [0.79, 0.98] six-way and
+30/30 [0.89, 1.00] on keeps-INBOX, from step 7.
+
+**Decision rule, agreed before looking:**
+
+- **Pass** if the action matrix holds up - costly errors at most 2 of 16
+  keeps-INBOX truths, and overall accuracy within the dev interval [0.70, 0.83].
+- **Fail** if action accuracy lands materially below dev, under 0.83. In that
+  case the honest response is to draw a **fresh** holdout by extending the
+  sample, **not** to iterate against the one just spent. Tuning against a
+  revealed holdout is precisely what the lock-box exists to prevent, and the
+  temptation would be at its strongest at that exact moment.
+- Either way the number is recorded with its interval, and `DESIGN.md` is
+  written from the dev-measured configuration, which is already fixed.
+
+### The holdout, opened once — 2026-09-14
+
+`20260913T113909-f1f3a4`, `--holdout`, T=0.8, F=0.15, n=60.
+
+| | dev (n=140) | **holdout (n=60)** |
+|---|---|---|
+| accuracy | 0.771 [0.70, 0.83] | **0.800** [0.68, 0.88] |
+| weighted | 0.771 | 0.787 |
+| excluding `unsure` | 0.774 | 0.825 |
+| **action accuracy** | **0.900** | **0.900** |
+| costly errors | 1 of 39 keeps | **1 of 16 keeps** |
+| clutter | 13 | 5 |
+| `To Action` retention | 20/20 | **9/9** |
+| `To Action` recall | 14/20 | 6/9 *(no claim - see pre-registration)* |
+| calibration gap | +0.157 | **+0.166** |
+
+**Pass on every pre-registered criterion**: costly errors 1 (rule: at most 2),
+accuracy 0.800 inside the dev interval [0.70, 0.83], action accuracy 0.900 (rule:
+at least 0.83).
+
+**No detectable inflation** - and the honest version of that claim. The point
+estimate went *up*, which is the opposite direction from overfitting, and the
+action matrix is identical to three decimal places. But n=60 gives [0.68, 0.88],
+which overlaps the dev interval almost entirely, so what this licenses is
+"inflation is not detectable at this sample size", not "there is none". The
+best available reading is that selection ran mostly on mechanism rather than on
+error-fishing - `v9b` was adopted on a pre-registered `Bookings` mechanism, and
+`v8`, `v4` and `v10` were each rejected on guards rather than adopted on noise.
+
+**The floor is dormant here too.** The holdout floor sweep returns an identical
+9/9 kept and 40 archived at F = 0.05, 0.10 and 0.15. Step 6 found this on dev;
+it now replicates on data no tuning ever touched, which upgrades it from an
+observation to a property of this model.
+
+### The one costly error, and the finding it forces
+
+```
+199b6758f4fcd5ad   S_human, mined
+from: Paula from Checkmate <team@checkmate.tech>
+subj: Re: Background Checking | EY | Membership Verification
+truth Personal -> predicted Promotions at 0.925 -> archived
+```
+
+A human-written reply, archived as marketing. **This is exactly the condition
+registered under "No prompt round for `Personal`" as the thing that would
+reopen that question**: *human-written mail predicted `Receipts`, `Updates` or
+`Promotions`. That crosses into the archive, and a missed human email is a real
+loss.* On dev there were none; on the holdout there is one, so across all 200
+messages one human-written email would be archived.
+
+**And it cannot be acted on now.** Tuning a prompt in response to a holdout
+error spends the holdout, which is the single thing the pre-registration
+forbids and the reason the box is opened once. The correct disposition is to
+carry it into Phase 3 as a **stated hypothesis with a stated test**: if
+`Personal` -> archive appears in live use, that is the trigger for a `Personal`
+prompt round, scored against a *fresh* holdout drawn by extending the sample.
+Recorded in `docs/PLAN.md` under Phase 2 findings, not fixed here.
+
+Note it is also the reverse of the dev picture, where every `Personal` error
+was free. One message is not a pattern; it is enough to move the question from
+"closed" to "watch", which is what it has been set to.
 
 ## Open question carried into this phase
 

@@ -45,7 +45,7 @@ TOP_LOGPROBS = 20
 # results file saying `prompt_version: 3` cannot be read back against a table
 # of hypotheses. Logged on every row, so a mixed log can be segmented by which
 # prompt produced it.
-DEFAULT_PROMPT_ID = "v1"
+DEFAULT_PROMPT_ID = "v9b-bookings"
 
 # Measured identical to three decimal places at 0.5, 1.0 and 2.0 in Phase 0 -
 # reported logprobs are pre-temperature on this stack. Pinned anyway to

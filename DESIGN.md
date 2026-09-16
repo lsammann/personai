@@ -51,13 +51,53 @@ easy querying:
 |---|---|---|---|
 | `Agent/To Action` | Requires a decision, payment, reply, or click from me — especially anything with a deadline | Yes | Yes |
 | `Agent/Receipts` | A transaction already completed; record-keeping only, no action needed | No | Yes |
-| `Agent/Bookings` | Confirmation of something scheduled/reserved (appointment, flight, reservation); reference only | No | Yes |
+| `Agent/Bookings` | A reservation you hold for a future date — a flight, hotel, restaurant or event ticket | **Yes** *(Phase 2)* | Yes |
 | `Agent/Updates` | Low-priority informational content, no action ever needed (newsletters, LinkedIn digests) | No | Yes |
 | `Agent/Promotions` | Marketing/sales content trying to get me to buy something | No | Yes |
-| `Agent/Personal` | Written by a real person directly to me, not automated or bulk mail | Yes | Yes |
+| `Agent/Personal` | Written by a real person directly to me, not automated or bulk mail — **plus, operationally, anything in a thread I'm part of** (see the reply rule) | Yes | Yes |
 | `Agent/Needs Review` | Classifier confidence below threshold; holding label until I manually re-file it | Yes | No — applied by the app |
 | `Agent/Processed` | Marker applied alongside every category label; means "successfully classified, never look again" | N/A (never affects inbox state) | No — applied by the app |
 | `Agent/Error` | The system gave up on this message after repeated failures. Should always be empty | Yes | No — applied by the app |
+
+**Two deterministic routing rules, both checked before any model call.** They
+point in opposite directions and live together in `app/prefilter.py`, because
+they answer the same question — can this be decided without an LLM?
+
+| rule | matches | routes to | `INBOX` |
+|---|---|---|---|
+| sender allowlist | domain in `prefilter_domains.json` | `Agent/Promotions` | removed |
+| **reply rule** | subject matches `^(Re\|Fw\|Fwd):` | `Agent/Personal` | **retained** |
+
+**The reply rule exists because the model reads `Personal` poorly** — 4 of 14
+on the Phase 2 dev split, mean `p(Personal)` 0.302, and one human-written reply
+archived as `Promotions` at 0.925 on the holdout. The labelling rule ground
+truth was built with is *"a human wrote it → `Personal`"*, chosen precisely
+because it is decidable from the text. The rule moves that decision into code,
+where it is decidable exactly.
+
+**Its discriminator is "am I in this thread", not "did a human type this."**
+Those come apart on automated replies — a ticketing auto-response, a support
+survey answering a query I sent — and those are still wanted in the inbox,
+because they exist only because I started something. That is why the label's
+operational meaning is wider than its description above, and why the eval
+reports the gap (`label_exact` against `rule_action_correct`) rather than
+hiding it. The model's own description is untouched, and stays accurate for
+what the model sees: rule-routed mail never reaches it.
+
+**`labels_remove` is empty, and that is the whole safety argument.** The rule
+can only ever move a message *into* the keeps-`INBOX` set, so it cannot create
+the one error that costs anything. Its worst case is clutter. Re-scored across
+all 14 Phase 2 runs on both splits — 28 scorings — it removed a costly error in
+four and **increased clutter in none**, because the messages it newly keeps
+were already being kept by the model.
+
+**Measured on 200 messages, which is a weak estimate and is treated as one.**
+15 subjects match; all 15 are mail that should stay visible, 13 of them
+human-written. `Re:` is cheap for automated mail to produce, and auto-responders
+are likely over-represented in an 18,668-message backfill relative to genuine
+replies, so the rule ships with `source: "reply"` in the logbook and a live
+measurement plan. The stricter version — `Re:` **and** no `List-Unsubscribe`
+header — needs a header the message cache does not store. See `docs/BACKLOG.md`.
 
 **Three mutually exclusive mailbox states.** `Agent/Processed` and
 `Agent/Error` are the two labels that take a message out of the work queue,
@@ -98,14 +138,32 @@ a quoted term is unambiguous whatever the name contains, so no query in the
 project has to know how a label is spelled. Nothing formats a label into a
 query string at the call site.
 
-**The action space is nearly binary, and that matters.** Four of the six
-real categories (`Receipts`, `Bookings`, `Updates`, `Promotions`) produce
-identical behaviour: label it, remove `INBOX`. `To Action` and `Personal`
-both keep it. So a Receipts↔Bookings confusion costs nothing, and so does a
-To Action↔Personal one — while a `To Action` false negative means a missed
-bill. The categories exist for retrieval and tidiness; the only decision with
+**The action space is nearly binary, and that matters.** Three of the six
+real categories (`Receipts`, `Updates`, `Promotions`) produce identical
+behaviour: label it, remove `INBOX`. `To Action`, `Personal` and — since
+Phase 2 — `Bookings` all keep it. So a To Action↔Personal confusion costs
+nothing, while a `To Action` false negative means a missed bill. The
+categories exist for retrieval and tidiness; the only decision with
 consequences is *does this need to stay visible*. This asymmetry drives the
 evaluation strategy and the asymmetric threshold rule below.
+
+**`Bookings` moved into the keeps-`INBOX` set in Phase 2, on measurement.**
+Every costly error in every run was a message the model had called `Bookings`,
+and three rounds of prompt work took the over-prediction from 21 of 200 down to
+10 while moving none of those messages at all. The taxonomy change removes the
+failure mode by construction rather than by persuasion: three lost messages
+became zero, for five extra messages in the inbox per 140. It is defensible on
+its own terms too — an upcoming flight or appointment is something the reader
+wants in front of them.
+
+**The cost is that Receipts↔Bookings is no longer free**, and it is now the
+system's residual exposure: the one costly error on dev is a United e-ticket,
+`Bookings` truth, called `Receipts` at 0.970 because the subject says "Receipt"
+and the sender is `Receipts@united.com`. Two prompt rounds were aimed at it
+(`v4-format`, `v10-itinerary`) and neither fixed it — `v10` raised
+`p(Bookings)` on that message ninefold, 0.027 → 0.238, and still lost to the
+literal token. A reader should know the remaining exposure is "a booking that
+looks like a receipt", not "a missed invoice".
 
 **Why `Personal` exists.** The other five categories all describe
 machine-generated mail — receipts, confirmations, newsletters, marketing,
@@ -143,8 +201,9 @@ For every successfully classified message, the agent applies, **in a single
 `messages.modify` call**:
 - `addLabelIds`: the chosen category label (or `Agent/Needs Review`), plus
   `Agent/Processed`
-- `removeLabelIds`: `INBOX` — except for `Agent/To Action` and
-  `Agent/Needs Review`, which retain it
+- `removeLabelIds`: `INBOX` — except for `Agent/To Action`, `Agent/Personal`,
+  `Agent/Bookings` and `Agent/Needs Review`, which retain it. The set is
+  `categories.KEEPS_INBOX`, never retyped at a call site
 
 **One atomic call, not three sequential ones.** Gmail's `messages.modify`
 accepts adds and removes together. Splitting this into separate calls means a
@@ -237,15 +296,34 @@ spikes and their findings are recorded in `docs/PLAN.md`.
   precedence: anything written by a real human is `Personal`; otherwise
   `To Action` beats everything; then `Bookings` over `Receipts`; then
   `Promotions` over `Updates`.
-- **Confidence threshold starts at 0.8.** Below this → `Agent/Needs Review`
-  instead of the argmax category. Config value, not hardcoded, and expected
-  to move once the eval set produces a calibration table.
-- **Asymmetric rule for `To Action`.** Independently of the argmax, if
-  `p(To Action)` exceeds a second, much lower threshold (starting at 0.15),
-  `INBOX` is retained. This is nearly free now that the full distribution is
-  available, and it protects the only error class that costs anything: a
-  missed bill. A Receipts/Bookings coin-flip still just picks one and
-  archives, because both outcomes are identical in behaviour.
+- **Confidence threshold is 0.8 — measured, Phase 2.** Below this →
+  `Agent/Needs Review` instead of the argmax category. The starting value
+  turned out to be right, but for a reason worth recording: T=0.6 maximises
+  action accuracy (0.921) and archives **three** messages the reader wanted
+  against 0.8's **one**. 0.8 is chosen deliberately at a small cost in
+  accuracy, because missed mail is the intolerable error. Going higher buys
+  nothing — the last remaining error sits at 0.970 confidence, so T would have
+  to exceed 0.97, putting a third of all mail into review.
+- **Asymmetric rule for `To Action` — built, and DORMANT on this model.**
+  Independently of the argmax, if `p(To Action)` exceeds a second, much lower
+  threshold (0.15), `INBOX` is retained.
+
+  **Phase 2 measured it firing on zero messages.** At F=0.15 it fires on none;
+  at 0.05 on two, neither of which needed saving; and the holdout sweep returns
+  identical results at 0.05, 0.10 and 0.15. The cause is saturation: median
+  confidence 0.982 and `retained_mass` 0.99997 mean the first-token
+  distribution is nearly one-hot, so a message whose argmax is `Receipts`
+  essentially never carries 15% residual mass on `To Action`. There is nothing
+  for a floor to catch.
+
+  **A reader must not assume this safeguard is operating.** The protection that
+  actually exists comes from two other places: `Needs Review` on low
+  confidence, and `KEEPS_INBOX`. The rule is kept because it costs nothing and
+  a less saturated model would make it live again — but it is dormant, not
+  active, and it replicated as dormant on data no tuning touched.
+
+  Note also that the Receipts/Bookings coin-flip argument below no longer
+  holds: `Bookings` now keeps `INBOX`.
 - **The two thresholds are coupled: `confidence_threshold + to_action_floor`
   must be below 1.** The rule needs one category above the threshold and
   `To Action` above the floor *in the same distribution*, and a distribution
@@ -394,11 +472,46 @@ classified an energy bill reading "payment due 15 October" as `Receipts` with
 `p(To Action) = 0.000` — a false negative on the one category that matters,
 with no probability mass left for the asymmetric rule to catch it.
 
-This is a **lead candidate, not a settled decision.** It rests on eleven
-synthetic emails, and the ranking changed twice as each new screen was added
-(speed, then calibration, then robustness). Phase 2 decides it against 150–200
-real hand-labeled messages, and must re-measure all three properties rather
-than inheriting these numbers.
+~~This is a **lead candidate, not a settled decision.**~~ **Settled in Phase 2
+against 200 hand-labelled real messages**, and the Phase 0 screen turned out to
+be directionally right to within three points — it predicted 0.818 stability
+for the 8B and 0.455 for the 3B; the real figures are 0.850 and 0.443.
+
+| measured on 200 real messages | `llama3.1:8b` | `llama3.2:3b` |
+|---|---|---|
+| accuracy | **0.743** | 0.393 |
+| `To Action` recall | 14/24 | **0/24** |
+| mean `p(To Action)` on real bills | 0.549 | 0.050 |
+| permutation stability | **0.850** | 0.443 |
+
+The 3B is disqualified: it never predicted `To Action` once in 200 messages and
+collapsed onto two categories, predicting `Personal` for 113 against a truth of
+16.
+
+### What the shipped configuration measures at
+
+`llama3.1:8b` + `v9b-bookings` + `body_chars=300`, at T=0.8 / F=0.15:
+
+| | dev (n=140) | holdout (n=60), opened once |
+|---|---|---|
+| accuracy | 0.771 [0.70, 0.83] | **0.800** [0.68, 0.88] |
+| **action accuracy** (keeps-`INBOX` vs archived) | **0.900** | **0.900** |
+| costly errors — mail archived that should have been kept | 1 | 1 |
+| `To Action` retention | 20/20 | 9/9 |
+| calibration gap | +0.157 | +0.166 |
+
+**Read those against the ceiling, not against 1.0.** A blind second pass over
+30 of the 200 messages reproduced the labeller's own judgement **28/30**
+[0.79, 0.98] six-way and **30/30** [0.89, 1.00] on the keeps-`INBOX` collapse.
+Ground truth is not perfect, and the six-way number cannot exceed roughly 0.93
+however good the classifier is. The operational ceiling, however, is clean.
+
+**The holdout showed no detectable inflation** — the point estimate rose rather
+than fell, and the action matrix is identical — but at n=60 the interval
+overlaps dev almost entirely, so the honest claim is "not detectable at this
+sample size", not "none". Six prompt variants, a five-point body sweep and a
+threshold sweep were all selected on dev; `docs/PHASE2_PLAN.md` records that
+exposure in full.
 
 ### Error handling
 
@@ -1016,20 +1129,27 @@ building later for the reasons given.
 
 ## Open Assumptions to Confirm During Build
 
-- **Final model choice.** `llama3.1:8b` leads on eleven synthetic emails,
-  but the ranking changed twice during Phase 0 as new screens were added.
-  Phase 2 re-measures latency, calibration gap and permutation stability
-  against real hand-labeled mail and decides.
-- **Where the confidence threshold actually belongs.** 0.8 is a starting
-  value, not a measured one. The calibration table sets it. So does the
-  `p(To Action)` floor, provisionally 0.15.
-- Prompt input fields and body truncation length — tuned against the eval
-  set, with the body budget prioritised for `To Action` signal.
+- ~~**Final model choice.**~~ *Settled, Phase 2: `llama3.1:8b`. The 3B never
+  emitted `To Action` once in 200 predictions and collapsed onto two
+  categories; permutation stability 0.850 against 0.443. Phase 0's eleven-email
+  screen predicted both figures to within three points.*
+- ~~**Where the confidence threshold actually belongs.**~~ *Settled, Phase 2:
+  T=0.8 measured (see above), and the `p(To Action)` floor stays at 0.15 but is
+  **dormant on this model**.*
+- ~~Prompt input fields and body truncation length~~ *Settled, Phase 2:
+  `body_chars=300`, and prompt `v9b-bookings`. 300 beats 0 by 8 fixed / 0
+  broken on `To Action` (p=0.008) and beats every longer setting on every axis
+  — above 300 the boilerplate tail drags predictions toward `Promotions`. It
+  also runs at 2.6s per call against 7.9s at 1500. Naming the input fields
+  explicitly (`v4-format`) was tried and failed.*
 - Initial seed list for the Promotions sender allowlist.
-- **Whether `Personal` holds up on real mail.** It classified cleanly on
-  three synthetic examples, but real human correspondence is far more varied
-  than a note from a friend — forwarded threads, mailing lists, and
-  recruiters all blur the line with `Updates`.
+- **Whether `Personal` holds up on real mail.** *Phase 2: it holds up as a
+  labelling rule — "did a person type this?" is decidable, and the blind
+  recheck reproduced it — but the model reads it poorly: 4 of 14 on dev, mean
+  `p(Personal)` 0.302 on true `Personal`. Every dev error was free (all land in
+  `KEEPS_INBOX`), but the holdout produced **one human-written message archived
+  as `Promotions` at 0.925**, which is the failure mode that matters. Carried
+  into Phase 3 as a watch item with a stated trigger — see `docs/PLAN.md`.*
 - ~~Real backfill volume once sent/drafts/chats are excluded.~~
   *Measured: 18,668. See `docs/BACKLOG.md`. The backfill section has not yet
   been revised to match.*

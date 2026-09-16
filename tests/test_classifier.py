@@ -221,9 +221,16 @@ def test_classify_sends_the_single_token_logprob_request():
 
 
 def test_classify_sends_the_built_prompt_and_the_email():
+    """Against the *default* prompt, whatever it currently is.
+
+    Pinned to `build_system_prompt()` until Phase 2 selected `v9b-bookings`,
+    at which point it failed for the right reason and the wrong one: what it
+    is testing is that `classify` sends the prompt the registry gives it, not
+    which prompt won a sweep.
+    """
     _, request = call(ollama_reply([entry("A", 1.0)]))
     system, user = json.loads(request.data)["messages"]
-    assert system["content"] == classifier.build_system_prompt()
+    assert system["content"] == classifier.system_prompt(classifier.DEFAULT_PROMPT_ID)
     assert "billing@octopus.energy" in user["content"]
     assert "payment due 15 October" in user["content"]
 
@@ -348,7 +355,9 @@ def test_prompt_hash_differs_between_letter_orders():
 def test_classify_builds_its_system_message_through_the_registry():
     _, request = call(ollama_reply([entry("A", 0.9), entry("B", 0.1)]))
     body = json.loads(request.data)
-    assert body["messages"][0]["content"] == classifier.system_prompt("v1")
+    assert body["messages"][0]["content"] == classifier.system_prompt(
+        classifier.DEFAULT_PROMPT_ID
+    )
 
 
 # --- the step 6 prompt variants -------------------------------------------

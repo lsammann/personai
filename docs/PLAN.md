@@ -138,7 +138,9 @@ rests on eleven synthetic emails I wrote. Phase 2 decides against real mail.
 
 - **Exact refresh-token lifetime in Testing status.** Assumed 7 days; the
   proactive expiry warning is timed off it. Confirm empirically once OAuth is
-  wired up.
+  wired up. *Still open at the end of Phase 2: consent dates from 2026-09-08,
+  so expiry is predicted around 2026-09-15, and Phase 2 finished without
+  needing Gmail again — scoring is offline. It will announce itself in Phase 3.*
 
 **Gate:** I can read my own mail from Python, and a local model returns a
 usable, well-behaved category distribution in tolerable time.
@@ -303,6 +305,88 @@ Phase 0 against each other. Every change is scored, not vibed.
 plumbing around a classifier; plumbing around a bad classifier is wasted
 work, and this is the cheapest possible place to discover it.
 
+### Findings — gate PASSED, 2026-09-14
+
+**The shipped configuration:** `llama3.1:8b`, prompt `v9b-bookings`,
+`body_chars=300`, `confidence_threshold=0.8`, `to_action_floor=0.15`.
+
+| | dev (n=140) | holdout (n=60), opened once |
+|---|---|---|
+| accuracy | 0.771 [0.70, 0.83] | 0.800 [0.68, 0.88] |
+| **action accuracy** | **0.900** | **0.900** |
+| costly errors | 1 | 1 |
+| `To Action` retention | 20/20 | 9/9 |
+| calibration gap | +0.157 | +0.166 |
+
+**1. Is overall accuracy tolerable?** Yes — 0.800 on the holdout, against a
+**measured ceiling of 0.933** [0.79, 0.98]: a blind second labelling pass over
+30 messages reproduced its own six-way judgement 28/30. The classifier is at
+roughly 0.86 of what this ground truth can support. On the collapse that
+matters it is 0.900 against a ceiling of 30/30.
+
+**2. Is recall on `To Action` high?** **Retention is 20/20 on dev and 9/9 on
+the holdout** — every actionable message kept the inbox. Raw argmax recall is
+14/20 and 6/9, and the gap between the two is `Needs Review` and `KEEPS_INBOX`
+doing exactly the job they were designed for. Two caveats recorded honestly:
+recall is 5/9 on the uniform `R` draw against 9/11 on keyword-mined strata, so
+the mined figure flatters; and the holdout's 9 `To Action` messages cannot
+resolve recall at any useful precision, which was registered before it opened.
+
+**3. Is the calibration gap meaningfully positive?** Yes — **+0.157 dev,
++0.166 holdout**. The first-token distribution carries real signal where Phase
+0's self-reported confidence carried none (+0.017 on the same model). This is
+the screen that justified the whole mechanism, and it holds on real mail.
+
+**4. Is permutation stability high?** Yes — **0.850** unchanged argmax and mean
+TV distance 0.167 for the 8B, against 0.443 / 0.426 for the 3B. Phase 0's
+synthetic screen predicted 0.818 and 0.455; it was directionally right to
+within three points. Permutation averaging is not needed.
+
+**5. What are the actual threshold values?** `T=0.8`, measured — T=0.6
+maximises action accuracy but archives three wanted messages against 0.8's one,
+and missed mail is the intolerable error. `F=0.15`, and **the floor is
+dormant**: it fires on zero messages, because median confidence 0.982 makes the
+distribution nearly one-hot, and this replicated on the holdout. `T + F = 0.95
+< 1`, and `Config` accepts the pair.
+
+**Three findings that changed the design:**
+
+- **`body_chars` 1500 → 300.** 300 beats 0 by 8 fixed / 0 broken on `To Action`
+  (p=0.008) and beats every longer setting on every axis. Above 300 accuracy
+  declines monotonically: the boilerplate tail drags predictions toward
+  `Promotions`, 53 → 66 at 3000 against a truth of 58. It also runs at 2.6s per
+  call against 7.9s at 1500.
+- **`Bookings` now keeps `INBOX`.** Every costly error in every run was a
+  `Bookings` prediction, and three rounds of prompt work moved none of them. The
+  taxonomy change removed the failure mode by construction.
+- **The asymmetric floor is inert on this model** and must be documented as
+  dormant, or a reader assumes a safeguard that is not operating.
+
+**Two things the phase could not settle, carried forward with stated triggers:**
+
+- **`Personal` is read poorly by the model** — 4 of 14 on dev, mean
+  `p(Personal)` 0.302. Every dev error was free, but the **holdout archived one
+  human-written message as `Promotions` at 0.925**. That is the failure mode
+  that matters, and it cannot be fixed by tuning against a holdout that has now
+  been opened. **Trigger for Phase 3:** if `Personal` → archive appears in live
+  use, that is the moment for a `Personal` prompt round, scored against a
+  *fresh* holdout drawn by extending the sample.
+- **Residual exposure is "a booking that looks like a receipt."** The one costly
+  error on dev is a United e-ticket called `Receipts` at 0.970, because the
+  subject says "Receipt" and the sender is `Receipts@united.com`. Two prompt
+  rounds were aimed at it and neither fixed it; `v10-itinerary` raised
+  `p(Bookings)` ninefold and still lost to the literal token. Documented as a
+  measured limit rather than an open question.
+
+**The method finding worth keeping.** Three of the eight prompt variants failed,
+and the two most instructive failed in the same way: a metric improving because
+confidence *dropped*. `v4-format` and `v10-itinerary` both reached zero costly
+errors by hedging messages into `Needs Review` rather than by classifying them
+correctly, and `v10` did it while raising six-way accuracy to the best of any
+run, one-directionally (4 fixed / 0 broken). Pre-registered guards on the action
+matrix caught both. Without them the phase would have shipped a worse system
+with better headline numbers.
+
 ---
 
 ## Phase 3 — The writer
@@ -330,7 +414,12 @@ work, and this is the cheapest possible place to discover it.
    the query from `STOP_LABELS`; an undo that covers one branch is incomplete.
 5. `app/gmail_client.py` — fetch, and the single atomic `messages.modify`
    call
-6. `app/agent.py` — `classify_and_label()`, honouring `dry_run`
+6. `app/agent.py` — `classify_and_label()`, honouring `dry_run`. **Wire in the
+   reply rule**: `prefilter.is_reply(subject)` → `decision.decide_reply_hit()`,
+   checked **before** the sender allowlist, so a `Re:` from an allowlisted
+   promotional domain stays visible. The pure half and its eval bucket were
+   built at the end of Phase 2; only the call site and the `logbook` `Source`
+   value `"reply"` remain. Nothing may apply a label until step 4 exists.
 7. A thin CLI entry point to run one pass over N messages. **Not the webapp
    yet** — a UI at this stage is a second thing that can be broken while I'm
    trying to establish whether the first thing works.

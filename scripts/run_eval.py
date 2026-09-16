@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Predict over the eval set, and score what came back.
 
-    run_eval.py predict --model llama3.1:8b --body-chars 1500
+    run_eval.py predict --model llama3.1:8b --body-chars 300
     run_eval.py score <run_id> --threshold 0.8 --floor 0.15
     run_eval.py compare <run_a> <run_b>
 
@@ -26,6 +26,7 @@ import json
 import sys
 
 from app import evallabel, evalrun, evalscore, evalset, prefilter
+from app.categories import Category
 from app.classifier import DEFAULT_PROMPT_ID
 from app.config import DATA_DIR
 
@@ -111,11 +112,15 @@ def cmd_score(args: argparse.Namespace) -> int:
     result = evalrun.load_result(path)
     sample, labels, strata, _seed = load_ground_truth()
 
-    senders = {}
+    # Both deterministic rules are computed at score time from the cache, so
+    # they cost no inference and every historical run can be re-scored under
+    # them. Nothing about a rule needs the model to be re-run.
+    senders, subjects = {}, {}
     for row in sample:
         message = evallabel.cache_get(row.message_id, CACHE_DIR)
         if message:
             senders[row.message_id] = message.sender
+            subjects[row.message_id] = message.subject
 
     split = None if args.all else ("holdout" if args.holdout else "dev")
     if args.holdout:
@@ -126,6 +131,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         result.predictions, labels, sample, strata,
         confidence_threshold=args.threshold, to_action_floor=args.floor,
         split=split, allowlist=prefilter.load_allowlist(), senders=senders,
+        subjects=subjects,
     )
     render(result.manifest, report, args, sample, labels)
 
@@ -197,6 +203,16 @@ def render(manifest, report, args, sample, labels) -> None:
     if report.prefilter:
         print(f"prefilter         {report.prefilter} "
               f"(scored on the action, not the 6-way label)")
+    if report.reply:
+        bucket = report.reply
+        print(f"\nreply rule        {bucket['n']} message(s) routed to "
+              f"{Category.PERSONAL.value}, INBOX kept")
+        print(f"  action correct  rule {bucket['rule_action_correct']}/"
+              f"{bucket['n']}   model would have been "
+              f"{bucket['model_action_correct']}/{bucket['n']}")
+        print(f"  exact label     {bucket['label_exact']}/{bucket['n']} are "
+              f"{Category.PERSONAL.value} in ground truth - the gap is the "
+              f"widening from \"a human wrote it\" to \"I am in this thread\"")
 
     stability = evalscore.stability(
         [row for row in evalrun.load_result(

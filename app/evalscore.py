@@ -36,7 +36,7 @@ from app.categories import KEEPS_INBOX, Category
 from app.decision import decide
 from app.evallabel import LabelRecord
 from app.evalset import Sampled
-from app.prefilter import matches
+from app.prefilter import is_reply, matches
 
 # Calibration buckets are half-open, [0.0,0.1) ... [0.9,1.0], so 0.8 lands in
 # [0.8,0.9). Arbitrary but pinned: an off-by-one at the boundary moves the
@@ -54,6 +54,10 @@ Z = 1.96
 
 # Rows carrying this are a rule firing, not a model answer.
 PREFILTER = "prefilter"
+# The reply rule. Checked BEFORE the allowlist, matching the live order:
+# a "Re:" from an allowlisted promotional domain is a reply to something
+# the reader sent, and they want to see it.
+REPLY = "reply"
 
 
 @dataclass(frozen=True)
@@ -135,6 +139,7 @@ class Report:
     latency: dict[str, float]
     by_source: dict[str, tuple[int, int]]
     prefilter: dict[str, int] = field(default_factory=dict)
+    reply: dict[str, int] = field(default_factory=dict)
     stability: dict[str, float] | None = None
 
 
@@ -256,6 +261,7 @@ def join(
     split: str | None = "dev",
     allowlist: Iterable[str] = (),
     senders: Mapping[str, str] | None = None,
+    subjects: Mapping[str, str] | None = None,
     order_name: str = "default",
 ) -> list[Scored]:
     """Predictions joined to truth and provenance, filtered to one split.
@@ -266,6 +272,7 @@ def join(
     """
     plan = {row.message_id: row for row in sample}
     senders = senders or {}
+    subjects = subjects or {}
     allowlist = frozenset(allowlist)
 
     scored: list[Scored] = []
@@ -279,6 +286,8 @@ def join(
         if split is not None and row.split != split:
             continue
         sender = senders.get(prediction.message_id, "")
+        # Reply first, allowlist second - the live order.
+        replied = is_reply(subjects.get(prediction.message_id))
         is_rule = bool(allowlist) and matches(sender, allowlist)
         scored.append(
             Scored(
@@ -294,7 +303,9 @@ def join(
                 unsure=label.unsure,
                 body_source=prediction.body_source,
                 latency_ms=prediction.latency_ms,
-                source=PREFILTER if is_rule else "model",
+                source=(
+                    REPLY if replied else PREFILTER if is_rule else "model"
+                ),
                 error=prediction.error,
             )
         )
@@ -311,6 +322,12 @@ def keeps_inbox(row: Scored, threshold: float, floor: float) -> bool:
     measures the shipped behaviour - including the asymmetric floor and
     Needs Review, both of which save a message the argmax would have archived.
     """
+    if row.source == REPLY:
+        # `decide_reply_hit()` removes nothing, so a rule-routed message is
+        # visible whatever the model said about it. Scoring the model's
+        # would-be decision here would measure a call the live system never
+        # makes.
+        return True
     if row.predicted is None:
         return True          # a failure applies no labels, so INBOX survives
     return "INBOX" not in decide(
@@ -331,16 +348,21 @@ def score(
     split: str | None = "dev",
     allowlist: Iterable[str] = (),
     senders: Mapping[str, str] | None = None,
+    subjects: Mapping[str, str] | None = None,
 ) -> Report:
     """A results file plus ground truth -> every number the phase gate needs."""
     scored = join(
         predictions, labels, sample,
-        split=split, allowlist=allowlist, senders=senders,
+        split=split, allowlist=allowlist, senders=senders, subjects=subjects,
     )
     answered = [row for row in scored if row.predicted is not None]
-    # Prefilter hits are a rule firing. They have no confidence, so they cannot
-    # appear in a calibration table without corrupting it.
-    model_rows = [row for row in answered if row.source != PREFILTER]
+    # Rule hits are a rule firing. They have no confidence in the live system,
+    # so they cannot appear in a calibration table without corrupting it - and
+    # the eval has a model confidence for them only because `predict` classifies
+    # every message regardless of which rules would have intercepted it.
+    model_rows = [
+        row for row in answered if row.source not in (PREFILTER, REPLY)
+    ]
     failures = len(scored) - len(answered)
 
     hits = sum(1 for row in answered if row.correct)
@@ -383,6 +405,7 @@ def score(
         latency=_latency(answered),
         by_source=_by_body_source(answered),
         prefilter=_prefilter_bucket(scored, confidence_threshold, to_action_floor),
+        reply=_reply_bucket(scored, confidence_threshold, to_action_floor),
     )
 
 
@@ -626,6 +649,49 @@ def _prefilter_bucket(
         ),
         "label_exact": sum(
             1 for row in hits if row.truth == Category.PROMOTIONS.value
+        ),
+    }
+
+
+def _reply_bucket(
+    rows: Sequence[Scored], threshold: float, floor: float
+) -> dict[str, int]:
+    """How the reply rule does, scored on the ACTION not the label.
+
+    Same treatment as the prefilter, for the same reason: the rule can only
+    emit `Agent/Personal`, so a reply whose true label is `To Action` is an
+    error 6-way and entirely correct in practice - both keep the inbox.
+
+    `model_action_correct` is the comparison that justifies the rule: what the
+    model would have done with these messages if the rule had not fired. Where
+    the rule scores higher, the rule is earning its place.
+
+    `label_exact` is deliberately reported too. The reader's definition here is
+    "am I in this thread", which is wider than `Personal`'s documented "written
+    by a real person" - so a gap between `rule_action_correct` and
+    `label_exact` is the size of that widening, visible rather than silent.
+    """
+    hits = [row for row in rows if row.source == REPLY]
+    if not hits:
+        return {}
+    keeps = {c.value for c in KEEPS_INBOX}
+    return {
+        "n": len(hits),
+        # The rule always keeps INBOX, so it is right whenever the truth keeps.
+        "rule_action_correct": sum(1 for row in hits if row.truth in keeps),
+        "model_action_correct": sum(
+            1 for row in hits
+            if (row.truth in keeps) == (
+                row.predicted is None
+                or "INBOX" not in decide(
+                    row.distribution,
+                    confidence_threshold=threshold,
+                    to_action_floor=floor,
+                ).labels_remove
+            )
+        ),
+        "label_exact": sum(
+            1 for row in hits if row.truth == Category.PERSONAL.value
         ),
     }
 

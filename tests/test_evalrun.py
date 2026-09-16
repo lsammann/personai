@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from app import evalrun
+from app import classifier, evalrun
 from app.categories import Category
 from app.classifier import Interpretation, OllamaError
 from app.evallabel import Cached
@@ -145,7 +145,7 @@ def test_manifest_and_predictions_round_trip(tmp_path):
 
     loaded = evalrun.load_result(path)
     assert loaded.manifest.run_id == "test-run"
-    assert loaded.manifest.prompt_id == "v1"
+    assert loaded.manifest.prompt_id == classifier.DEFAULT_PROMPT_ID
     assert loaded.manifest.extraction_version
     assert loaded.manifest.prompt_hash
     assert [row.message_id for row in loaded.predictions] == ["a"]

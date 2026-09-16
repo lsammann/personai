@@ -284,3 +284,38 @@ def test_decision_module_imports_nothing_impure():
         elif isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
     assert imported <= allowed, f"impure imports: {sorted(imported - allowed)}"
+
+
+# --- the reply rule -------------------------------------------------------
+
+
+def test_a_reply_hit_never_removes_inbox():
+    """The whole safety argument for the rule, as a test.
+
+    It can only move a message INTO the keeps-INBOX set, so it cannot create
+    the one error in this system that costs anything. If this assertion ever
+    has to change, the rule has stopped being safe by construction and the
+    argument for shipping it without a strong precision estimate is gone.
+    """
+    assert decision.decide_reply_hit().labels_remove == ()
+
+
+def test_a_reply_hit_applies_personal_and_processed():
+    result = decision.decide_reply_hit()
+    assert set(result.labels_add) == {"Agent/Personal", "Agent/Processed"}
+    assert result.category is Category.PERSONAL
+
+
+def test_a_reply_hit_records_no_confidence():
+    """A rule fired; a fabricated probability would corrupt the calibration
+    table, which is computed from model confidences only."""
+    result = decision.decide_reply_hit()
+    assert result.confidence is None
+    assert result.needs_review is False
+
+
+def test_a_reply_hit_is_processed_never_errored():
+    """The three mutually exclusive mailbox states still hold."""
+    result = decision.decide_reply_hit()
+    assert "Agent/Processed" in result.labels_add
+    assert "Agent/Error" not in result.labels_add

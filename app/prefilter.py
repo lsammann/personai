@@ -1,4 +1,9 @@
-"""Sender-domain allowlist, checked before any model call is made.
+"""Deterministic routing: decisions that can be made without the model.
+
+Two rules, pointing in opposite directions. The sender-domain allowlist
+archives bulk mail; the reply rule keeps thread mail visible. Both answer
+the same question - can this be decided without an LLM call? - and both
+are checked before any model call is made.
 
 A match routes straight to Agent/Promotions with INBOX removed and no LLM call,
 which is the difference between string matching in microseconds and ~10 seconds
@@ -13,6 +18,7 @@ tagged `source: prefilter`, so the metrics account for them.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Collection
 from email.utils import parseaddr
 from pathlib import Path
@@ -65,3 +71,35 @@ def matches(sender: str, allowlist: Collection[str]) -> bool:
     return any(
         domain == entry or domain.endswith(f".{entry}") for entry in allowlist
     )
+
+
+# --- the reply rule -------------------------------------------------------
+
+# A subject that opens "Re:", "Fw:" or "Fwd:" means the message sits in a
+# thread the reader is part of. The colon is required: without it "Reminder:"
+# and "Receipt:" both begin with "re" and the rule would archive-proof a large
+# slice of the promotional mail it is meant to be orthogonal to.
+REPLY = re.compile(r"^\s*(re|fw|fwd)\s*:", re.IGNORECASE)
+
+
+def is_reply(subject: str | None) -> bool:
+    """True if this message is a reply or a forward, judged on the subject.
+
+    **The discriminator is "am I in this thread", not "did a human type this".**
+    Those come apart on automated replies - a ticketing auto-response, a
+    support survey answering a query the reader sent - and the reader's
+    judgement is that those are still wanted in the inbox, because they exist
+    only because the reader started something. Measured over the 200-message
+    eval set, 15 subjects match and all 15 are mail the reader wants visible;
+    13 of them are also human-written.
+
+    Deliberately blunt. A stricter version would require the absence of a
+    `List-Unsubscribe` header, which is the standard bulk-mail marker - that
+    needs a header the message cache does not store, so it is a live-measured
+    refinement rather than something this phase can claim. See
+    `docs/BACKLOG.md`.
+
+    The subject is the only input, so this is decidable before any fetch cost
+    beyond metadata and cannot fail on a malformed body.
+    """
+    return bool(REPLY.match(subject or ""))

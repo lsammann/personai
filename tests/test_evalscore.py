@@ -416,3 +416,110 @@ def test_evalscore_imports_nothing_impure():
         elif isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
     assert imported <= allowed, f"impure imports: {sorted(imported - allowed)}"
+
+
+# --- the reply rule bucket ------------------------------------------------
+
+
+REPLY_STRATA = {"strata": [{"name": "Residual", "N_h": 100}]}
+
+
+def reply_setup(truth_category, predicted, confidence=0.99, subject="Re: hi"):
+    """An explicit distribution: the default spreads leftover mass evenly, which
+    puts p(To Action) at 0.167 and trips the asymmetric floor, so every row
+    would keep INBOX for the wrong reason."""
+    spread = dist(**{predicted.lower().replace(" ", "_"): confidence})
+    spread = {k: (confidence if k == predicted else
+                  (1 - confidence) / 5) for k in spread}
+    preds = [prediction("m1", predicted, confidence, distribution=spread)]
+    labels = {"m1": truth("m1", truth_category)}
+    plan = [sampled("m1")]
+    return preds, labels, plan, {"m1": subject}
+
+
+def test_a_reply_is_tagged_as_a_rule_hit_not_a_model_answer():
+    preds, labels, plan, subjects = reply_setup(Category.PERSONAL, "Promotions")
+    rows = evalscore.join(preds, labels, plan, subjects=subjects)
+    assert rows[0].source == evalscore.REPLY
+
+
+def test_a_non_reply_subject_is_left_to_the_model():
+    preds, labels, plan, _ = reply_setup(Category.PERSONAL, "Promotions")
+    rows = evalscore.join(preds, labels, plan, subjects={"m1": "Reminder: pay"})
+    assert rows[0].source == "model"
+
+
+def test_the_reply_rule_beats_the_sender_allowlist():
+    """The live order, and the reader's call: a "Re:" from an allowlisted
+    promotional domain is a reply to something they sent, so they want to see
+    it. Checking the allowlist first would archive exactly those."""
+    preds, labels, plan, subjects = reply_setup(Category.PERSONAL, "Promotions")
+    rows = evalscore.join(
+        preds, labels, plan, subjects=subjects,
+        allowlist={"uniqlo.co.uk"}, senders={"m1": "offers@uniqlo.co.uk"},
+    )
+    assert rows[0].source == evalscore.REPLY
+
+
+def test_a_rule_routed_message_keeps_inbox_whatever_the_model_said():
+    """`decide_reply_hit()` removes nothing, so scoring the model's would-be
+    decision here would measure a call the live system never makes."""
+    preds, labels, plan, subjects = reply_setup(
+        Category.PERSONAL, "Promotions", confidence=0.99
+    )
+    rows = evalscore.join(preds, labels, plan, subjects=subjects)
+    assert evalscore.keeps_inbox(rows[0], 0.8, 0.15) is True
+
+    model_rows = evalscore.join(preds, labels, plan, subjects={"m1": "Sale now"})
+    assert evalscore.keeps_inbox(model_rows[0], 0.8, 0.15) is False
+
+
+def test_rule_hits_stay_out_of_the_calibration_table():
+    """They have no confidence in the live system. The eval has one only
+    because `predict` classifies every message regardless of which rules
+    would have intercepted it."""
+    low = {c.value: 0.002 for c in Category}
+    preds = [prediction("m1", "Promotions", 0.99, {**low, "Promotions": 0.99}),
+             prediction("m2", "Receipts", 0.95, {**low, "Receipts": 0.95})]
+    labels = {"m1": truth("m1", Category.PERSONAL),
+              "m2": truth("m2", Category.RECEIPTS)}
+    plan = [sampled("m1"), sampled("m2")]
+    report = evalscore.score(
+        preds, labels, plan, REPLY_STRATA, confidence_threshold=0.8,
+        to_action_floor=0.15, subjects={"m1": "Re: hi"},
+    )
+    assert sum(bucket["n"] for bucket in report.calibration) == 1
+
+
+def test_the_reply_bucket_scores_the_action_not_the_label():
+    """A reply whose truth is `To Action` is a 6-way error and operationally
+    correct - both keep the inbox."""
+    preds, labels, plan, subjects = reply_setup(Category.TO_ACTION, "To Action")
+    report = evalscore.score(
+        preds, labels, plan, REPLY_STRATA, confidence_threshold=0.8,
+        to_action_floor=0.15, subjects=subjects,
+    )
+    assert report.reply["n"] == 1
+    assert report.reply["rule_action_correct"] == 1
+    assert report.reply["label_exact"] == 0
+
+
+def test_the_reply_bucket_reports_what_the_model_would_have_done():
+    """The comparison that justifies the rule: where it scores higher than the
+    model would have, it is earning its place."""
+    preds, labels, plan, subjects = reply_setup(Category.PERSONAL, "Promotions")
+    report = evalscore.score(
+        preds, labels, plan, REPLY_STRATA, confidence_threshold=0.8,
+        to_action_floor=0.15, subjects=subjects,
+    )
+    assert report.reply["rule_action_correct"] == 1
+    assert report.reply["model_action_correct"] == 0
+
+
+def test_no_replies_means_no_bucket():
+    preds, labels, plan, _ = reply_setup(Category.PERSONAL, "Personal")
+    report = evalscore.score(
+        preds, labels, plan, REPLY_STRATA, confidence_threshold=0.8,
+        to_action_floor=0.15, subjects={"m1": "A subject"},
+    )
+    assert report.reply == {}

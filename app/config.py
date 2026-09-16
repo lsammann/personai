@@ -30,16 +30,26 @@ class Config(BaseModel):
     confidence_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     # Independent of the argmax: if p(To Action) clears this, INBOX is kept.
     # Protects the only error class that costs anything - a missed bill.
+    #
+    # DORMANT on llama3.1:8b, measured in Phase 2 and replicated on the
+    # holdout: the sweep returns identical results at 0.05, 0.10 and 0.15
+    # because the first-token distribution is near one-hot (median confidence
+    # 0.982), so a message whose argmax is Receipts essentially never carries
+    # 15% residual mass on To Action. Kept because it costs nothing and a less
+    # saturated model would make it live again - but the protection that
+    # actually operates is Needs Review plus KEEPS_INBOX. See DESIGN.md.
     to_action_floor: float = Field(default=0.15, ge=0.0, le=1.0)
     ollama_model: str = "llama3.1:8b"
-    # How much of the body is sent to the model. A placeholder, not a
-    # measurement - docs/BACKLOG.md puts the median real body at 7,445
-    # characters, so 1500 shows roughly the first fifth of a typical email.
-    # This is the dominant latency lever (the call emits one token, so cost is
-    # essentially prompt length) and one of the three knobs Phase 2 tunes
-    # against the eval set. 0 is allowed: subject-and-sender-only is a
+    # How much of the body is sent to the model. **Measured**, not a
+    # placeholder: Phase 2 swept 0 / 300 / 800 / 1500 / 3000 and 300 won on
+    # every axis. Against 0 it fixes 8 of the 20 To Action messages and breaks
+    # none (p=0.008); above 300 accuracy declines monotonically, because the
+    # boilerplate tail - unsubscribe footers, social links, legal text - drags
+    # predictions toward Promotions (53 -> 66 predictions at 3000, truth 58).
+    # It is also the dominant latency lever, the call emitting one token: 2.6s
+    # here against 7.9s at 1500. 0 is allowed: subject-and-sender-only is a
     # legitimate experiment, not a broken config.
-    body_chars: int = Field(default=1500, ge=0)
+    body_chars: int = Field(default=300, ge=0)
     # Defaults to True so a fresh install cannot write to the inbox by
     # accident. Turning it off is a deliberate act.
     dry_run: bool = True

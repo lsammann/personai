@@ -521,6 +521,60 @@ Nothing here needs acting on now. It should be read at these points:
 - **Phase 4 — prefilter seeding.** `data/sender_domains.csv` is the derived
   allowlist seed, alongside the List-Unsubscribe idea above.
 
+## The reply rule — what it is estimated on, and what would sharpen it
+
+Built at the end of Phase 2 (pure half + eval bucket); wired into `agent.py` in
+Phase 3. `DESIGN.md` → the two deterministic routing rules has the design.
+
+**The estimate is thin and one-sided.** 15 of the 200 eval subjects match
+`^(Re|Fw|Fwd):`. All 15 are mail that should stay visible — 13 human-written,
+plus a Google support survey and a Payoneer auto-reply, both answering queries
+the reader sent. Precision on the reader's own definition is 15/15, but the
+Wilson interval at n=15 is [0.78, 1.00], and **`Re:` is cheap for automated
+mail to produce**. Ticketing systems, auto-responders and no-reply support
+queues are all likely over-represented in an 18,668-message backfill relative
+to genuine human replies, so the live rate should be assumed worse.
+
+**The live measurement, once Phase 3 runs.** `logbook` records
+`source: "reply"`, so rule-routed `Personal` is separable from model-routed
+`Personal` permanently. After the first real run, pull a sample of rule hits and
+record observed precision here. **Trigger to act:** if rule-routed `Personal`
+fills with auto-responders the reader does not want visible.
+
+**The refinement, when that trigger fires.** Require `Re:` **and** the absence
+of a `List-Unsubscribe` header — the standard bulk-mail marker, which a
+ticketing auto-response often carries and a human reply never does. It cannot
+be evaluated against the existing 200: `evallabel.Cached` stores sender,
+subject and the two text parts only, so the header would need
+`gmail_client.fetch` to carry it and the cache to store it — a schema change
+and a refetch, which is why it is deferred rather than guessed at now.
+
+## Boilerplate inside the truncation budget — measured, not yet acted on
+
+Raised while diagnosing the holdout's one costly error: a human reply whose
+visible 300 characters were 13% content and 87% signature block plus legal
+disclaimer, including the tagline "Checkmate – Pre-Employment Screening
+Software www.checkmate.tech", which reads as marketing copy. It was classified
+`Promotions` at 0.925.
+
+**Measured across the 200:** a confidentiality notice, unsubscribe line or
+similar boilerplate marker appears *inside the first 300 characters* on **13 of
+200** messages — `Receipts` 4, `To Action` 3, `Promotions` 3, `Updates` 2,
+`Personal` 1. So it is real but narrow, and it is **not** a trailing-footer
+problem: truncation at 300 already removes the tail. The noise is before the
+cut.
+
+**Why it was not built.** Stripping the legal disclaimer alone would not have
+saved the message that prompted it — the signature and tagline survive, and
+those are the most promotional-looking text in it. Doing it properly means
+signature-block detection, where a false strip deletes real content. It also
+cannot be evaluated without re-running inference, since `EXTRACTION_VERSION` is
+in the run manifest and a bump forces re-prediction by design.
+
+**If it is picked up:** bump `EXTRACTION_VERSION`, re-run `predict` on the
+selected configuration, and score against the 13 affected messages
+specifically rather than the headline accuracy, which cannot resolve 13 of 200.
+
 ## Worth re-measuring later
 
 - All of it, once the mailbox has moved on — it grows ~18/day.
