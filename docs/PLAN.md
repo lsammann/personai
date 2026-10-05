@@ -313,10 +313,16 @@ work, and this is the cheapest possible place to discover it.
 | | dev (n=140) | holdout (n=60), opened once |
 |---|---|---|
 | accuracy | 0.771 [0.70, 0.83] | 0.800 [0.68, 0.88] |
-| **action accuracy** | **0.900** | **0.900** |
-| costly errors | 1 | 1 |
+| **action accuracy** | **0.900** | **0.917** |
+| costly errors | 1 | **0** |
 | `To Action` retention | 20/20 | 9/9 |
-| calibration gap | +0.157 | +0.166 |
+| calibration gap | +0.162 | +0.199 |
+
+**Including the reply rule, which is what ships** — added at the end of the
+phase in response to the holdout's one costly error. Without it the holdout
+reads 0.900 with one costly error. Across all 200: six-way 0.780, one of 55
+wanted messages archived, `To Action` retention **29/29**, 9% left visible
+needlessly, 16% into `Needs Review`.
 
 **1. Is overall accuracy tolerable?** Yes — 0.800 on the holdout, against a
 **measured ceiling of 0.933** [0.79, 0.98]: a blind second labelling pass over
@@ -337,10 +343,19 @@ resolve recall at any useful precision, which was registered before it opened.
 0's self-reported confidence carried none (+0.017 on the same model). This is
 the screen that justified the whole mechanism, and it holds on real mail.
 
-**4. Is permutation stability high?** Yes — **0.850** unchanged argmax and mean
-TV distance 0.167 for the 8B, against 0.443 / 0.426 for the 3B. Phase 0's
+**4. Is permutation stability high?** Yes — **0.853** unchanged argmax and mean
+TV distance **0.155** on the shipped configuration, re-measured 2026-09-16
+because the original screen ran on `v1` at `body_chars=800` and the prompt is
+the category descriptions, which is exactly what letter-position sensitivity
+would interact with. Narrowing `Bookings` cost nothing: `v1` @ 800 gave 0.850 /
+0.167 on the same 200 messages, against 0.443 / 0.426 for the 3B. Phase 0's
 synthetic screen predicted 0.818 and 0.455; it was directionally right to
 within three points. Permutation averaging is not needed.
+
+*Free finding from that run: the shipped configuration re-run three days later
+reproduced dev accuracy 0.771 and an identical action matrix. One emitted token
+and a fixed letter mapping make the pipeline reproducible in practice, not just
+in principle.*
 
 **5. What are the actual threshold values?** `T=0.8`, measured — T=0.6
 maximises action accuracy but archives three wanted messages against 0.8's one,

@@ -352,6 +352,29 @@ def agreement(
     )
 
 
+def corrected_after_recheck(
+    first: Mapping[str, LabelRecord], second: Mapping[str, LabelRecord]
+) -> list[str]:
+    """Ids whose pass-1 row was written AFTER their pass-2 row.
+
+    The ceiling is measured once, before corrections. Fixing a genuine pass-1
+    error afterwards - which is the agreed disposition for a real disagreement
+    - makes pass 1 agree with pass 2 by construction, so re-running the report
+    would print a higher, meaningless number from the same draw.
+
+    Timestamps rather than file order here, deliberately and unlike `resolve`:
+    the question is not which row wins but which was written later, and the two
+    passes are days apart, so the tie that makes file order necessary within a
+    pass cannot arise between them.
+    """
+    stale = []
+    for message_id, later in second.items():
+        earlier = first.get(message_id)
+        if earlier is not None and earlier.labelled_at > later.labelled_at:
+            stale.append(message_id)
+    return sorted(stale)
+
+
 def save_draw(draw: RecheckDraw, path: Path) -> None:
     """Pin the draw. Ids and provenance only, checked on write."""
     row = {

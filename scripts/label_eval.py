@@ -446,6 +446,21 @@ def recheck_report(
     `evalscore` rather than being written again here - one estimator, one
     implementation.
     """
+    stale = evallabel.corrected_after_recheck(first, second)
+    if stale:
+        print(f"\n{RULE}")
+        print(f"STALE: {len(stale)} pass-1 row(s) were corrected AFTER the recheck ran.")
+        print(id_list(stale))
+        print(
+            "  Pass 1 now agrees with pass 2 on those by construction, so the\n"
+            "  agreement rate computed here would be higher than what was\n"
+            "  measured and would mean nothing. The ceiling is recorded once,\n"
+            "  before corrections - see docs/PHASE2_PLAN.md -> Step 7 results.\n"
+            "  To measure a ceiling again, extend the draw (`--n`) into messages\n"
+            "  this pass has not seen."
+        )
+        return
+
     result = evallabel.agreement(first, second)
     print(f"\n{RULE}")
     print(

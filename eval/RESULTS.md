@@ -25,9 +25,26 @@ One row per prediction run. `score` appends with `--append --note`.
 | 20260913T105941-b65597 | llama3.1:8b | v9-bookings | 300 | dev | 0.771 | [0.70,0.83] | 12/20 | 20/20 | +0.140 | v9-bookings: Bookings description narrowed. Costly errors 1, clutter 15, action 0.886. 7 fixed/4 broken vs v1, p=0.549 - not significant |
 | **20260913T113909-f1f3a4** | llama3.1:8b | **v9b-bookings** | 300 | dev | 0.771 | [0.70,0.83] | 14/20 | **20/20** | +0.157 | **SELECTED.** v9b: v9 minus "appointment", Personal exclusion moved inside the description. Best where it counts - **action accuracy 0.900, clutter 13, 1 costly error, retention 20/20**. 6 fixed/3 broken vs v1 (p=0.508) and 3/3 vs v9 (p=1.00): the effect size is *not* measurable at n=140, and the case for it is the pre-registered Bookings mechanism, not the p-value |
 | **20260913T113909-f1f3a4** | llama3.1:8b | **v9b-bookings** | 300 | **holdout** | 0.800 | [0.68,0.88] | 6/9 | **9/9** | +0.166 | **THE LOCK-BOX, opened once 2026-09-14.** Same run, holdout split, n=60. Action accuracy **0.900 - identical to dev** - 1 costly error, clutter 5. No detectable inflation: the point estimate rose rather than fell, though at n=60 the interval overlaps dev almost entirely, so the honest claim is "not detectable at this size". The floor sweep returns identical results at F=0.05/0.10/0.15, replicating the dormancy finding on untouched data. Recall 6/9 carries no claim - pre-registered, 9 To Action messages cannot resolve it. The one costly error is a human-written reply archived as Promotions at 0.925, which is the trigger condition recorded for a Phase 3 Personal round |
+| 20260916T124103-b2ea63 | llama3.1:8b | v9b-bookings | 300 | dev | 0.771 | [0.70,0.83] | 14/20 | 20/20 | +0.162 | **Permutation screen on the SHIPPED config**, 600 calls. unchanged 0.853, mean TV 0.155 - better than v1@800's 0.850/0.167, so narrowing the Bookings description cost no robustness. Gate question 4 previously rested on a configuration we do not ship. Also a free reproducibility check: dev accuracy and the action matrix (38/1/13/88) came back identical to 20260913T113909-f1f3a4, three days apart |
 | 20260913T114810-1a5257 | llama3.1:8b | v8-updates | 300 | dev | 0.750 | [0.67,0.81] | 12/20 | 19/20 | +0.142 | v8-updates: dropped "low-priority" from the Updates description. FAILED - 2 costly errors, retention 19/20, 3 fixed/3 broken p=1.00. The wording was a labelling problem, not a model one. Do not adopt |
 | 20260914T132822-bb1948 | llama3.1:8b | v10-itinerary | 300 | dev | 0.800 | [0.73,0.86] | 15/20 | 20/20 | +0.131 | v10-itinerary: Bookings description told to claim a future-trip ticket even when the email is also the receipt. **REJECTED on pre-registered guards** - six-way accuracy *rose* to the best of any run (4 fixed/0 broken vs v9b, p=0.125) while **action accuracy fell 0.900->0.857 and clutter rose 13->20**. The target message never flipped: United stays Receipts but at 0.752 not 0.970, so its 0 costly errors are Needs Review absorbing it, not comprehension. p(Bookings) on it did rise 0.027->0.238 - mechanism real, insufficient. Needs Review 17.9%->25.7%. Do not adopt |
 | 20260913T123421-87a8e6 | llama3.1:8b | v4-format | 300 | dev | 0.757 | [0.68,0.82] | 13/20 | 20/20 | +0.090 | v4-format: named the input fields and stated the From address is not a category. FAILED - both target messages unchanged, and its 0 costly errors are hedging not comprehension: gap +0.157->+0.090 pushed messages into Needs Review. 4 fixed/6 broken vs v9b, p=0.754. Do not adopt |
+
+## The reply rule, added after these runs were scored
+
+Every row above is the **model alone**. The shipped system also runs a
+deterministic rule — subject matching `^(Re|Fw|Fwd):` routes to
+`Agent/Personal` with `INBOX` retained, no model call — which `score` now
+applies from the cached subjects, so every run above re-scores under it for
+free. Re-scored across all 14 runs on both splits, 28 scorings: **a costly
+error disappeared in 4 and clutter rose in none.**
+
+On the selected run it changes the holdout from action accuracy 0.900 with one
+costly error to **0.917 with zero**, and leaves dev untouched. Rule hits are
+reported in their own bucket, scored on the action rather than the 6-way label,
+and excluded from the calibration table — which is why the selected run's gap
+reads +0.162 dev / +0.199 holdout under the rule against +0.157 / +0.166
+without it.
 
 ## Reading these after the re-score
 

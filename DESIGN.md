@@ -495,10 +495,29 @@ collapsed onto two categories, predicting `Personal` for 113 against a truth of
 | | dev (n=140) | holdout (n=60), opened once |
 |---|---|---|
 | accuracy | 0.771 [0.70, 0.83] | **0.800** [0.68, 0.88] |
-| **action accuracy** (keeps-`INBOX` vs archived) | **0.900** | **0.900** |
-| costly errors — mail archived that should have been kept | 1 | 1 |
+| **action accuracy** (keeps-`INBOX` vs archived) | **0.900** | **0.917** |
+| costly errors — mail archived that should have been kept | 1 | **0** |
 | `To Action` retention | 20/20 | 9/9 |
-| calibration gap | +0.157 | +0.166 |
+| calibration gap | +0.162 | +0.199 |
+
+Those figures **include the reply rule**, which is what ships. Without it the
+holdout reads 0.900 and one costly error — the human-written reply archived as
+`Promotions` — and the calibration gaps are +0.157 / +0.166, computed over rule
+routed messages the live system never sends to the model.
+
+**Across all 200 labelled messages:** six-way 0.780; of the 55 messages that
+should stay visible, **one is archived** (98.2% retention); **`To Action`
+retention is 29/29**; 18 messages (9%) stay visible that could have been
+archived; 32 (16%) go to `Agent/Needs Review` for manual filing. So roughly a
+quarter of mail still needs the reader's attention — this removes about
+three-quarters of the noise, it does not empty an inbox.
+
+**Permutation stability on this exact configuration: 0.853 unchanged argmax,
+mean TV 0.155** (`20260916T124103-b2ea63`, 600 calls over three letter
+mappings). Measured on the shipped prompt rather than inherited from the
+model-selection screen above, which ran on `v1` at 800 characters — the prompt
+*is* the category descriptions, so a prompt change is exactly the kind of thing
+that could reintroduce letter-position sensitivity. It did not.
 
 **Read those against the ceiling, not against 1.0.** A blind second pass over
 30 of the 200 messages reproduced the labeller's own judgement **28/30**

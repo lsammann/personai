@@ -512,3 +512,26 @@ def test_the_recheck_seed_is_not_the_sample_seed():
     """One number reproduces the plan, and no draw reshuffles another."""
     assert evallabel.DEFAULT_RECHECK_SEED != 7
     assert evallabel.RECHECK_PASS == 2
+
+
+def test_a_pass_one_correction_after_the_recheck_is_detected():
+    """The ceiling is measured once, before corrections. Fixing a genuine
+    pass-1 error afterwards makes pass 1 agree with pass 2 by construction, so
+    re-running the report would print a higher number that means nothing."""
+    first = {"a": LabelRecord("a", Category.PERSONAL, False, "2026-09-16T10:00:00+00:00"),
+             "b": LabelRecord("b", Category.UPDATES, False, "2026-09-12T10:00:00+00:00")}
+    second = {"a": LabelRecord("a", Category.PERSONAL, False, "2026-09-14T10:00:00+00:00", 2),
+              "b": LabelRecord("b", Category.UPDATES, False, "2026-09-14T10:00:00+00:00", 2)}
+    assert evallabel.corrected_after_recheck(first, second) == ["a"]
+
+
+def test_an_untouched_pass_one_is_not_stale():
+    first = {"a": LabelRecord("a", Category.PERSONAL, False, "2026-09-12T10:00:00+00:00")}
+    second = {"a": LabelRecord("a", Category.BOOKINGS, False, "2026-09-14T10:00:00+00:00", 2)}
+    assert evallabel.corrected_after_recheck(first, second) == []
+
+
+def test_staleness_ignores_messages_the_recheck_never_visited():
+    """Relabelling the other 170 says nothing about the draw's ceiling."""
+    first = {"z": LabelRecord("z", Category.PERSONAL, False, "2026-09-20T10:00:00+00:00")}
+    assert evallabel.corrected_after_recheck(first, {}) == []
