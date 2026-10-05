@@ -441,6 +441,13 @@ with better headline numbers.
 
 **Gate — a deliberate escalation, not one step:**
 - Dry run over ~50 messages; read the log; the intended actions look right
+- **Then a larger dry run — a few hundred — read as a second eval, not as a
+  plumbing check.** Phase 2's dev set absorbed eight prompt variants and three
+  sweeps, so its 0.771 is optimistic by an unknown amount and the holdout is
+  spent. A dry run over mail no tuning has ever seen costs nothing, writes
+  nothing, and is the only cheap instrument left for that question. If it
+  agrees with the reader's own judgement at roughly the eval's rate, the Phase
+  2 numbers transfer; if it does not, that is worth knowing before any write
 - Live run over a *tiny* slice (`newer_than:1d`, or a dozen messages).
   Inspect the actual inbox.
 - Run `undo_run.py` over that window. Confirm the inbox is exactly as it was.

@@ -575,6 +575,44 @@ in the run manifest and a bump forces re-prediction by design.
 selected configuration, and score against the 13 affected messages
 specifically rather than the headline accuracy, which cannot resolve 13 of 200.
 
+## Truncation disclosure — never tested, and Phase 2 moved the ground under it
+
+Carried from a Phase 0 note. The idea: tell the model its body text may be cut
+off, so it cannot read "no deadline mentioned" as "no deadline exists" — a
+false negative on the one category where being wrong costs anything. Three
+variants were sketched: a control; a line in the **system** prompt (byte
+identical every call, so it caches); and truncating at a word boundary with an
+ellipsis, which signals truncation implicitly with no prompt change at all.
+
+**It was never run**, and three Phase 2 findings change how it should be read
+if it ever is:
+
+- **The premise got stronger.** The note assumed a 1,500-character budget
+  against a 7,445-character median body. The measured budget is **300**, so the
+  model now sees roughly 4% of a typical email, not a fifth.
+- **But more text is not the answer**, which is what makes disclosure
+  interesting rather than moot: 800, 1500 and 3000 all scored *worse* than 300,
+  because the boilerplate tail drags predictions toward `Promotions`. If
+  truncation is costing recall, the fix has to be telling the model about it,
+  not showing it more.
+- **The risk the note flagged is now a measured pattern, not a hypothesis.**
+  It warned that disclosure might induce hedging — a spread distribution and a
+  flooded review queue that looks like caution. That is exactly how
+  `v4-format` and `v10-itinerary` both failed: each reached zero costly errors
+  by pushing messages into `Needs Review`, and `v10` did it while posting the
+  best six-way accuracy of any run. **Score it on the action matrix and the
+  `Needs Review` rate, never on recall or accuracy alone.**
+
+**Mechanics, corrected:** the note predates step 4, so it says to bump
+`PROMPT_VERSION` — that no longer exists. Add a variant to `PROMPTS` in
+`app/classifier.py` with a new `prompt_id`, which is what keeps runs
+segmentable now. The ellipsis variant is the odd one out: it changes
+`message_body`, so it bumps `EXTRACTION_VERSION` and forces re-prediction
+rather than a re-score.
+
+**Worth doing only with a pre-registered guard**, as every late Phase 2 variant
+was, and against a fresh holdout — the existing one is spent.
+
 ## Worth re-measuring later
 
 - All of it, once the mailbox has moved on — it grows ~18/day.
