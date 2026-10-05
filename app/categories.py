@@ -47,8 +47,10 @@ class Category(StrEnum):
 
 
 # One line each. These are the category definitions the model is given, so
-# editing any of them is a prompt change and must bump PROMPT_VERSION in
-# `classifier`.
+# editing any of them is a prompt change: it needs a new `prompt_id` in
+# `classifier.PROMPTS`. `classifier.prompt_hash()` is the backstop that
+# catches an edit made without one - two incomparable eval runs filed under
+# the same label would invalidate every conclusion drawn from them.
 DESCRIPTIONS: Mapping[Category, str] = {
     Category.TO_ACTION: (
         "requires a decision, payment, reply, or click from the reader, "
@@ -66,11 +68,27 @@ DESCRIPTIONS: Mapping[Category, str] = {
     ),
 }
 
-# The two categories that stay visible in the inbox. The other four produce
+# The categories that stay visible in the inbox. The other three produce
 # identical behaviour - label it, remove INBOX - which is why a Receipts vs
-# Bookings confusion costs nothing and a To Action false negative costs a
+# Promotions confusion costs nothing and a To Action false negative costs a
 # missed bill. See DESIGN.md, "The action space is nearly binary".
-KEEPS_INBOX = frozenset({Category.TO_ACTION, Category.PERSONAL})
+#
+# BOOKINGS was added in Phase 2 on measurement, not preference. Every costly
+# error in the eval - a message that should have stayed visible and was
+# archived - was a message the model had called Bookings, across every prompt
+# variant tried. Narrowing the category's description took its over-prediction
+# from 21 of 200 down to 10, and did not move those messages at all. Keeping
+# Bookings visible takes them to zero by construction rather than by
+# persuasion, and it costs five extra messages in the inbox per 140.
+#
+# It is also defensible on its own terms: an upcoming flight or appointment is
+# something the reader wants in front of them, which is what INBOX means here.
+# The cost is that the archive half is now three categories rather than four,
+# so "Receipts vs Bookings is a free error" - an argument several Phase 2
+# labelling decisions leaned on - no longer holds.
+KEEPS_INBOX = frozenset(
+    {Category.TO_ACTION, Category.PERSONAL, Category.BOOKINGS}
+)
 
 # Single-token labels, not category names: category words tokenize into several
 # tokens and their first tokens collide ("Receipts"/"Reminders" both begin

@@ -49,7 +49,9 @@ def test_operational_labels_are_not_categories():
 
 
 def test_keeps_inbox_is_exactly_to_action_and_personal():
-    assert cat.KEEPS_INBOX == {Category.TO_ACTION, Category.PERSONAL}
+    assert cat.KEEPS_INBOX == {
+        Category.TO_ACTION, Category.PERSONAL, Category.BOOKINGS
+    }
 
 
 def test_letter_map_is_a_bijection():

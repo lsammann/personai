@@ -1,11 +1,28 @@
 # CLAUDE.md
 
 Personal Gmail classification agent. Read `DESIGN.md` for what and why,
-`docs/PLAN.md` for build order and phase gates.
+`docs/PLAN.md` for the phases and their gates, and the current phase's own
+plan - `docs/PHASE2_PLAN.md` - for how this phase is being built and where the
+code has deliberately diverged from it.
 
-**Current phase: 2 (eval harness).** This is the single source of truth for
-where the project is - `docs/PLAN.md` describes the phases and records what
-each one found, but never claims which is current.
+**Current phase: 2 complete — Phase 3 (the writer end) is next.**
+
+This file is the single source of truth for which **phase** is current;
+`docs/PHASE2_PLAN.md` → Build order is the single source of truth for which
+**step**, and records what each finished step produced. Check the build order
+before planning anything - steps 1-6 are done (200 hand-labelled messages, a
+working harness, and the sweeps finished), and the phase plan's §1-§6 describe
+the phase as originally agreed, not as it stands. **Step 6 results** near the
+end of that document holds the measured configuration and three findings that
+change the design: the `to_action_floor` is inert on this model, `Bookings`
+now keeps `INBOX`, and `body_chars` should be 300 rather than 1500. Step 3 also added a **labelling rules** section,
+which is the decision procedure ground truth was built with and the one step
+7's recheck has to reapply.
+
+Start there rather than at the top of `DESIGN.md`: the phase plan's
+**amendment log** lists every place the build knowingly departed from the
+agreed design, which is the context that would otherwise be lost between
+sessions.
 
 ## How we work
 

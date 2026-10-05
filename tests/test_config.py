@@ -20,7 +20,7 @@ def test_defaults():
 
 def test_body_chars_default_and_bounds():
     """The dominant latency lever, and one of the three knobs Phase 2 tunes."""
-    assert Config().body_chars == 1500
+    assert Config().body_chars == 300        # measured in Phase 2, not a default
     assert Config(body_chars=0).body_chars == 0   # subject-only is a valid test
     with pytest.raises(ValidationError):
         Config(body_chars=-1)

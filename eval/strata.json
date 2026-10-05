@@ -1,0 +1,41 @@
+{
+  "frame_query": "after:2025/09/11 before:2026/09/11 -in:sent -in:drafts -in:chats",
+  "frame_size": 6333,
+  "seed": 7,
+  "strata": [
+    {
+      "N_h": 74,
+      "n_extension": 0,
+      "n_h": 37,
+      "name": "S_action",
+      "query": "subject:(invoice OR \"payment due\" OR overdue OR renew OR expires OR \"action required\" OR statement OR verify)",
+      "window_years": 1
+    },
+    {
+      "N_h": 60,
+      "n_extension": 0,
+      "n_h": 36,
+      "name": "S_human",
+      "query": "is:starred OR from:me (by thread)",
+      "window_years": 1
+    },
+    {
+      "N_h": 189,
+      "n_extension": 0,
+      "n_h": 34,
+      "name": "S_txn",
+      "query": "subject:(receipt OR order OR booking OR reservation OR confirmation)",
+      "window_years": 1
+    },
+    {
+      "N_h": 6010,
+      "n_extension": 0,
+      "n_h": 93,
+      "name": "Residual",
+      "query": "",
+      "window_years": 1
+    }
+  ],
+  "window_end": "2026-09-11",
+  "window_start": "2025-09-11"
+}

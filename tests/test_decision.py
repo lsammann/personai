@@ -23,9 +23,10 @@ from app.categories import ERROR, INBOX, NEEDS_REVIEW, PROCESSED, Category, labe
 T = 0.8
 F = 0.15
 
+# Bookings is NOT here: it joined KEEPS_INBOX in Phase 2, on the measurement
+# that every costly eval error was a message the model had called Bookings.
 ARCHIVED = [
     Category.RECEIPTS,
-    Category.BOOKINGS,
     Category.UPDATES,
     Category.PROMOTIONS,
 ]
@@ -102,6 +103,30 @@ def test_low_confidence_with_to_action_signal_still_just_needs_review():
     result = decide(dist(Category.RECEIPTS, 0.5, p_to_action=0.4))
     assert result.labels_add == tuple(sorted([NEEDS_REVIEW, PROCESSED]))
     assert result.labels_remove == ()
+
+
+def test_bookings_keeps_the_inbox():
+    """Changed in Phase 2 and worth pinning, because it inverts an assumption
+    the earlier design leaned on.
+
+    Every message the eval lost - one that should have stayed visible and was
+    archived - had been classified Bookings, across four prompt variants.
+    Three rounds of prompt work took the over-prediction from 21 of 200 to 10
+    and moved none of them. Keeping Bookings visible removes the failure mode
+    by construction.
+    """
+    result = decide(dist(Category.BOOKINGS, 0.99))
+    assert result.labels_remove == ()
+    assert not result.needs_review
+    assert result.labels_add == tuple(sorted([label_for(Category.BOOKINGS), PROCESSED]))
+
+
+def test_the_archive_half_is_now_three_categories():
+    """So "Receipts vs Bookings is a free error" no longer holds - an argument
+    several Phase 2 labelling decisions were made on."""
+    from app.categories import KEEPS_INBOX
+    assert set(ARCHIVED) == set(Category) - KEEPS_INBOX
+    assert len(ARCHIVED) == 3
 
 
 # --- boundaries -----------------------------------------------------------
@@ -259,3 +284,38 @@ def test_decision_module_imports_nothing_impure():
         elif isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
     assert imported <= allowed, f"impure imports: {sorted(imported - allowed)}"
+
+
+# --- the reply rule -------------------------------------------------------
+
+
+def test_a_reply_hit_never_removes_inbox():
+    """The whole safety argument for the rule, as a test.
+
+    It can only move a message INTO the keeps-INBOX set, so it cannot create
+    the one error in this system that costs anything. If this assertion ever
+    has to change, the rule has stopped being safe by construction and the
+    argument for shipping it without a strong precision estimate is gone.
+    """
+    assert decision.decide_reply_hit().labels_remove == ()
+
+
+def test_a_reply_hit_applies_personal_and_processed():
+    result = decision.decide_reply_hit()
+    assert set(result.labels_add) == {"Agent/Personal", "Agent/Processed"}
+    assert result.category is Category.PERSONAL
+
+
+def test_a_reply_hit_records_no_confidence():
+    """A rule fired; a fabricated probability would corrupt the calibration
+    table, which is computed from model confidences only."""
+    result = decision.decide_reply_hit()
+    assert result.confidence is None
+    assert result.needs_review is False
+
+
+def test_a_reply_hit_is_processed_never_errored():
+    """The three mutually exclusive mailbox states still hold."""
+    result = decision.decide_reply_hit()
+    assert "Agent/Processed" in result.labels_add
+    assert "Agent/Error" not in result.labels_add

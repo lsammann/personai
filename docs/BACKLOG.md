@@ -67,6 +67,15 @@ backfill.
 
 ## Body lengths — larger than the Phase 0 spikes assumed
 
+> **Corrected 2026-09-09. The figures below conflate prose with HTML markup.**
+> They were measured with an extractor whose fallback, for mail carrying no
+> `text/plain` part, returns the raw HTML source. 23% of mail is HTML-only, so
+> for roughly a quarter of the sample the "body length" recorded here is the
+> length of `<td style="...">`, not of anything readable. See *Body structure*
+> below for the corrected figures. The numbers in this block are retained
+> because the latency argument that follows them still holds — the model was
+> being sent that markup, and paying for it.
+
 ```
 p10      638      p50    7,553      p90    57,527
 p25    1,981      p75   20,306      max   113,964
@@ -89,20 +98,345 @@ emits a single token, so cost is essentially `prompt_tokens ÷ prompt_eval
 rate` — latency is close to linear in input length, with nothing else to
 amortise it against.
 
-Rough projection at a 1,500-char truncation (~375 tokens plus a ~300-token
-system prompt), using Phase 0's measured prompt-eval rates:
+## Body structure — what the model actually receives
 
-| Scope | Messages | `llama3.1:8b` (~9.5s) | 3B (~3.8s) |
+Measured 2026-09-10 by `scripts/measure_bodies.py` over 250 messages sampled
+(seed 11) from the Phase 2 eval frame, pinned to absolute bounds:
+`after:1757462400 before:1788998400 -in:sent -in:drafts -in:chats` (6,314
+messages). Read-only; nothing written to disk. Figures are unaffected by the
+`message/rfc822` handling described below, which no message in the sample
+exercised.
+
+> **Use absolute dates when sampling.** `newer_than:1y` is relative, so it
+> names a different population every day and a seeded sample drawn through it
+> is not reproducible. Measured directly: the same seed over the same nominal
+> frame returned a largely different 150 messages on consecutive days.
+
+| Cohort | Share |
+|---|---|
+| Has a real `text/plain` part | 75.6% |
+| **HTML-only** | **24.4%** |
+| No text part at all | 0% |
+| — of which stub `text/plain` parts | 0.8% |
+
+At n=250 the HTML-only share carries roughly ±5 points. Three samples across
+two days gave 23.3%, 16.0% and 24.4% — call it **about one message in four**,
+and do not read the third decimal.
+
+A *stub* is a `text/plain` part under 200 characters sitting beside more than
+twice that in stripped HTML — "View this email in your browser" — where the
+real content exists only as HTML. Rare, but it fails silently: the extractor
+succeeds and returns a body indistinguishable from a genuinely short email.
+
+**Lengths, separated by cohort.** This is the corrected input to the
+truncation decision:
+
+| | p10 | p50 | p90 |
 |---|---|---|---|
-| last 3 months | 1,951 | 5.1h | 2.1h |
-| last 6 months | 3,541 | 9.3h | 3.7h |
-| last 1 year | 6,327 | 16.7h | 6.7h |
-| last 2 years | 11,719 | 30.9h | 12.4h |
-| everything | 18,668 | 49.3h | 19.7h |
+| Old extractor output (the figures above) | 1,203 | **7,555** | 79,216 |
+| `text/plain` parts — actual prose | 1,052 | **5,637** | 37,484 |
+| `text/html` raw source | 15,153 | 59,313 | 122,867 |
+| `text/html` tag-stripped — actual prose | 640 | **1,598** | 3,818 |
+| **Selected body — what the model now reads** | 705 | **3,874** | 23,332 |
 
-Untruncated, at the median body length, the full backlog is on the order of
-**160 hours**. Truncation is not a tuning preference here; without it the
-backfill is impractical at any scope.
+Stripping keeps **2.9%** of the HTML source. **26.0%** of selected bodies fit
+whole inside the current 1,500-character budget.
+
+**Consequences.**
+
+- For a quarter of all mail, the budget was being spent almost entirely on
+  markup. The first 300 characters of a real message under the old extractor:
+
+  ```
+  <html dir="ltr" lang="en">\n  <head>\n    <meta http-equiv="Content-Type" ...
+  ```
+
+  The same message now opens `"Luke Sammann, this code expires in 10 minutes.
+  ... Your security code is ..."` — a PayPal 2FA mail, unmistakable once
+  readable. The old behaviour was both less accurate *and* no faster, since
+  the markup still had to be tokenised.
+- **One `body_chars` is doing two different jobs.** At 1,500 it captures
+  nearly a whole stripped HTML message (p50 1,598) but only the first quarter
+  of a typical plain-text one (p50 5,637). The Phase 2 sweep will show this;
+  before the correction it was hidden inside a blended average.
+- Attachments are never fetched — Gmail returns an `attachmentId` rather than
+  data, and the walk skips those parts. A bill existing only as an attached
+  PDF is invisible to the classifier. See `DESIGN.md` → Classification logic.
+
+### Stub detection misses a whole class of it — found while labelling
+
+Found 2026-09-12, labelling the eval set. A SEEK newsletter reached the
+labelling UI with no content in it at all:
+
+```
+Hi ,
+This email is only available in HTML. To see the full message, please view it
+in your browser https://click.email.seek.com.au/?qs=ABB7InYi...  (361 chars of URL)
+The team at SEEK
+This email was sent to you as a registered user of www.seek.com.au ...
+```
+
+The HTML part carried the real message — "Did you know there are limits to
+what employers can ask in an interview?" plus two promotional blocks, which is
+exactly the material that decides `Updates` vs `Promotions`.
+
+**Both halves of the stub rule failed, for different reasons, and neither is
+the threshold:**
+
+| | measured | rule |
+|---|---|---|
+| `len(plain)` | 707 | needs < 200 (`STUB_MAX_CHARS`) |
+| — of which tracking URLs | 361 | |
+| — informative plain text | ~346 | |
+| `len(stripped html)` | 1,061 | |
+| — of which zero-width padding | 104 | the preheader spacer trick |
+| — informative html text | 853 | |
+| ratio html/plain | **1.5** | needs > 2.0 (`STUB_HTML_RATIO`) |
+
+So **raising `STUB_MAX_CHARS` would not have caught this**: the ratio guard
+blocks it independently. Both lengths are inflated by material that carries no
+meaning — tracking URLs on one side, `\u200c` spacers on the other — so the
+comparison is not measuring what it claims to. On informative text the ratio is
+2.5 and clears the guard; only the length test would still need to move.
+
+### Tracking URLs are eating the truncation budget
+
+Measured 2026-09-12 over the 22 messages cached so far by the labelling run.
+Small sample, re-measure at 200, but the effect is too large to be noise:
+
+| | |
+|---|---|
+| URLs as a share of the whole selected body | p50 **28.1%**, p90 87.1% |
+| URLs as a share of the first 1,500 chars | p50 10.1%, p90 **89.2%** |
+| Messages spending >25% of the budget on URLs | **10 of 22** |
+| URLs per message | p50 4, max 252 |
+| Longest single URL | 1,495 chars |
+
+This understates it in the units that decide latency: a base64 tracking token
+is near the worst case for a BPE tokenizer — roughly a token every 2-3
+characters against ~4 for prose — so the token share exceeds the character
+share. On CPU-only inference, where the call emits one token and cost is
+essentially prompt length, this is a latency lever as well as an accuracy one.
+(The tokenizer figure is inference from how BPE behaves, not measured here.)
+
+**Replace each URL with its host, rather than removing it.** Host-only
+recovers 22.6% of the median body against 28.1% for deletion, and the extra
+5.5 points buy `account.proton.me`, `click.discord.com`,
+`click.e.afl.com.au` — the domain says what kind of mail this is, which is
+exactly the half a tracking parameter cannot carry.
+
+Worth defaulting on rather than treating as open: a tracking parameter cannot
+carry classification signal, so the argument does not depend on the
+measurement. It is still a knob, still bumps `EXTRACTION_VERSION`, and still
+appears in the step 6 sweep, which is what would say so if this reasoning is
+wrong.
+
+**Fixed 2026-09-12 as `EXTRACTION_VERSION = "v3"`.** Items 1-4 below are
+implemented; item 1's threshold is not. What was built:
+
+1. Compare *informative* lengths — URLs removed from the plain part,
+   zero-width characters removed from the stripped HTML. This corrects the
+   measurement rather than loosening the guard. This is URL removal for the
+   *length comparison only* — it changes nothing the model reads, and is a
+   separate decision from the body rewrite above.
+2. Strip zero-width characters from the selected body regardless. They carry
+   no information under any policy and spent 10% of this message's budget.
+3. Consider an explicit marker test ("only available in HTML", "view this
+   email in your browser") firing regardless of length, still gated on the
+   HTML having more informative text.
+4. Rewrite each URL in the selected body to its host, per the section above.
+
+**What was deliberately left alone: `STUB_MAX_CHARS` itself.** It is still
+200. The threshold is a tuning knob and one example is not a distribution — the
+risk of raising it is a genuinely short human email being redirected to its
+HTML part, which is the error that would quietly damage `Personal`. It turned
+out not to need raising: measuring informative characters and honouring the
+declaration fixes the observed case without moving it. Whether 200 is right at
+all is still an open measurement, and the eval cache is the instrument.
+
+**Verification over the 22 messages cached at the time.** Two source flips,
+both inspected by hand:
+
+| was | now | subject |
+|---|---|---|
+| `plain` (707) | `stub_fallback` (853) | the SEEK newsletter above — the target |
+| `plain` (193) | `stub_fallback` (232) | a SerpApi confirmation email |
+
+The second is a consequence of measuring informative length rather than raw:
+that plain part is 104 characters of prose plus an 89-character confirmation
+token. The HTML version carries the same words plus the anchor text "Confirm
+your email", so it is neutral-to-better, not a regression. Bodies got shorter
+on 14 of 22 messages, median −13.5%, entirely from URL rewriting.
+
+Re-run this comparison at n=200 once labelling is complete. The flip set is the
+thing to look at, and a *human* email flipping to its HTML part is the finding
+that would justify revisiting the rule.
+
+The labelling UI was fixed immediately and separately: `m` now shows the text
+part `select_body` did *not* choose, so the labeller can always see what the
+email is even when the model cannot. Ground truth is what the email IS.
+
+### A `text/plain` part that is really an HTML document — `v4`
+
+Found 2026-09-12, labelling. A Collingwood FC mailout reached the UI as
+120,567 characters of unreadable markup. The `text/plain` part was a complete
+HTML document — `<!DOCTYPE html>`, 172 tags, 334 CSS rules, `@media` queries —
+shipped under both MIME types by the sender's platform. Preferring plain then
+feeds the model `<meta name="x-apple-disable-message-reformatting">`: the exact
+failure `DESIGN.md` records for the old extractor, returning through a
+mis-declared content type rather than a missing part. **1 of 64 cached
+messages.**
+
+Fixed by stripping a plain part that *declares* itself a document, reported as
+its own `body_source` cohort, `plain_markup`, so the eval can segment on it.
+Matched on the declaration rather than tag density: markup quoted inside a
+genuine plain-text email is a different thing, and a density test would call
+it wrong.
+
+**Also in `v4`: U+034F.** The spacer character added in `v3` was the wrong one.
+Across 64 cached messages the combining grapheme joiner outnumbers the
+zero-width non-joiner five to one — 3,081 against 603 — and the SEEK message
+that prompted `v3` simply happened to use the more obvious one. The set is
+populated from what appears in real mail, not from a Unicode chart.
+
+| invisible character | occurrences |
+|---|---|
+| U+034F combining grapheme joiner | **3,081** |
+| U+200C zero-width non-joiner | 603 |
+| U+FEFF byte-order mark | 300 |
+| U+00AD soft hyphen | 288 |
+
+**Verified over 64 cached messages — four source flips, each inspected:**
+
+| was | now | message |
+|---|---|---|
+| `plain` 120,567 | `plain_markup` **371** | Collingwood FC — the `v4` target |
+| `plain` 18,620 | `stub_fallback` 1,132 | Skyscanner — see below |
+| `plain` 707 | `stub_fallback` 853 | SEEK — the `v3` target |
+| `plain` 193 | `stub_fallback` 232 | SerpApi confirmation |
+
+The Skyscanner one is the clearest vindication of measuring informative
+length: its plain part is 18,622 characters of which **18,474 — 99.2% — are
+two tracking URLs**, leaving 52 characters of actual words. The model would
+have read 1,500 characters of tracking token; it now reads the deal list with
+destinations and prices. No rule based on raw length could have distinguished
+that from a long email.
+
+Body sources across the cache afterwards: `plain` 48, `html` 12,
+`stub_fallback` 3, `plain_markup` 1.
+
+### The n=200 audit — `v2` vs `v4`, against labels
+
+Run 2026-09-13 by `scripts/measure_extraction.py` over all 200 cached eval
+messages, each with a hand label attached. Offline: no Gmail, no Ollama.
+This is the re-run the two sections above asked for.
+
+**Seven source flips out of 200, and none on a `Personal` message** — the only
+category where picking the wrong part costs something, since `Personal` keeps
+the inbox. Each was read individually rather than counted:
+
+| label | v2 | v4 | message |
+|---|---|---|---|
+| Promotions | plain 707 | stub_fallback 853 | SEEK — the declared-HTML-only case |
+| Promotions | plain 1,725 | stub_fallback 5,238 | Qantas Travel Insider |
+| Promotions | plain 18,620 | stub_fallback 1,132 | Skyscanner — 99.2% tracking URL |
+| Promotions | plain 95,852 | plain_markup 360 | Collingwood "Flash sale" |
+| Promotions | plain 101,188 | plain_markup 635 | Collingwood "Magpie Mega Draw" |
+| Promotions | plain 120,567 | plain_markup 371 | Collingwood "Magpie Army" |
+| To Action | plain 193 | stub_fallback 232 | SerpApi confirmation |
+
+Two things the wider sample changed. **The markup-as-plain bug is 3 in 200, not
+1 in 64** — all three Collingwood, each previously spending the whole budget on
+CSS. And the Qantas flip validates the declaration test specifically: its plain
+part is 596 informative characters of pure chrome ("having trouble viewing",
+"update preferences", "unsubscribe", "online help") with no content at all, so
+no value of `STUB_MAX_CHARS` could have caught it while the ratio test measured
+raw length.
+
+**`STUB_MAX_CHARS` stays at 200, and the question is retired.** Raising it
+would newly capture seven messages — six marketing plus a LinkedIn digest, no
+human mail. Lowering it changes nothing. The one `Personal` message the stub
+rule *does* fire on (a 39-character reply, "Hi Luke, Thank you! Kind regards,
+Paula") comes out better for it: the HTML opens with those same 39 characters
+and then adds a signature, a company name and the quoted thread, where the
+plain part alone is nearly contentless. Not provably optimal — but no candidate
+value changes anything that matters in this mailbox, which is a more useful
+answer than leaving it open.
+
+### Body length under `v4` — the input to the `body_chars` sweep
+
+| cohort | n | p10 | p50 | p90 |
+|---|---|---|---|---|
+| all | 200 | 466 | **1,678** | 5,335 |
+| plain | 146 | 525 | 1,947 | 6,266 |
+| html | 44 | 376 | 1,182 | 3,692 |
+| stub_fallback | 7 | 232 | 1,065 | 5,238 |
+| plain_markup | 3 | 360 | 371 | 635 |
+
+**The distribution has collapsed.** The old selected-body figures were p50
+3,874 and p90 23,332; they are now 1,678 and 5,335 — a 57% drop at the median
+and 77% at p90, from URL rewriting and markup stripping together.
+
+| body_chars | sent whole | chars per 200-message run |
+|---|---|---|
+| 0 | 0% | 0 |
+| 300 | 4.5% | 59,151 |
+| 800 | 25.0% | 144,863 |
+| 1500 | **44.5%** | 236,661 |
+| 3000 | **72.5%** | 356,110 |
+
+Consequences for step 6:
+
+- **The planned candidates `{0, 300, 800, 1500, 3000}` still straddle the
+  distribution well** — each step moves whole-message coverage materially
+  (0 → 4.5 → 25 → 44.5 → 72.5%), so no run is spent on a knob that is not
+  moving. Going above 3,000 would be: p90 is 5,335, so 3,000 already truncates
+  only the top quarter.
+- **"One `body_chars` doing two jobs" has largely healed.** The old gap between
+  plain (p50 5,637) and stripped HTML (p50 1,598) was 3.5x; under `v4` it is
+  1,947 vs 1,182, or 1.6x. Most of that gap was tracking URLs in plain parts.
+- **Two `body_source` cohorts are too small to carry a conclusion.**
+  `plain_markup` has 3 members and `stub_fallback` 7. Step 5 reports accuracy
+  by source; those two rows must be shown with their n and read as anecdote.
+- **One thin body in 200**: a 62-character `Personal` note ("CV & Cover Letter
+  for EY Role"), which is simply a short email. Nothing systemic reaching the
+  model as sender-and-subject only.
+
+## Forwarded mail and reply chains
+
+- **`message/rfc822` (forward "as attachment"): 0 of 250, 0.0%** — 95% upper
+  bound about 1.2%, so up to ~75 messages across the frame.
+- **Gmail's default Forward is *inline*,** not as-attachment: the original
+  lands in the same text part, below the note. That is 100% of the forwards
+  present in this mailbox.
+- **So an attached message is appended after the covering note**, with a
+  forwarded-message divider, reproducing what inline forwarding already
+  produces. Reading only the note would make one user action classify
+  differently depending on which forward button was pressed. Order is the
+  substance of the rule: truncation cuts from the start, so the human's words
+  always survive and the forwarded content fills the remaining budget — a
+  friend forwarding a promotion stays `Personal`, while a friend forwarding an
+  invoice still has "invoice" and "due" within reach.
+- Whether the model actually reads a forwarded note as `Personal` is a prompt
+  question the eval set answers.
+- **Quoted reply history: 2 of 250, 0.8%** of the frame, averaging 71% of the
+  body, with the new text fitting inside 1,500 characters in both cases.
+  Far too thin to conclude anything — the random frame is almost entirely bulk
+  mail. The `S_human` stratum over-samples reply chains by design and is where
+  this gets measured.
+
+## Gmail API quota — a constraint on bulk fetching
+
+Two sweeps died on `403 rateLimitExceeded` between the **150th and 175th**
+`messages.get`, and seven backoff attempts spanning a minute did not reopen
+the window — so it is not a per-minute burst limit, and reacting to it does
+not work. Pacing does: 250 fetches at a 0.5s delay completed with zero
+retries.
+
+`gmail_client.throttle()` is opt-in rather than built into `fetch()`, because
+the labelling CLI fetches one message per human decision, roughly every thirty
+seconds, and would gain nothing from sleeping. **Anything that prefetches in
+bulk — notably building the eval content cache — must pace.**
 
 ## Sender concentration — weaker than hoped
 
@@ -187,9 +521,105 @@ Nothing here needs acting on now. It should be read at these points:
 - **Phase 4 — prefilter seeding.** `data/sender_domains.csv` is the derived
   allowlist seed, alongside the List-Unsubscribe idea above.
 
+## The reply rule — what it is estimated on, and what would sharpen it
+
+Built at the end of Phase 2 (pure half + eval bucket); wired into `agent.py` in
+Phase 3. `DESIGN.md` → the two deterministic routing rules has the design.
+
+**The estimate is thin and one-sided.** 15 of the 200 eval subjects match
+`^(Re|Fw|Fwd):`. All 15 are mail that should stay visible — 13 human-written,
+plus a Google support survey and a Payoneer auto-reply, both answering queries
+the reader sent. Precision on the reader's own definition is 15/15, but the
+Wilson interval at n=15 is [0.78, 1.00], and **`Re:` is cheap for automated
+mail to produce**. Ticketing systems, auto-responders and no-reply support
+queues are all likely over-represented in an 18,668-message backfill relative
+to genuine human replies, so the live rate should be assumed worse.
+
+**The live measurement, once Phase 3 runs.** `logbook` records
+`source: "reply"`, so rule-routed `Personal` is separable from model-routed
+`Personal` permanently. After the first real run, pull a sample of rule hits and
+record observed precision here. **Trigger to act:** if rule-routed `Personal`
+fills with auto-responders the reader does not want visible.
+
+**The refinement, when that trigger fires.** Require `Re:` **and** the absence
+of a `List-Unsubscribe` header — the standard bulk-mail marker, which a
+ticketing auto-response often carries and a human reply never does. It cannot
+be evaluated against the existing 200: `evallabel.Cached` stores sender,
+subject and the two text parts only, so the header would need
+`gmail_client.fetch` to carry it and the cache to store it — a schema change
+and a refetch, which is why it is deferred rather than guessed at now.
+
+## Boilerplate inside the truncation budget — measured, not yet acted on
+
+Raised while diagnosing the holdout's one costly error: a human reply whose
+visible 300 characters were 13% content and 87% signature block plus legal
+disclaimer, including the tagline "Checkmate – Pre-Employment Screening
+Software www.checkmate.tech", which reads as marketing copy. It was classified
+`Promotions` at 0.925.
+
+**Measured across the 200:** a confidentiality notice, unsubscribe line or
+similar boilerplate marker appears *inside the first 300 characters* on **13 of
+200** messages — `Receipts` 4, `To Action` 3, `Promotions` 3, `Updates` 2,
+`Personal` 1. So it is real but narrow, and it is **not** a trailing-footer
+problem: truncation at 300 already removes the tail. The noise is before the
+cut.
+
+**Why it was not built.** Stripping the legal disclaimer alone would not have
+saved the message that prompted it — the signature and tagline survive, and
+those are the most promotional-looking text in it. Doing it properly means
+signature-block detection, where a false strip deletes real content. It also
+cannot be evaluated without re-running inference, since `EXTRACTION_VERSION` is
+in the run manifest and a bump forces re-prediction by design.
+
+**If it is picked up:** bump `EXTRACTION_VERSION`, re-run `predict` on the
+selected configuration, and score against the 13 affected messages
+specifically rather than the headline accuracy, which cannot resolve 13 of 200.
+
+## Truncation disclosure — never tested, and Phase 2 moved the ground under it
+
+Carried from a Phase 0 note. The idea: tell the model its body text may be cut
+off, so it cannot read "no deadline mentioned" as "no deadline exists" — a
+false negative on the one category where being wrong costs anything. Three
+variants were sketched: a control; a line in the **system** prompt (byte
+identical every call, so it caches); and truncating at a word boundary with an
+ellipsis, which signals truncation implicitly with no prompt change at all.
+
+**It was never run**, and three Phase 2 findings change how it should be read
+if it ever is:
+
+- **The premise got stronger.** The note assumed a 1,500-character budget
+  against a 7,445-character median body. The measured budget is **300**, so the
+  model now sees roughly 4% of a typical email, not a fifth.
+- **But more text is not the answer**, which is what makes disclosure
+  interesting rather than moot: 800, 1500 and 3000 all scored *worse* than 300,
+  because the boilerplate tail drags predictions toward `Promotions`. If
+  truncation is costing recall, the fix has to be telling the model about it,
+  not showing it more.
+- **The risk the note flagged is now a measured pattern, not a hypothesis.**
+  It warned that disclosure might induce hedging — a spread distribution and a
+  flooded review queue that looks like caution. That is exactly how
+  `v4-format` and `v10-itinerary` both failed: each reached zero costly errors
+  by pushing messages into `Needs Review`, and `v10` did it while posting the
+  best six-way accuracy of any run. **Score it on the action matrix and the
+  `Needs Review` rate, never on recall or accuracy alone.**
+
+**Mechanics, corrected:** the note predates step 4, so it says to bump
+`PROMPT_VERSION` — that no longer exists. Add a variant to `PROMPTS` in
+`app/classifier.py` with a new `prompt_id`, which is what keeps runs
+segmentable now. The ellipsis variant is the odd one out: it changes
+`message_body`, so it bumps `EXTRACTION_VERSION` and forces re-prediction
+rather than a re-score.
+
+**Worth doing only with a pre-registered guard**, as every late Phase 2 variant
+was, and against a fresh holdout — the existing one is spent.
+
 ## Worth re-measuring later
 
 - All of it, once the mailbox has moved on — it grows ~18/day.
 - Sender concentration across the whole backlog rather than a recent sample.
 - Body-length distribution on a larger sample; 40 messages is thin for
   percentiles as skewed as these.
+- ~~Stub detection, against the eval cache~~ **Done 2026-09-13** — see The
+  n=200 audit above. `scripts/measure_extraction.py` re-runs it in one command
+  whenever an extraction rule changes, which is the point at which it should
+  be re-run.

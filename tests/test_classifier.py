@@ -138,10 +138,30 @@ def test_system_prompt_lists_every_category_with_its_letter():
 
 
 def test_user_message_truncates_the_body():
-    message = classifier.build_user_message("a@b.com", "Subject", "x" * 5000, 100)
+    message = classifier.build_user_message("a@b.com", "Subject", "x" * 5000, "", 100)
     assert message.count("x") == 100
     assert "From: a@b.com" in message
     assert "Subject: Subject" in message
+
+
+def test_user_message_selects_the_body_rather_than_trusting_the_caller():
+    """The single-path guarantee: no caller can hand the model its own body.
+
+    An HTML-only message reaches the model as readable text without anything
+    outside this function having made a choice. Before the split, 23% of real
+    mail arrived here as raw markup - see docs/BACKLOG.md -> Body structure.
+    """
+    message = classifier.build_user_message(
+        "shop@example.com",
+        "Invite",
+        "",
+        "<html><head><style>p{color:red}</style></head>"
+        "<body><p>You have been invited</p></body></html>",
+        1500,
+    )
+    assert "You have been invited" in message
+    assert "<p>" not in message
+    assert "color:red" not in message
 
 
 # --- the Ollama call, mocked ----------------------------------------------
@@ -182,6 +202,7 @@ def call(payload_or_error):
             "billing@octopus.energy",
             "Your bill is ready",
             "payment due 15 October",
+            "",
             model="llama3.1:8b",
             body_chars=1500,
         )
@@ -200,9 +221,16 @@ def test_classify_sends_the_single_token_logprob_request():
 
 
 def test_classify_sends_the_built_prompt_and_the_email():
+    """Against the *default* prompt, whatever it currently is.
+
+    Pinned to `build_system_prompt()` until Phase 2 selected `v9b-bookings`,
+    at which point it failed for the right reason and the wrong one: what it
+    is testing is that `classify` sends the prompt the registry gives it, not
+    which prompt won a sweep.
+    """
     _, request = call(ollama_reply([entry("A", 1.0)]))
     system, user = json.loads(request.data)["messages"]
-    assert system["content"] == classifier.build_system_prompt()
+    assert system["content"] == classifier.system_prompt(classifier.DEFAULT_PROMPT_ID)
     assert "billing@octopus.energy" in user["content"]
     assert "payment due 15 October" in user["content"]
 
@@ -244,7 +272,7 @@ def test_non_json_response_becomes_ollama_error():
         patch("urllib.request.urlopen", fake_urlopen),
         pytest.raises(OllamaError, match="invalid JSON"),
     ):
-        classifier.classify("a@b.com", "s", "b", model="m", body_chars=100)
+        classifier.classify("a@b.com", "s", "b", "", model="m", body_chars=100)
 
 
 def test_http_error_status_becomes_ollama_error():
@@ -270,3 +298,107 @@ def test_both_failure_modes_share_a_base_class():
     """The caller retries on either, so it should not have to name both."""
     assert issubclass(NoCategoryLetter, classifier.ClassifierError)
     assert issubclass(OllamaError, classifier.ClassifierError)
+
+
+# --- the prompt registry --------------------------------------------------
+
+
+def test_v1_is_the_committed_prompt_not_a_copy_of_it():
+    """The baseline has to BE the shipped prompt, or it is not a baseline."""
+    assert classifier.system_prompt("v1") == classifier.build_system_prompt()
+    assert classifier.PROMPTS["v1"] is classifier.build_system_prompt
+
+
+def test_an_unknown_prompt_id_raises_rather_than_defaulting():
+    """A typo in a sweep must not file a run under the wrong label.
+
+    Falling back to v1 would be silent: nothing in the results file or the
+    report would look wrong, and every comparison drawn from it would be
+    invalid.
+    """
+    with pytest.raises(KeyError, match="unknown prompt_id"):
+        classifier.system_prompt("v9-typo")
+
+
+def test_the_default_prompt_id_is_in_the_registry():
+    assert classifier.DEFAULT_PROMPT_ID in classifier.PROMPTS
+
+
+def test_prompt_hash_is_stable_and_short():
+    first = classifier.prompt_hash("v1")
+    assert first == classifier.prompt_hash("v1")
+    assert len(first) == 12
+
+
+def test_editing_a_category_description_moves_the_prompt_hash(monkeypatch):
+    """The guard that catches a prompt change made without a new id.
+
+    `categories.DESCRIPTIONS` IS the prompt - editing one line changes what
+    every model sees - so two runs either side of an edit are incomparable.
+    Filed under the same `prompt_id` they would look comparable, and nothing
+    about the output would say otherwise.
+    """
+    before = classifier.prompt_hash("v1")
+    edited = dict(classifier.DESCRIPTIONS)
+    edited[Category.RECEIPTS] = "a transaction already completed, plus VAT"
+    monkeypatch.setattr(classifier, "DESCRIPTIONS", edited)
+
+    assert classifier.prompt_hash("v1") != before
+
+
+def test_prompt_hash_differs_between_letter_orders():
+    """Permutation runs are different runs; the manifest must say so."""
+    rotated = classifier.DEFAULT_ORDER[1:] + classifier.DEFAULT_ORDER[:1]
+    assert classifier.prompt_hash("v1") != classifier.prompt_hash("v1", rotated)
+
+
+def test_classify_builds_its_system_message_through_the_registry():
+    _, request = call(ollama_reply([entry("A", 0.9), entry("B", 0.1)]))
+    body = json.loads(request.data)
+    assert body["messages"][0]["content"] == classifier.system_prompt(
+        classifier.DEFAULT_PROMPT_ID
+    )
+
+
+# --- the step 6 prompt variants -------------------------------------------
+
+
+def test_every_registered_prompt_keeps_the_output_contract():
+    """A variant that forgets "reply with one character" breaks the whole
+    confidence mechanism, not just its own accuracy."""
+    for prompt_id in classifier.PROMPTS:
+        text = classifier.system_prompt(prompt_id)
+        assert "exactly one character" in text
+        assert "A, B, C, D, E, F" in text
+
+
+def test_every_registered_prompt_names_all_six_categories():
+    for prompt_id in classifier.PROMPTS:
+        text = classifier.system_prompt(prompt_id)
+        for category in Category:
+            assert category.value in text, f"{prompt_id} drops {category}"
+
+
+def test_v2_changes_only_the_precedence_block():
+    """One variable per variant, or a win cannot be attributed."""
+    v1 = classifier.system_prompt("v1")
+    v2 = classifier.system_prompt("v2-ordered")
+    assert classifier._definitions(classifier.DEFAULT_ORDER) in v1
+    assert classifier._definitions(classifier.DEFAULT_ORDER) in v2
+    assert "choose the FIRST that applies" in v2
+    assert "Precedence when an email fits two categories" not in v2
+
+
+def test_v9_changes_only_the_bookings_description():
+    v9 = classifier.system_prompt("v9-bookings")
+    assert "confirmation of something scheduled or reserved" not in v9
+    assert classifier.BOOKINGS_NARROWED in v9
+    # The precedence block is untouched, so a win is attributable to the
+    # description alone.
+    assert "Precedence when an email fits two categories" in v9
+
+
+def test_the_variants_hash_differently_from_the_baseline():
+    hashes = {prompt_id: classifier.prompt_hash(prompt_id)
+              for prompt_id in classifier.PROMPTS}
+    assert len(set(hashes.values())) == len(hashes)

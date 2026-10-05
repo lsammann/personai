@@ -84,3 +84,40 @@ def test_committed_allowlist_is_valid():
         assert "/" not in entry
         assert not entry.startswith(".")
         assert "." in entry
+
+
+# --- the reply rule -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "subject",
+    ["Re: hello", "RE: HELLO", "re: x", "re : x", "  Re: padded",
+     "Fw: x", "FW: x", "Fwd: x", "FWD: x", "Re:Re: nested"],
+)
+def test_a_reply_or_forward_is_recognised(subject):
+    assert prefilter.is_reply(subject) is True
+
+
+@pytest.mark.parametrize(
+    "subject",
+    ["Reminder: your trial ends", "Receipt: order 123", "Result: your test",
+     "Renewal due", "Review your purchase", "re-engage with us",
+     "Your Re: something", "", "   ", None],
+)
+def test_what_merely_starts_with_re_is_not_a_reply(subject):
+    """The colon is load-bearing.
+
+    "Reminder:" and "Receipt:" both open with "re", and both are exactly the
+    promotional and transactional mail the rule is supposed to leave alone. A
+    matcher without the colon would keep a large slice of the archive pile in
+    the inbox permanently.
+    """
+    assert prefilter.is_reply(subject) is False
+
+
+def test_the_reply_rule_reads_only_the_subject():
+    """No body, no sender, no fetch beyond metadata - and nothing that can
+    fail on malformed content."""
+    import inspect
+
+    assert list(inspect.signature(prefilter.is_reply).parameters) == ["subject"]

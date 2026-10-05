@@ -118,6 +118,36 @@ def decide_prefilter_hit() -> Decision:
     )
 
 
+def decide_reply_hit() -> Decision:
+    """Row 6b. A reply or forward, routed by rule with no model call made.
+
+    **`labels_remove` is empty, and that is the whole safety argument.** This
+    rule can only ever move a message INTO the keeps-INBOX set, so it cannot
+    create the one error in this system that costs anything. Its worst case is
+    clutter - a message left visible that could have been archived - which is
+    the cheap side of the asymmetry the whole design is built on.
+
+    It exists because the model reads `Personal` poorly: 4 of 14 on the Phase 2
+    dev split, mean `p(Personal)` 0.302 on true `Personal`, and one
+    human-written reply archived as `Promotions` at 0.925 on the holdout. The
+    labelling rule that ground truth was built with - a human wrote it, so
+    `Personal` - was chosen for being decidable from the text. This moves that
+    decision into code, where it is decidable exactly.
+
+    Confidence is None for the same reason as `decide_prefilter_hit`: the row
+    records a rule firing, and a fabricated probability would corrupt the
+    calibration table.
+    """
+    return Decision(
+        labels_add=_sorted(label_for(Category.PERSONAL), PROCESSED),
+        labels_remove=(),
+        category=Category.PERSONAL,
+        confidence=None,
+        needs_review=False,
+        to_action_override=False,
+    )
+
+
 def decide_failure() -> Decision:
     """Row 7. Ollama unreachable, no valid category letter, a Gmail error.
 
