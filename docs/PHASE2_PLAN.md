@@ -573,7 +573,7 @@ whether the HTML path classifies as well as the plain path, and whether a
    Selected: `llama3.1:8b`, `body_chars=300`, prompt `v9b-bookings`, `T=0.8`,
    and `Bookings` added to `KEEPS_INBOX`. Dev action accuracy 0.900,
    `To Action` retention 24/24.
-7. **← current.** `label_eval.py recheck` — the self-consistency ceiling.
+7. ~~`label_eval.py recheck` — the self-consistency ceiling~~
    **Harness built**, 2026-09-13: `recheck` + `--report`, the pinned draw per
    A9, `verify --pass 2` checking against that draw, and the keypress loop
    shared with `label` rather than copied. 393 tests, ruff clean, no new
@@ -1907,7 +1907,7 @@ here.** 0.8 was measured on dev, and picking a threshold off the holdout table
 would turn the holdout into a second dev set, which is the exact failure the
 split exists to prevent.
 
-**Why the estimate is expected to be optimistic.** Seven prompt variants, a
+**Why the estimate is expected to be optimistic.** Six prompt variants, a
 five-point `body_chars` sweep and a threshold sweep were all selected against
 the same dev 140, three of the prompt rounds tuned by reading specific errors.
 The dev figures are biased upward by an unknown amount and the holdout is the

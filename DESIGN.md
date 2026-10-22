@@ -213,7 +213,8 @@ run and can leave it carrying two different category labels.
 
 Removing `INBOX` is the agent's most consequential write action and the
 mechanism behind the end-state goal: **the inbox only ever contains
-`Agent/To Action` and `Agent/Needs Review` items.**
+`KEEPS_INBOX` mail — `Agent/To Action`, `Agent/Personal`, `Agent/Bookings` —
+and `Agent/Needs Review` items.**
 
 ### Dry-run mode
 
@@ -222,8 +223,9 @@ pre-filter, classify, decide labels, **write to the classification log** —
 but applies no label changes and removes no `INBOX` labels. Intended actions
 are reported to the webapp and to stdout.
 
-This is not optional polish: the first backfill run touches ~3000 emails
-using a model whose accuracy hasn't been validated yet. Dry-run first,
+This is not optional polish: the first backfill run touches 18,668 emails
+(measured in `docs/BACKLOG.md`; the original estimate was ~3000), and the
+model's accuracy has only been validated on a 200-message sample. Dry-run first,
 inspect the log, then enable writes.
 
 Because dry runs write to the log, the Metrics view works normally during a
@@ -251,10 +253,20 @@ id isn't possible without a DB; bounding by time is, and is sufficient.
 
 ### Pre-filter (before calling the model)
 
-- A sender-domain allowlist (JSON list of known promotional domains) checked
-  first. A match routes straight to `Agent/Promotions` + `Agent/Processed`,
-  `INBOX` removed, no LLM call made.
-- Anything not matched goes to the classifier with the five real categories
+Two deterministic rules, both in `app/prefilter.py`, checked in this order:
+
+- **The reply rule, first.** A subject opening `Re:`, `Fw:` or `Fwd:` routes
+  to `Agent/Personal` + `Agent/Processed` with `INBOX` **retained**, no LLM
+  call made (`decision.decide_reply_hit()`). It can only move mail *into* the
+  keeps-`INBOX` set, so its worst case is clutter, never a costly error. Added
+  at the end of Phase 2 because the model reads `Personal` poorly and the
+  holdout's one costly error was a human-written reply archived as
+  `Promotions`. It runs before the allowlist so a `Re:` from an allowlisted
+  domain stays visible. Logged with `source: reply`.
+- **The sender-domain allowlist** (JSON list of known promotional domains). A
+  match routes straight to `Agent/Promotions` + `Agent/Processed`, `INBOX`
+  removed, no LLM call made.
+- Anything matched by neither goes to the classifier with the six categories
   as options.
 - The allowlist starts short and manually seeded, growing as I notice repeat
   senders that keep landing in Needs Review or get misclassified.
@@ -616,7 +628,7 @@ the Metrics view silently averages across two models.
 | `timestamp` | ordering, rotation |
 | `message_id` | join back to Gmail; dedup |
 | `sender`, `subject` | human-readable identification when reviewing |
-| `source` | `model` / `prefilter` / `correction` — prefilter hits never reach the model, corrections come from reconciliation |
+| `source` | `model` / `prefilter` / `reply` / `correction` — prefilter and reply-rule hits never reach the model, corrections come from reconciliation. `reply` is added to `logbook.Source` in Phase 3 with the call site |
 | `category` | the argmax |
 | `confidence` | the winning probability |
 | `distribution` | **all six probabilities.** The runner-up drives the asymmetric `To Action` rule, and a saturated distribution is only visible here |
@@ -909,10 +921,14 @@ Not built preemptively.
 - **Gmail access:** `google-api-python-client` + OAuth. **Web application**
   client type — *not* Desktop/installed-app — with redirect URI
   `http://localhost:8000/auth/callback` (Google permits plain HTTP for
-  localhost). `gmail.modify` scope, required for label changes.
-- **LLM inference:** Ollama, local model (assumption: `llama3.1:8b` or
-  `qwen2.5:7b-instruct` — confirm once hardware is tested), called with
-  schema-constrained structured output
+  localhost). Scope widens in steps: `gmail.readonly` through Phase 2,
+  `gmail.readonly` + `gmail.labels` for label creation at the start of Phase
+  3, then `gmail.modify` — required for changing a message's labels — once
+  the label queries are verified.
+- **LLM inference:** Ollama, local `llama3.1:8b` (chosen in Phase 2 — see
+  Model selection), called for a single letter with `logprobs: true`;
+  confidence is the renormalised first-token distribution (see
+  Classification logic)
 - **Frontend:** Plain HTML/JS single page to start
 - **Config:** single JSON file on disk, loaded once at startup into an
   in-memory object, written through on save from the Settings page
@@ -967,34 +983,49 @@ inside the same FastAPI app the webapp uses, sharing the Gmail client, Ollama
 client, and config. Splitting into multiple repos would mean duplicating
 shared code for no benefit at this scale.
 
+Files marked `(Phase N)` do not exist yet; everything else does.
+
 ```
 email-agent/
   app/
     main.py             # FastAPI app + routes ONLY — thin, no logic
-    agent.py            # poll loop, classify_and_label(), reconcile step
+    agent.py            # (Phase 3) classify_and_label(); poll loop + reconcile (Phase 4)
     decision.py         # pure decision logic: distribution -> labels
     categories.py       # the six categories, letter mapping, label names
-    classifier.py       # Ollama calls, prompt templates, category defs
+    classifier.py       # Ollama calls, prompt registry, distribution parsing
     auth.py             # OAuth routes, token storage, credential validation
-    gmail_client.py     # label ops, message fetching, batchModify
-    prefilter.py        # sender-domain allowlist matching
+    gmail_client.py     # message fetching; atomic messages.modify (Phase 3)
+    message_body.py     # pure: plain-vs-HTML choice, stripping, EXTRACTION_VERSION
+    prefilter.py        # the reply rule and the sender-domain allowlist
     logbook.py          # append/read the JSONL classification log
     config.py           # load/save config, defaults, in-memory state
-    backfill.py         # paginated sweep, resumable, progress tracking
-    metrics.py          # aggregate log + eval results for the Metrics view
-  frontend/             # dashboard: status, start/stop, settings, backfill, metrics
-  eval/
+    evalset.py          # pure: eval sample strata, drawing, splits, weights
+    evallabel.py        # pure: label records, corrections, cache, recheck draw
+    evalrun.py          # eval predict: Ollama calls, results files
+    evalscore.py        # pure eval scoring: accuracy, action matrix, calibration
+    backfill.py         # (Phase 4) paginated sweep, resumable, progress tracking
+    metrics.py          # (Phase 5) aggregate log + eval results for the Metrics view
+  frontend/             # (Phase 5) dashboard: status, start/stop, settings, metrics
+  eval/                 # data only, no code (see docs/PHASE2_PLAN.md, A8)
+    sample.jsonl        # the stratified sample plan
+    strata.json         # strata and the pinned frame window
     labeled.jsonl       # hand-labeled eval set (message ids + labels, no content)
-    run_eval.py         # score current model+prompt; accuracy, confusion, calibration
+    recheck.json        # the pinned blind-recheck draw
+    results/            # one JSONL per eval run
+    RESULTS.md          # every run, scored and annotated
   scripts/
-    setup_labels.py     # idempotent label creation (check-then-create)
-    spike_ollama.py     # Phase 0: latency, schema compliance, confidence method
-    spike_labels.py     # Phase 0: label-position bias, temperature
-    undo_run.py         # strip Agent/ labels, restore INBOX — time-window REQUIRED
+    label_eval.py       # sample / label / recheck / verify CLI
+    run_eval.py         # predict / score CLI
+    setup_labels.py     # (Phase 3) idempotent label creation (check-then-create)
+    undo_run.py         # (Phase 3) strip Agent/ labels, restore INBOX — time-window REQUIRED
+    smoke_classify.py   # live plumbing check of the classifier against Ollama
+    measure_*.py        # mailbox and extraction measurements behind docs/BACKLOG.md
+    spike_*.py          # Phase 0 throwaway spikes; exempt from ruff
   data/                 # config.json, oauth token, classifications.jsonl — gitignored
   tests/
   docs/
     PLAN.md             # phased build order and gates
+    PHASE2_PLAN.md      # how Phase 2 was built, amendments, and its results
     BACKLOG.md          # mailbox survey: real volume, ages, body lengths
   config.example.json
   prefilter_domains.json
