@@ -2,27 +2,26 @@
 
 Personal Gmail classification agent. Read `DESIGN.md` for what and why,
 `docs/PLAN.md` for the phases and their gates, and the current phase's own
-plan - `docs/PHASE2_PLAN.md` - for how this phase is being built and where the
-code has deliberately diverged from it.
+plan for how that phase is being built and where the code has deliberately
+diverged from it.
 
-**Current phase: 2 complete — Phase 3 (the writer end) is next.**
+**Current phase: 3 — the writer. Not yet planned.** Phase 2 is complete
+(gate passed 2026-09-14, all eight build steps done). The first piece of
+Phase 3 work is writing and agreeing `docs/PHASE3_PLAN.md`, built from
+`docs/PLAN.md` → Phase 3; no Phase 3 code exists yet.
 
-This file is the single source of truth for which **phase** is current;
-`docs/PHASE2_PLAN.md` → Build order is the single source of truth for which
-**step**, and records what each finished step produced. Check the build order
-before planning anything - steps 1-6 are done (200 hand-labelled messages, a
-working harness, and the sweeps finished), and the phase plan's §1-§6 describe
-the phase as originally agreed, not as it stands. **Step 6 results** near the
-end of that document holds the measured configuration and three findings that
-change the design: the `to_action_floor` is inert on this model, `Bookings`
-now keeps `INBOX`, and `body_chars` should be 300 rather than 1500. Step 3 also added a **labelling rules** section,
-which is the decision procedure ground truth was built with and the one step
-7's recheck has to reapply.
+This file is the single source of truth for which **phase** is current; the
+current phase plan's Build order is the single source of truth for which
+**step**, and records what each finished step produced.
 
-Start there rather than at the top of `DESIGN.md`: the phase plan's
-**amendment log** lists every place the build knowingly departed from the
-agreed design, which is the context that would otherwise be lost between
-sessions.
+**`docs/PHASE2_PLAN.md` is now the record of how the classifier was chosen.**
+Read its **amendment log** for every place the build knowingly departed from
+the agreed design, **Step 6 results** for the measured configuration (the
+`to_action_floor` is inert on this model, `Bookings` keeps `INBOX`,
+`body_chars` is 300), **Step 8** for the holdout and the reply rule it forced,
+and the **labelling rules** section for the decision procedure ground truth
+was built with - which is also how the Phase 3 large dry run should be judged.
+Its §1-§6 describe the phase as originally agreed, not as it stands.
 
 ## How we work
 
@@ -51,9 +50,12 @@ worth nothing here.
 
 ## Hard rules
 
-- **Scope is `gmail.readonly` until Phase 3.** Do not request or use
-  `gmail.modify` before then. Phases 0–2 must be incapable of modifying the
-  inbox, not merely unlikely to.
+- **Scope is `gmail.readonly` until Phase 3, and widens in two deliberate
+  steps.** Phases 0–2 must be incapable of modifying the inbox, not merely
+  unlikely to. Phase 3 first adds `gmail.labels` - enough to create the
+  `Agent/` labels, not to touch any message - and moves to `gmail.modify` only
+  after the label queries are verified against the real labels. See
+  `docs/PLAN.md` → Phase 3.
 - **Never commit `data/`.** OAuth credentials, tokens, and the classification
   log live there. Check `.gitignore` before adding files.
 - **No write path ships before `scripts/undo_run.py` exists and has been run

@@ -47,6 +47,11 @@ the build, rather than merely unlikely — a bug in a fetch loop can't remove
 moment: that's the point where the project acquires the ability to do harm,
 and it should feel like a step rather than a default.
 
+Phase 3 takes that step in two parts. Creating the `Agent/` labels is itself a
+write, so it first re-consents to `gmail.readonly` + `gmail.labels` — label
+management only, still unable to change a message — and moves to
+`gmail.modify` only once the label queries are verified.
+
 ---
 
 ## Phase overview
@@ -393,8 +398,9 @@ distribution nearly one-hot, and this replicated on the holdout. `T + F = 0.95
   `p(Bookings)` ninefold and still lost to the literal token. Documented as a
   measured limit rather than an open question.
 
-**The method finding worth keeping.** Three of the eight prompt variants failed,
-and the two most instructive failed in the same way: a metric improving because
+**The method finding worth keeping.** Four of the six prompt variants tried
+against `v1` were rejected (`v2`, `v8`, `v4`, `v10`), and the two most
+instructive failed in the same way: a metric improving because
 confidence *dropped*. `v4-format` and `v10-itinerary` both reached zero costly
 errors by hedging messages into `Needs Review` rather than by classifying them
 correctly, and `v10` did it while raising six-way accuracy to the best of any
@@ -408,9 +414,19 @@ with better headline numbers.
 
 **Goal:** first write access. Handled carefully.
 
+> How it gets built: `docs/PHASE3_PLAN.md`, to be written and agreed before
+> any of the steps below.
+
 **Build, in this order — the order is the point:**
-1. `scripts/setup_labels.py` — idempotent label creation, all seven labels
-   plus `Agent/Error`
+1. **Re-auth to `gmail.readonly` + `gmail.labels`**, then
+   `scripts/setup_labels.py` — idempotent label creation, all nine: the six
+   category labels, `Agent/Needs Review`, `Agent/Processed` and `Agent/Error`.
+   Label creation is a write and cannot run on `gmail.readonly` alone.
+   `gmail.labels` is the narrowest scope that allows it: it can create, rename
+   and delete *labels* but cannot change which labels a *message* carries, so
+   a bug at this step still cannot remove `INBOX` from anything. The cost is
+   one extra consent screen; the benefit is that "can modify mail" stays its
+   own deliberate step (3) rather than arriving with the label setup.
 2. **Verify the label queries against the real nested labels.** Label names
    contain spaces and are nested under `Agent/`. That `label:` resolves a
    multi-word name by longest match is measured (see `DESIGN.md` → Label
@@ -419,16 +435,22 @@ with better headline numbers.
    `label:"Agent/To Action"` and the `UNPROCESSED_TERMS` negations return the
    counts they should, before any query is trusted to decide what gets
    processed. A wrong queue query does not error, it silently changes which
-   mail the agent sees.
-3. **Re-auth to `gmail.modify`.** The project can now do damage.
+   mail the agent sees. Still no message writes: apply a label to a handful
+   of messages by hand in the Gmail UI to give the queries something to find.
+3. **Re-auth to `gmail.modify`.** The project can now do damage. (`modify`
+   includes label management, so `gmail.labels` is not needed alongside it.)
+   This consent also settles the Phase 0 refresh-token question — the
+   Phase 2 token, consented 2026-09-08, will have expired by now; record when
+   it actually did.
 4. **`scripts/undo_run.py` — before anything writes in anger.** Required
    time-window argument, no default. Test it by hand-applying `Agent/`
    labels to five throwaway messages and confirming it strips them cleanly.
    **It must sweep `{label:"Agent/Processed" label:"Agent/Error"}`, not just
    `Processed`** — see Phase 1's findings on the three mailbox states. Build
    the query from `STOP_LABELS`; an undo that covers one branch is incomplete.
-5. `app/gmail_client.py` — fetch, and the single atomic `messages.modify`
-   call
+5. `app/gmail_client.py` — the single atomic `messages.modify` call. The read
+   half already exists from Phase 2; `test_gmail_client_contains_no_write_call`
+   must be updated deliberately to allow exactly this call, not deleted
 6. `app/agent.py` — `classify_and_label()`, honouring `dry_run`. **Wire in the
    reply rule**: `prefilter.is_reply(subject)` → `decision.decide_reply_hit()`,
    checked **before** the sender allowlist, so a `Re:` from an allowlisted
@@ -442,7 +464,7 @@ with better headline numbers.
 **Gate — a deliberate escalation, not one step:**
 - Dry run over ~50 messages; read the log; the intended actions look right
 - **Then a larger dry run — a few hundred — read as a second eval, not as a
-  plumbing check.** Phase 2's dev set absorbed eight prompt variants and three
+  plumbing check.** Phase 2's dev set absorbed six prompt variants and three
   sweeps, so its 0.771 is optimistic by an unknown amount and the holdout is
   spent. A dry run over mail no tuning has ever seen costs nothing, writes
   nothing, and is the only cheap instrument left for that question. If it
