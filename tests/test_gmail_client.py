@@ -1,4 +1,6 @@
-"""Gmail access: the MIME walk, pagination, and the read-only guarantee.
+"""Gmail access: the MIME walk, pagination, label lookup and creation.
+
+What may reach the API, and from where, is tested in `test_write_guard.py`.
 
 The walk is pure - it takes the payload dict - so the three real tree shapes
 are tested directly. Only the API calls need a fake service, and it is a hand
@@ -12,11 +14,9 @@ Tree shapes are taken from real mail; see the module docstring of
 
 from __future__ import annotations
 
-import ast
 import base64
 import datetime as dt
 import json
-from pathlib import Path
 
 import pytest
 from googleapiclient.errors import HttpError
@@ -24,11 +24,15 @@ from googleapiclient.errors import HttpError
 from app import gmail_client
 from app.gmail_client import (
     Message,
+    MissingLabels,
     NotAuthenticated,
     collect_text_parts,
     count,
+    create_label,
     fetch,
+    fetch_raw,
     header,
+    label_ids,
     search_ids,
 )
 
@@ -259,15 +263,36 @@ class FakeMessages:
         return FakeExecutable(self._message)
 
 
+class FakeLabels:
+    def __init__(self, existing: dict[str, str] | None = None):
+        self._existing = dict(existing or {})
+        self.list_calls: list[dict] = []
+        self.create_calls: list[dict] = []
+
+    def list(self, **kwargs):
+        self.list_calls.append(kwargs)
+        return FakeExecutable(
+            {"labels": [{"name": n, "id": i} for n, i in self._existing.items()]}
+        )
+
+    def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return FakeExecutable({"id": "Label_new", "name": kwargs["body"]["name"]})
+
+
 class FakeService:
-    def __init__(self, messages: FakeMessages):
+    def __init__(self, messages: FakeMessages | None = None, labels: FakeLabels | None = None):
         self._messages = messages
+        self._labels = labels
 
     def users(self):
         return self
 
     def messages(self):
         return self._messages
+
+    def labels(self):
+        return self._labels
 
 
 def test_search_ids_paginates_to_the_end():
@@ -492,22 +517,54 @@ def test_jitter_is_equal_not_full_so_retries_span_the_window(monkeypatch):
     assert sum(slept) > 30
 
 
-# --- the read-only guarantee ---------------------------------------------
+# --- labels ----------------------------------------------------------------
 
 
-def test_gmail_client_contains_no_write_call():
-    """CLAUDE.md requires Phases 0-2 to be INCAPABLE of modifying the inbox,
-    not merely unlikely to. The gmail.readonly token is the backstop; this is
-    the guarantee. Phase 3 adds messages.modify and updates this deliberately.
-    """
-    forbidden = {
-        "modify", "batchModify", "trash", "untrash", "delete", "batchDelete",
-        "insert", "send", "create", "update", "patch",
-    }
-    source = Path(gmail_client.__file__).read_text()
-    called = {
-        node.func.attr
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-    assert not called & forbidden, f"write calls: {sorted(called & forbidden)}"
+def test_fetch_raw_returns_the_whole_response_through_execute(monkeypatch):
+    """measure_bodies needs more than Message carries, and used to call the
+    API directly - without backoff. It goes through here now."""
+    executed = []
+    real_execute = gmail_client._execute
+    monkeypatch.setattr(
+        gmail_client, "_execute", lambda r: executed.append(r) or real_execute(r)
+    )
+    response = {"id": "m1", "payload": {"headers": []}, "sizeEstimate": 1234}
+    messages = FakeMessages(message=response)
+
+    assert fetch_raw(FakeService(messages), "m1") == response
+    assert len(executed) == 1
+    assert messages.get_calls == [{"userId": "me", "id": "m1", "format": "full"}]
+
+
+LABELS = {"INBOX": "INBOX", "Agent/To Action": "Label_1", "Agent/Processed": "Label_2"}
+
+
+def test_label_ids_maps_every_requested_name_and_nothing_else():
+    labels = FakeLabels(LABELS)
+    ids = label_ids(FakeService(labels=labels), ["Agent/To Action", "Agent/Processed"])
+    assert ids == {"Agent/To Action": "Label_1", "Agent/Processed": "Label_2"}
+    assert len(labels.list_calls) == 1
+
+
+def test_label_ids_names_every_missing_label_not_just_the_first():
+    """One rerun of setup should fix all of them."""
+    with pytest.raises(MissingLabels) as raised:
+        label_ids(
+            FakeService(labels=FakeLabels(LABELS)),
+            ["Agent/Processed", "Agent/Receipts", "Agent/Error"],
+        )
+    assert raised.value.missing == ["Agent/Error", "Agent/Receipts"]
+
+
+def test_label_ids_does_not_match_a_case_variant():
+    """A case variant is a different label here; setup_labels reports the
+    clash rather than this quietly accepting it."""
+    labels = FakeLabels({"agent/to action": "Label_9"})
+    with pytest.raises(MissingLabels):
+        label_ids(FakeService(labels=labels), ["Agent/To Action"])
+
+
+def test_create_label_sends_only_the_name_and_returns_the_id():
+    labels = FakeLabels()
+    assert create_label(FakeService(labels=labels), "Agent/Receipts") == "Label_new"
+    assert labels.create_calls == [{"userId": "me", "body": {"name": "Agent/Receipts"}}]

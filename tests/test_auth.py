@@ -151,3 +151,102 @@ def test_exchange_records_consent_timestamp(monkeypatch):
     stored = json.loads(auth.TOKEN_PATH.read_text())
     assert "consented_at" in stored
     assert stored["credentials"]["refresh_token"] == "r"
+
+
+# ---------- granted scopes ----------
+#
+# What the token can do is what Google GRANTED, which the library reads from
+# the token response and then drops on serialisation. These pin that it is
+# captured, kept, and checked - and that its absence fails closed.
+
+
+def write_granted(granted: list[str] | None) -> None:
+    payload = {"credentials": {"token": "x"}, "consented_at": auth._now().isoformat()}
+    if granted is not None:
+        payload["granted_scopes"] = granted
+    auth.TOKEN_PATH.write_text(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "granted, expected",
+    [
+        ([auth.READONLY, auth.LABELS], [auth.LABELS, auth.READONLY]),
+        # Google's raw `scope` field is one space-separated string.
+        (f"{auth.READONLY} {auth.LABELS}", [auth.LABELS, auth.READONLY]),
+    ],
+)
+def test_consent_records_what_google_granted(monkeypatch, granted, expected):
+    auth._pending_flows["s1"] = "v"
+    flow = FakeFlow()
+    flow.credentials.granted_scopes = granted
+    monkeypatch.setattr(auth, "_flow", lambda: flow)
+
+    auth.exchange_code("code", "s1")
+
+    assert json.loads(auth.TOKEN_PATH.read_text())["granted_scopes"] == expected
+    assert auth.granted_scopes() == frozenset(expected)
+
+
+def test_a_refresh_keeps_the_recorded_grant(monkeypatch):
+    """Refreshing changes the access token, not the consent - same as
+    consented_at."""
+    write_granted([auth.READONLY])
+
+    class ExpiredCredentials(FakeCredentials):
+        valid = False
+        expired = True
+        refresh_token = "r"
+
+        @classmethod
+        def from_authorized_user_info(cls, info, scopes):
+            return cls()
+
+        def refresh(self, request):
+            pass
+
+    monkeypatch.setattr(auth, "Credentials", ExpiredCredentials)
+    assert auth.load_credentials() is not None
+    assert auth.granted_scopes() == frozenset({auth.READONLY})
+
+
+def test_no_recorded_grant_means_nothing_granted():
+    """Today's token predates recording. Unknown is not assumed to be what
+    was requested."""
+    write_granted(None)
+    assert auth.granted_scopes() == frozenset()
+    with pytest.raises(auth.InsufficientScope, match="nothing recorded"):
+        auth.require_scope(auth.READONLY)
+
+
+def test_no_token_at_all_means_nothing_granted():
+    assert auth.granted_scopes() == frozenset()
+
+
+@pytest.mark.parametrize(
+    "granted, needed, ok",
+    [
+        ([auth.READONLY], auth.READONLY, True),
+        ([auth.READONLY, auth.LABELS], auth.LABELS, True),
+        # modify covers both narrower scopes - the one place that rule lives
+        ([auth.MODIFY], auth.LABELS, True),
+        ([auth.MODIFY], auth.READONLY, True),
+        # labels and readonly are siblings, not nested
+        ([auth.LABELS], auth.READONLY, False),
+        ([auth.READONLY], auth.LABELS, False),
+        ([auth.READONLY, auth.LABELS], auth.MODIFY, False),
+    ],
+)
+def test_require_scope(granted, needed, ok):
+    write_granted(granted)
+    if ok:
+        auth.require_scope(needed)
+    else:
+        with pytest.raises(auth.InsufficientScope, match=needed):
+            auth.require_scope(needed)
+
+
+def test_status_reports_granted_not_requested(credentials_ok, monkeypatch):
+    """The confusion being fixed: SCOPES is what we ask for, not what we have."""
+    monkeypatch.setattr(auth, "SCOPES", [auth.MODIFY])
+    write_granted([auth.READONLY])
+    assert auth.status()["granted_scopes"] == [auth.READONLY]

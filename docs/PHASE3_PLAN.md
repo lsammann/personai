@@ -463,10 +463,17 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 ## Build order
 
-**Current step: 1** (not started).
+**Current step: 2** (not started).
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
-   no consent, no API calls
+   no consent, no API calls. **Done 2026-11-02.** Produced
+   `tests/test_write_guard.py` (allowlist over `.users()` chains; replaces
+   `test_gmail_client_contains_no_write_call`), `gmail_client.fetch_raw` /
+   `label_ids` / `create_label` / `MissingLabels`,
+   `auth.granted_scopes` / `require_scope` / `InsufficientScope` with the
+   grant recorded in `token.json`, and `measure_bodies` routed through
+   `fetch_raw`. 461 tests pass. The stored token has no grant record until
+   step 2's consent, so `require_scope` fails closed until then
 2. Consent `readonly + labels` → `setup_labels.py` → run it
 3. `verify_labels.py`, with the expectations written here first → run it
 4. Consent `gmail.modify`; record token dates
@@ -480,3 +487,175 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 Per `CLAUDE.md`, each step is planned in its own section before it is
 written, and nothing is committed by Claude.
+
+---
+
+## Step 1 implementation
+
+**Status: agreed and built, 2026-11-02.** Code and tests only: no
+consent, no API calls, `SCOPES` unchanged. Where this differs from §1, this
+section is newer, and each difference is marked.
+
+### What reading the code turned up
+
+- **A write-verb denylist cannot run repo-wide.** §1 bans calls named
+  `update`, `create`, `insert`, `send`, `delete` and so on across `app/` and
+  `scripts/`. Plain Python uses the same names: `app/evalset.py:317` is
+  `taken.update(picks)` on a set, and would fail the guard on day one.
+  Excluding the test by receiver type isn't possible either, because the AST
+  carries no types.
+- **The granted scopes exist, then get thrown away.** After `fetch_token`,
+  `google_auth_oauthlib` builds the credentials with
+  `granted_scopes=session.token.get("scope")`, which is Google's answer. But
+  `Credentials.to_json()` does not serialise `granted_scopes`, and
+  `from_authorized_user_info(info, SCOPES)` sets `.scopes` to the requested
+  list. So the stored token records only what was asked for. The token on
+  disk today has no granted record at all.
+- **`scripts/measure_bodies.py:219` bypasses `_execute`,** so it gets none of
+  the backoff. Routing it through `gmail_client` fixes that too.
+- **`scripts/spike_labels.py`** is Ollama-only and never touches Gmail. It
+  needs nothing.
+
+### The guard: an allowlist of API calls, not a denylist of verbs (changes §1)
+
+Every Gmail API call goes through `svc.users()`. That is the one shape that
+identifies an API call without knowing types, so the guard keys on it:
+
+1. **Imports.** No file under `app/` or `scripts/` imports `googleapiclient`
+   except `app/gmail_client.py` and the exempt file.
+2. **No API calls outside `gmail_client`.** No file except
+   `app/gmail_client.py` and the exempt file contains a call to `.users()`.
+3. **`gmail_client`'s API calls are exactly an allowlist.** For each call
+   chain rooted at `.users()`, record the names after it, such as
+   `("messages", "get")`. The set found must **equal**:
+
+   ```python
+   ALLOWED_API_CALLS = {
+       ("messages", "list"),   # search_refs
+       ("messages", "get"),    # fetch_raw
+       ("labels", "list"),     # label_ids          (new, step 1)
+       ("labels", "create"),   # create_label       (new, step 1)
+   }
+   ```
+
+   Step 5 adds `("messages", "modify")` in its own diff.
+
+Why an allowlist:
+
+- It fails closed. A write verb nobody thought to list (`batchModify`,
+  `import_`, `settings().filters().create`) is still caught, because it is not
+  on the list.
+- New *reads* show up in a diff too, which costs nothing.
+- `set.update` and similar are never `.users()`-rooted, so they are never seen.
+
+A chain that does not resolve cleanly also fails. That includes binding a
+resource to a variable (`m = svc.users().messages()` records
+`("messages",)`, which is not on the list) and `getProfile` with no resource.
+Limit, stated in the docstring: this catches mistakes, not deliberate evasion
+(`getattr(svc, "users")`). Scope is the backstop for that.
+
+**The exemption.** `EXEMPT = {"scripts/spike_gmail.py"}`, an exact path,
+commented with why. A test asserts every exempt path still exists, so a
+stale exemption can't linger after the file is gone. The script gains a
+header comment: exempt from `tests/test_write_guard.py`, builds its own
+client, must stay read-only.
+
+`test_gmail_client_contains_no_write_call` is removed and the new module's
+docstring says it replaces it with a strict superset.
+
+### `app/gmail_client.py`
+
+```python
+def fetch_raw(svc, message_id: str) -> dict:
+    """The full messages.get response, through _execute. fetch() is built on it."""
+
+def label_ids(svc, names: Collection[str]) -> dict[str, str]:
+    """name -> id for every requested label, by exact name.
+    Raises MissingLabels naming *all* the missing ones, not just the first."""
+
+def create_label(svc, name: str) -> str:
+    """Create one user label; return its id."""
+```
+
+- `fetch` becomes `fetch_raw` plus parsing, with no behaviour change. This
+  gives `measure_bodies` the raw payload it needs.
+- `create_label` sends `{"name": name}` only and accepts Gmail's default
+  visibility.
+- `create_label` is not idempotent, but `_execute` still wraps it. If a
+  create succeeds and the response is lost to a 5xx, the retry gets 409
+  "already exists". 409 is not retryable, so it raises. Rerunning
+  `setup_labels` (idempotent) then finds the label. A loud failure is
+  correct here.
+- `MissingLabels(GmailError)` is new.
+- The module docstring changes: "read-only" becomes "one write so far,
+  `labels.create`", pointing at the guard.
+
+### `app/auth.py`
+
+```python
+READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+LABELS   = "https://www.googleapis.com/auth/gmail.labels"
+MODIFY   = "https://www.googleapis.com/auth/gmail.modify"
+SCOPES = [READONLY]                      # unchanged until step 2
+
+_IMPLIES = {MODIFY: frozenset({LABELS, READONLY})}
+
+class InsufficientScope(Exception): ...
+
+def granted_scopes() -> frozenset[str]: ...
+def require_scope(scope: str) -> None: ...
+```
+
+- **Storage.** `_write_token` saves `"granted_scopes"` at the top level of
+  `token.json`, next to `consented_at` and for the same reason: it is a fact
+  about the consent, not about the access token. On consent it comes from
+  `creds.granted_scopes`, normalised from list or space-separated string to a
+  sorted list. A refresh keeps the stored value, as it keeps `consented_at`.
+- **No record means nothing granted.** `granted_scopes()` returns an empty
+  set when the record is missing, which is the case for today's token. So
+  `require_scope` fails closed until the next consent, which step 2 makes
+  anyway.
+- **Existing scripts are unaffected.** No existing read-only script calls
+  `require_scope` in this step, so nothing breaks before re-consent. The
+  first callers are `setup_labels` (step 2) and `run_pass` / `undo_run`.
+- **`InsufficientScope` lives in `auth`,** not as a subclass of
+  `gmail_client.NotAuthenticated`, because `gmail_client` imports `auth`.
+  The other direction would be circular. Its message names the missing scope
+  and says to reconnect via `/auth/start`.
+- **`status()`** reports `"granted_scopes"` instead of `SCOPES`.
+  `main.py`'s status line shows "not recorded, reconnect" when the set is
+  empty.
+
+### Tests
+
+- `tests/test_write_guard.py`: the three rules above, run against the real
+  tree. Then each rule against small synthetic sources, to prove the test can
+  fail:
+  - a `.users().messages().trash()` chain
+  - an aliased resource
+  - a `googleapiclient` import in a script
+  - a `set.update` (must *not* fail)
+
+  Plus: the exempt paths exist.
+- `test_gmail_client.py`:
+  - `fetch_raw` goes through `_execute`, and `fetch` still parses it
+    unchanged
+  - `label_ids` with all present, one missing, several missing (all named),
+    and a case-variant name that does not match
+  - `create_label` sends the name and returns the id
+- `test_auth.py`:
+  - consent stores the granted set, in both list and string form
+  - refresh keeps it
+  - a missing record gives an empty set
+  - `require_scope`: an exact match passes; `MODIFY` satisfies `LABELS` and
+    `READONLY`; `LABELS` does not satisfy `READONLY` or the reverse; an
+    empty record raises, naming the scope
+  - `status()` reports granted rather than requested: patch `SCOPES` to
+    differ and check that the output follows the token
+
+### Files touched
+
+`app/gmail_client.py`, `app/auth.py`, `app/main.py` (one status line),
+`scripts/measure_bodies.py`, `scripts/spike_gmail.py` (header comment only),
+`tests/test_write_guard.py` (new), `tests/test_gmail_client.py`,
+`tests/test_auth.py`. No new dependencies.

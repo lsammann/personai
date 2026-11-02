@@ -5,13 +5,14 @@ nothing about what the model should read - choosing between the plain and HTML
 parts is model-input policy and lives in `message_body`. `fetch()` therefore
 returns both text parts, raw and decoded, and expresses no preference.
 
-**Read-only until Phase 3.** `CLAUDE.md` requires Phases 0-2 to be incapable
-of modifying the inbox rather than merely unlikely to, and the token carries
-`gmail.readonly`, so a write here would fail at the API. That is a backstop,
-not the guarantee: a test parses this module and fails if a modify, trash or
-delete call appears in it, the same way a test guards the purity of
-`decision`. Phase 3 adds the single atomic `messages.modify` call and updates
-that test deliberately.
+**The only door to the Gmail API.** No other module in `app/` or `scripts/`
+may call `svc.users()`, and every API call made here must be on an explicit
+allowlist - both enforced by `tests/test_write_guard.py`. Writes so far: one,
+`labels.create` (Phase 3 step 1), which can create a label but cannot touch a
+message. Step 5 adds the single atomic `messages.modify` and widens the
+allowlist by exactly that call. The granted OAuth scope is the backstop
+underneath: until step 4 the token cannot modify a message even if code
+tried.
 
 The MIME walk is the substantial part. An email is headers plus one blob of
 text at the wire level; MIME is the convention that lets one message carry
@@ -47,6 +48,7 @@ import base64
 import datetime as dt
 import random
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from google.oauth2.credentials import Credentials
@@ -116,6 +118,22 @@ class NotAuthenticated(GmailError):
     expired refresh token fails identically every time and needs a human to
     re-consent.
     """
+
+
+class MissingLabels(GmailError):
+    """One or more required labels do not exist in the mailbox.
+
+    Raised by `label_ids` so a run fails closed: classifying into a label
+    that is not there would mean either a 400 per message or, worse, a
+    silent fallback.
+    """
+
+    def __init__(self, missing: Collection[str]):
+        self.missing = sorted(missing)
+        super().__init__(
+            "Missing labels: " + ", ".join(self.missing)
+            + ". Run scripts/setup_labels.py."
+        )
 
 
 @dataclass(frozen=True)
@@ -275,6 +293,18 @@ def count(svc, query: str) -> int:
     return len(search_ids(svc, query))
 
 
+def fetch_raw(svc, message_id: str) -> dict:
+    """The full `messages.get` response, unparsed.
+
+    For measurement scripts that need more of the payload than `Message`
+    carries. Exists so they reach the API through here, with backoff, rather
+    than calling `svc.users()` themselves.
+    """
+    return _execute(
+        svc.users().messages().get(userId="me", id=message_id, format="full")
+    )
+
+
 def fetch(svc, message_id: str) -> Message:
     """One message, with both text parts decoded.
 
@@ -284,9 +314,7 @@ def fetch(svc, message_id: str) -> Message:
     recovery path for a genuine failure, not a substitute for handling a
     rate limit that normal operation trips on its own.
     """
-    payload_response = _execute(
-        svc.users().messages().get(userId="me", id=message_id, format="full")
-    )
+    payload_response = fetch_raw(svc, message_id)
     payload = payload_response.get("payload", {})
     parts = collect_text_parts(payload)
     return Message(
@@ -299,6 +327,35 @@ def fetch(svc, message_id: str) -> Message:
         text_html=parts.get("text/html", ""),
         label_ids=tuple(payload_response.get("labelIds", []) or ()),
     )
+
+
+def label_ids(svc, names: Collection[str]) -> dict[str, str]:
+    """name -> id for every requested label, matched by exact name.
+
+    One `labels.list` call. Raises `MissingLabels` naming every absent label,
+    not just the first, so one rerun of setup fixes all of them. Exact match
+    only: a case variant is a different label as far as this is concerned,
+    and `setup_labels` is where a clash gets reported.
+    """
+    response = _execute(svc.users().labels().list(userId="me"))
+    by_name = {label["name"]: label["id"] for label in response.get("labels", [])}
+    missing = [name for name in names if name not in by_name]
+    if missing:
+        raise MissingLabels(missing)
+    return {name: by_name[name] for name in names}
+
+
+def create_label(svc, name: str) -> str:
+    """Create one user label and return its id.
+
+    Name only; Gmail's default visibility (shown in the sidebar and on
+    messages) is what the agent's labels want. Not idempotent, but still
+    wrapped in `_execute`: if a create succeeds and its response is lost to a
+    5xx, the retry gets 409 "already exists", which is not retryable and
+    raises. Rerunning `setup_labels`, which is idempotent, then finds it.
+    """
+    response = _execute(svc.users().labels().create(userId="me", body={"name": name}))
+    return response["id"]
 
 
 def collect_text_parts(payload: dict) -> dict[str, str]:

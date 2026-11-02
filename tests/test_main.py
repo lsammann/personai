@@ -25,7 +25,7 @@ def test_index_offers_connect_when_unauthenticated(client):
 def test_index_offers_reconnect_when_connected(client, monkeypatch):
     monkeypatch.setattr(auth, "status", lambda: {
         "connected": True, "needs_auth": False,
-        "scopes": auth.SCOPES, "days_since_consent": 2, "days_remaining": 5,
+        "granted_scopes": [auth.READONLY], "days_since_consent": 2, "days_remaining": 5,
     })
     body = client.get("/").text
     assert "connected" in body
@@ -34,7 +34,7 @@ def test_index_offers_reconnect_when_connected(client, monkeypatch):
 
 def test_index_shows_expiry_warning(client, monkeypatch):
     monkeypatch.setattr(auth, "status", lambda: {
-        "connected": True, "needs_auth": False, "scopes": auth.SCOPES,
+        "connected": True, "needs_auth": False, "granted_scopes": [auth.READONLY],
         "days_since_consent": 6, "days_remaining": 1,
         "expiry_warning": True, "reason": "Gmail access expires in ~1 day(s)",
     })

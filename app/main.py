@@ -29,9 +29,10 @@ def index() -> str:
         banner = (
             f"<p><strong>{s['reason']}</strong></p>" if s.get("reason") else ""
         )
+        granted = ", ".join(s["granted_scopes"]) or "not recorded - reconnect"
         body = (
             "<p>Gmail: <strong>connected</strong> "
-            f"(scope: {', '.join(s['scopes'])})</p>{expiry}{banner}"
+            f"(granted: {granted})</p>{expiry}{banner}"
             '<p><a href="/auth/start">Reconnect Gmail</a></p>'
         )
     else:
