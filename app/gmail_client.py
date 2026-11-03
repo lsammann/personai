@@ -329,16 +329,25 @@ def fetch(svc, message_id: str) -> Message:
     )
 
 
+def all_labels(svc) -> dict[str, str]:
+    """name -> id for every label in the mailbox, system labels included.
+
+    One `labels.list` call; it is not paginated. `setup_labels` needs every
+    name, not just the wanted ones, to see case variants.
+    """
+    response = _execute(svc.users().labels().list(userId="me"))
+    return {label["name"]: label["id"] for label in response.get("labels", [])}
+
+
 def label_ids(svc, names: Collection[str]) -> dict[str, str]:
     """name -> id for every requested label, matched by exact name.
 
-    One `labels.list` call. Raises `MissingLabels` naming every absent label,
-    not just the first, so one rerun of setup fixes all of them. Exact match
-    only: a case variant is a different label as far as this is concerned,
-    and `setup_labels` is where a clash gets reported.
+    Raises `MissingLabels` naming every absent label, not just the first, so
+    one rerun of setup fixes all of them. Exact match only: a case variant is
+    a different label as far as this is concerned, and `setup_labels` is
+    where a clash gets reported.
     """
-    response = _execute(svc.users().labels().list(userId="me"))
-    by_name = {label["name"]: label["id"] for label in response.get("labels", [])}
+    by_name = all_labels(svc)
     missing = [name for name in names if name not in by_name]
     if missing:
         raise MissingLabels(missing)

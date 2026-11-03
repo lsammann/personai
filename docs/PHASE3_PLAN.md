@@ -463,7 +463,7 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 ## Build order
 
-**Current step: 2** (not started).
+**Current step: 3** (not started).
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
    no consent, no API calls. **Done 2026-11-02.** Produced
@@ -474,7 +474,16 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
    grant recorded in `token.json`, and `measure_bodies` routed through
    `fetch_raw`. 461 tests pass. The stored token has no grant record until
    step 2's consent, so `require_scope` fails closed until then
-2. Consent `readonly + labels` → `setup_labels.py` → run it
+2. Consent `readonly + labels` → `setup_labels.py` → run it. **Done
+   2026-11-03.** Consent at `2026-11-03T00:20:50Z`, which starts the 7-day
+   clock. Granted, as stored: `gmail.labels` and `gmail.readonly`, offered by
+   Google as two separate checkboxes. Step 1's grant capture works against a
+   real consent. Preview showed nine to create and no clashes; `--apply`
+   created all nine (`Label_2`..`Label_10`); a rerun showed nine present and
+   nothing to create. No parent `Agent` label exists; the labels appear in
+   the sidebar. Whether a scope change breaks an existing token was **not
+   observed**: the old token had already expired, so re-consent was needed
+   anyway. `require_scope` became `require_scopes` (see the Step 2 section).
 3. `verify_labels.py`, with the expectations written here first → run it
 4. Consent `gmail.modify`; record token dates
 5. `gmail_client.modify_labels` (A1)
@@ -659,3 +668,259 @@ def require_scope(scope: str) -> None: ...
 `scripts/measure_bodies.py`, `scripts/spike_gmail.py` (header comment only),
 `tests/test_write_guard.py` (new), `tests/test_gmail_client.py`,
 `tests/test_auth.py`. No new dependencies.
+
+---
+
+## Step 2 implementation
+
+**Status: done 2026-11-03.** The first consent that
+widens scope, and the first write to the mailbox: nine empty labels. No
+message is touched, and `gmail.labels` cannot touch one.
+
+### Code
+
+**`app/categories.py`** gains the label set and the pure check over it. It
+stays free of I/O, so it remains importable by `decision`.
+
+```python
+# Every label the agent owns. Built from the existing names, never retyped.
+AGENT_LABELS: frozenset[str] = frozenset(
+    {label_for(c) for c in Category} | {NEEDS_REVIEW, *STOP_LABELS}
+)
+
+@dataclass(frozen=True)
+class LabelSetupPlan:
+    present: tuple[str, ...]      # wanted, already exists by exact name
+    to_create: tuple[str, ...]    # wanted, absent
+    clashes: tuple[tuple[str, str], ...]   # (wanted, existing case variant)
+
+def plan_label_setup(existing: Collection[str]) -> LabelSetupPlan: ...
+```
+
+- A clash is an existing name equal to a wanted one under `casefold()` but
+  not exactly (`agent/to action` vs `Agent/To Action`). Gmail treats label
+  names case-insensitively for uniqueness, so creating the wanted one would
+  fail anyway. Reporting the clash beats a 409 halfway through.
+- Labels outside `AGENT_LABELS` (`INBOX`, the reader's own) are ignored.
+
+**`app/gmail_client.py`** gains `all_labels(svc) -> dict[str, str]`, with
+`label_ids` rebuilt on it. This is the same `labels.list` call, so the
+guard's allowlist does not change. `setup_labels` needs every name, not
+only the wanted ones, to see case variants.
+
+**`app/auth.py`:** `SCOPES = [READONLY, LABELS]`.
+
+**`scripts/setup_labels.py`:**
+
+```
+uv run python scripts/setup_labels.py            # prints the plan, creates nothing
+uv run python scripts/setup_labels.py --apply    # creates what is missing
+```
+
+1. `require_scopes(auth.LABELS, auth.READONLY)`. Readonly is not strictly
+   needed for labels, but every later step assumes both, so a partial grant
+   is caught here, the first time it can be.
+
+   *Changed during step 2 (2026-11-03):* step 1's `require_scope(scope)`
+   became `require_scopes(scope, *more)`. Entry points call it once, and the
+   error names every missing scope at once, as `label_ids` does for labels.
+   It takes separate arguments rather than a list, because a list parameter
+   given one string would iterate its characters. Existing tests were
+   amended; none were added. Everywhere above that says `require_scope`
+   now means this.
+2. `all_labels` → `plan_label_setup`.
+3. Any clash: print it and exit non-zero **before creating anything**, even
+   with `--apply`. The script never renames or deletes.
+4. Without `--apply`, print the table (name, present / would create) and
+   stop.
+5. With `--apply`, `create_label` each missing name in sorted order. Then
+   `label_ids(svc, AGENT_LABELS)` re-reads them, which proves all nine exist
+   by the same lookup later steps use. Print name, id, created / already
+   present.
+6. Report whether a bare `Agent` label exists after creation. That is an
+   observation for step 3, not a decision made here.
+
+**Why `--apply`, when the plan said only "create-only":** it matches
+`undo_run.py` and `run_pass.py`. Every script that can write shows its plan
+first, and writing is a deliberate flag. Nine empty labels are easy to remove
+by hand, so this is about consistency more than risk.
+
+### Tests
+
+- `test_categories.py`:
+  - `AGENT_LABELS` has exactly nine members, all starting with
+    `LABEL_PREFIX`, and it is exactly the six `label_for` values plus
+    `NEEDS_REVIEW` and `STOP_LABELS`
+  - `plan_label_setup`:
+    - none present
+    - some present
+    - all present (nothing to create, which is what idempotence means)
+    - a case variant counts as a clash, not as present or to-create
+    - foreign labels are ignored
+- `test_gmail_client.py`: `all_labels` returns every label, and `label_ids`
+  behaves as before.
+- `test_auth.py`: `SCOPES == [READONLY, LABELS]` exactly, so step 4's
+  change has to appear in a diff.
+- `setup_labels.py` itself stays thin and is not unit-tested. Its logic is
+  `plan_label_setup` plus three `gmail_client` calls, each already tested.
+
+### Expected side effect
+
+Changing `SCOPES` probably breaks the current token before re-consent. A
+refresh sends the requested scopes, and Google is expected to refuse a
+refresh that asks for more than was granted. The token then reads as
+`needs_auth`. So the code change and the consent should happen in one
+sitting. Whatever happens is recorded, as it is the first real evidence of
+how the token behaves across a scope change.
+
+### The manual procedure (the human)
+
+1. Land the code; tests pass.
+2. Start the server (`uv run uvicorn app.main:app --port 8000`) and visit
+   `/auth/start`. Google may show separate checkboxes per scope: **tick
+   both.** If Google refuses `gmail.labels` outright, add it under the
+   consent screen's Data access settings in the Cloud console and retry.
+3. **Check the step 1 assumption against a real consent:**
+   - `data/token.json` has `granted_scopes` listing `gmail.labels` and
+     `gmail.readonly`
+   - the status page at `/` shows both
+   - If `granted_scopes` is missing, stop. Step 1's capture does not work
+     against real Google, and `setup_labels` will refuse to run.
+4. `uv run python scripts/setup_labels.py`: read the plan. Expected: nine to
+   create, no clashes.
+5. `uv run python scripts/setup_labels.py --apply`: nine created, nine ids.
+6. Run it again with `--apply`. Expected: nine present, nothing created.
+7. Look at the Gmail sidebar and note how the labels display. That is
+   input to step 3.
+
+### Recorded when done
+
+- The consent timestamp (`consented_at`), which starts the 7-day clock.
+- The granted set exactly as stored.
+- Whether the token broke on the `SCOPES` change, before re-consent.
+- Whether an `Agent` parent label exists, and how the sidebar shows the
+  nine.
+
+---
+
+## Step 3 implementation
+
+**Status: proposed, 2026-11-03. Not yet agreed.** Still no message writes by
+code. The human labels a handful of messages by hand. A read-only script
+checks that our queries find exactly those messages, then checks again,
+after the labels are removed, that the queries find nothing.
+
+### Part 1: the parent label (settles §3's third bullet)
+
+Observed in step 2: with no `Agent` label, the nine show flat. Gmail nesting
+is naming only: `Agent/Bookings` nests under `Agent` if and only if a label
+named exactly `Agent` exists. **Decision (2026-11-03): create it.**
+
+- `categories.LABEL_PARENT = "Agent"`, derived from `LABEL_PREFIX`. It moves
+  out of `setup_labels.py`.
+- `categories.SETUP_LABELS = AGENT_LABELS | {LABEL_PARENT}`, ten names.
+  `plan_label_setup` works over `SETUP_LABELS`.
+- `AGENT_LABELS` stays the **nine**: the labels the agent applies to messages.
+  The parent is never put on a message, so it is not in `AGENT_LABELS`,
+  and so not in `label_ids` lookups or the undo sweep.
+- `setup_labels.py` drops its "parent exists?" report; the parent is just a
+  tenth row now. Rerunning `--apply` creates only `Agent`.
+- Tests: the existing `plan_label_setup` tests are amended from nine to ten.
+  The "nine in `AGENT_LABELS`" test stays as it is.
+
+The parent is created **before** the query checks run, so the queries are
+verified in their final setup.
+
+### Part 2: `scripts/verify_labels.py`
+
+```
+uv run python scripts/verify_labels.py --expect labelled
+uv run python scripts/verify_labels.py --expect clean
+```
+
+Read-only: `require_scopes(auth.READONLY)`, and only `gmail_client.count`.
+Every query is built with `label_term` and `UNPROCESSED_TERMS`, the same
+helpers the agent will use. That is the point: we test the real query
+builders, not hand-typed strings.
+
+**The base query `B`** is `-in:sent -in:drafts -in:chats`, the exclusions
+`run_pass` will use. `count(B)` is taken first and again last. If it changed,
+mail arrived mid-check and the run is reported void, not failed.
+
+**Checks:**
+
+1. **Positive:** `count(B label_term(L))` for every label `L` in
+   `AGENT_LABELS`, against the expected count below.
+2. **Negation:** `count(B label_term(L, negate=True)) == count(B) − k` for the
+   two multi-word labels, `To Action` and `Needs Review`. These are the
+   names most likely to be mis-parsed.
+3. **The complement identity:**
+   `count(B UNPROCESSED_TERMS) + count(B Processed) + count(B Error) == count(B)`.
+   A wrong negation raises no error; it just quietly changes what the queue
+   holds. This identity is what catches it.
+4. **Reported, not checked:** `count(B label:"Agent")`, so we learn whether
+   searching the parent also returns its children's messages. Nothing depends
+   on it, but it is worth knowing before Phase 4.
+
+Output: one row per check (query, expected, actual, PASS or FAIL); exit
+non-zero on any FAIL.
+
+**Expectations, fixed here before running.** Six received messages, called
+M1 to M6:
+
+| Message | Labels applied by hand |
+|---|---|
+| M1 | `To Action`, `Processed` |
+| M2 | `To Action`, `Processed` |
+| M3 | `Needs Review`, `Processed` |
+| M4 | `Receipts`, `Bookings`, `Personal`, `Promotions`, `Updates`, `Processed` |
+| M5 | `Error` |
+| M6 | none (the control) |
+
+`--expect labelled`:
+- `To Action` 2; `Needs Review` 1; `Receipts`, `Bookings`, `Personal`,
+  `Promotions`, `Updates` 1 each
+- `Processed` 4; `Error` 1; unprocessed = `count(B)` − 5
+
+M4 carrying five categories is not something the agent would ever do. It is
+there so every label name is searched at least once using only six messages.
+
+`--expect clean`: every label count is 0, and unprocessed equals
+`count(B)`. Run after the labels are removed. It proves the removal and
+gives the queries a second, independent check.
+
+Both sets of numbers live in the script as constants, matching this table.
+
+**Testing:** the script is not unit-tested, which is the same call as
+`setup_labels`. Its expectations come from a human count, not from the code,
+so a bug in the checker most likely shows up as a FAIL rather than a false
+PASS. The `clean` run is the second check.
+
+### The manual procedure (the human)
+
+A. Land the code; tests pass.
+
+B. `uv run python scripts/setup_labels.py --apply`. Expected: `Agent`
+   created, nine present. Check that the sidebar now nests the nine.
+
+C. **Turn conversation view off** (Gmail settings, General tab).
+   - With it on, labelling one message labels its whole thread, and the
+     counts would be wrong for a reason unrelated to the queries.
+   - Pick six received messages, not ones you sent.
+   - Apply the labels exactly as in the table. M6 gets nothing; it only
+     needs to exist.
+
+D. `uv run python scripts/verify_labels.py --expect labelled`. All PASS.
+
+E. Remove every hand-applied label from M1 to M5.
+
+F. `uv run python scripts/verify_labels.py --expect clean`. All PASS.
+
+G. Turn conversation view back on if you want it.
+
+### Recorded when done
+
+- Both runs' outputs.
+- Whether `label:"Agent"` matches child-labelled messages.
+- That the hand-applied labels were removed, which is shown by the `clean`
+  run.

@@ -15,7 +15,8 @@ Needs Review" unrepresentable rather than merely unlikely.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 
 
@@ -143,6 +144,54 @@ UNPROCESSED_TERMS = " ".join(
 def label_for(category: Category) -> str:
     """`Category.TO_ACTION` -> `Agent/To Action`."""
     return f"{LABEL_PREFIX}{category.value}"
+
+
+# Every label the agent owns: the six categories plus the three operational
+# labels. Built from the names above, never retyped, so a renamed category or
+# a new stop label reaches setup_labels without a second edit.
+AGENT_LABELS: frozenset[str] = frozenset(
+    {label_for(category) for category in Category} | {NEEDS_REVIEW, *STOP_LABELS}
+)
+
+
+@dataclass(frozen=True)
+class LabelSetupPlan:
+    """What `scripts/setup_labels.py` would do, given the labels that exist."""
+
+    present: tuple[str, ...]
+    to_create: tuple[str, ...]
+    # (wanted, existing case variant)
+    clashes: tuple[tuple[str, str], ...]
+
+
+def plan_label_setup(existing: Collection[str]) -> LabelSetupPlan:
+    """Sort `AGENT_LABELS` into present, to create, and clashing.
+
+    A clash is an existing label equal to a wanted one ignoring case but not
+    exactly - `agent/to action` against `Agent/To Action`. Gmail refuses a
+    second label differing only in case, so creating it would fail anyway;
+    reporting the clash up front means setup stops before creating anything,
+    rather than with a 409 halfway through. Whether to rename the existing
+    one is the human's call, never the script's.
+
+    Labels outside `AGENT_LABELS` - INBOX, the reader's own - are ignored.
+    """
+    existing_set = set(existing)
+    by_folded: dict[str, list[str]] = {}
+    for name in existing_set:
+        by_folded.setdefault(name.casefold(), []).append(name)
+
+    present, to_create, clashes = [], [], []
+    for wanted in sorted(AGENT_LABELS):
+        if wanted in existing_set:
+            present.append(wanted)
+            continue
+        variants = sorted(by_folded.get(wanted.casefold(), []))
+        if variants:
+            clashes += [(wanted, variant) for variant in variants]
+        else:
+            to_create.append(wanted)
+    return LabelSetupPlan(tuple(present), tuple(to_create), tuple(clashes))
 
 
 def letter_map(order: tuple[Category, ...] = DEFAULT_ORDER) -> dict[str, Category]:

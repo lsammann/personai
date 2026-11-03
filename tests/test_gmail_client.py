@@ -26,6 +26,7 @@ from app.gmail_client import (
     Message,
     MissingLabels,
     NotAuthenticated,
+    all_labels,
     collect_text_parts,
     count,
     create_label,
@@ -537,6 +538,12 @@ def test_fetch_raw_returns_the_whole_response_through_execute(monkeypatch):
 
 
 LABELS = {"INBOX": "INBOX", "Agent/To Action": "Label_1", "Agent/Processed": "Label_2"}
+
+
+def test_all_labels_returns_every_label_including_system_ones():
+    labels = FakeLabels(LABELS)
+    assert all_labels(FakeService(labels=labels)) == LABELS
+    assert labels.list_calls == [{"userId": "me"}]
 
 
 def test_label_ids_maps_every_requested_name_and_nothing_else():

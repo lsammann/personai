@@ -126,3 +126,48 @@ def test_argmax_rejects_an_incomplete_distribution():
         cat.argmax({})
     with pytest.raises(ValueError):
         cat.argmax({Category.TO_ACTION: 1.0})
+
+
+# --- the agent's labels, and setting them up ---------------------------------
+
+
+def test_agent_labels_are_the_six_categories_plus_three_operational():
+    assert len(cat.AGENT_LABELS) == 9
+    assert all(label.startswith(cat.LABEL_PREFIX) for label in cat.AGENT_LABELS)
+    assert cat.AGENT_LABELS == (
+        {cat.label_for(c) for c in Category} | {cat.NEEDS_REVIEW, *cat.STOP_LABELS}
+    )
+
+
+def test_label_setup_with_nothing_present_creates_all_nine():
+    plan = cat.plan_label_setup(["INBOX", "UNREAD"])
+    assert set(plan.to_create) == cat.AGENT_LABELS
+    assert plan.present == () and plan.clashes == ()
+
+
+def test_label_setup_creates_only_what_is_missing():
+    plan = cat.plan_label_setup(["INBOX", cat.PROCESSED, cat.ERROR])
+    assert set(plan.present) == {cat.PROCESSED, cat.ERROR}
+    assert set(plan.to_create) == cat.AGENT_LABELS - {cat.PROCESSED, cat.ERROR}
+
+
+def test_label_setup_with_all_present_creates_nothing():
+    """What idempotence means: a second run is a no-op."""
+    plan = cat.plan_label_setup([*cat.AGENT_LABELS, "INBOX"])
+    assert plan.to_create == () and plan.clashes == ()
+    assert set(plan.present) == cat.AGENT_LABELS
+
+
+def test_a_case_variant_is_a_clash_not_present_and_not_to_create():
+    """Gmail refuses a label differing only in case, so creating it would
+    fail; and treating it as present would apply the reader's label."""
+    plan = cat.plan_label_setup(["agent/to action"])
+    assert plan.clashes == (("Agent/To Action", "agent/to action"),)
+    assert "Agent/To Action" not in plan.to_create
+    assert "Agent/To Action" not in plan.present
+
+
+def test_label_setup_ignores_labels_it_does_not_own():
+    plan = cat.plan_label_setup(["Agent", "Agent/Something Else", "Receipts"])
+    assert set(plan.to_create) == cat.AGENT_LABELS
+    assert plan.clashes == ()

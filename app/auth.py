@@ -6,9 +6,9 @@ app, so the flow runs as ordinary routes in this app rather than through
 server, and shells out to a browser). First-time setup and the weekly
 re-authentication are therefore the same code path.
 
-Scope is read-only until Phase 3 step 2, then widens in two deliberate steps
+Scope was read-only until Phase 3 step 2, and widens in two deliberate steps
 - see CLAUDE.md. What Google *granted* is recorded at consent and checked by
-`require_scope`; the `SCOPES` constant is only what we *ask* for.
+`require_scopes`; the `SCOPES` constant is only what we *ask* for.
 """
 
 from __future__ import annotations
@@ -37,11 +37,14 @@ READONLY = "https://www.googleapis.com/auth/gmail.readonly"
 LABELS = "https://www.googleapis.com/auth/gmail.labels"
 MODIFY = "https://www.googleapis.com/auth/gmail.modify"
 
-# What the consent flow REQUESTS. Phases 0-2 are structurally incapable of
+# What the consent flow REQUESTS. Phases 0-2 were structurally incapable of
 # modifying the mailbox; each widening is its own Phase 3 step and forces a
 # re-consent. Never read this to learn what the token can do - Google may
 # grant less than was asked, and that is what `granted_scopes()` reports.
-SCOPES = [READONLY]
+#
+# Phase 3 step 2: + gmail.labels, which can create labels but cannot touch a
+# message. Step 4 replaces both with gmail.modify. A test pins this list.
+SCOPES = [READONLY, LABELS]
 
 # gmail.modify covers everything gmail.labels and gmail.readonly allow. Kept
 # in one place so no caller has to know the scope hierarchy.
@@ -208,7 +211,7 @@ def granted_scopes() -> frozenset[str]:
     """What the last consent actually granted, as Google returned it.
 
     Empty when nothing is recorded - no token, or a token written before this
-    was captured. Empty means `require_scope` fails closed, which is the
+    was captured. Empty means `require_scopes` fails closed, which is the
     point: an unknown grant is not assumed to be the requested one.
     """
     stored = _read_token()
@@ -217,22 +220,29 @@ def granted_scopes() -> frozenset[str]:
     return frozenset(_normalise_scopes(stored.get("granted_scopes")))
 
 
-def require_scope(scope: str) -> None:
-    """Raise `InsufficientScope` unless the granted set covers `scope`.
+def require_scopes(scope: str, *more: str) -> None:
+    """Raise `InsufficientScope` unless the granted set covers every scope.
 
     Checks the recorded grant, not `SCOPES`: requesting a scope proves
-    nothing about having it. Each entry point calls this for the scope it
-    needs before making any API call.
+    nothing about having it. Each entry point calls this once, with every
+    scope it needs, before making any API call. The error names every
+    missing scope, so one re-consent fixes all of them.
+
+    Separate arguments rather than a list: a list parameter given a single
+    string would iterate its characters. The first is positional and
+    required, so calling with no scopes at all is a TypeError rather than a
+    check that silently passes.
     """
     granted = granted_scopes()
     covered = set(granted)
     for held in granted:
         covered |= _IMPLIES.get(held, frozenset())
-    if scope not in covered:
+    missing = [needed for needed in (scope, *more) if needed not in covered]
+    if missing:
         held_text = ", ".join(sorted(granted)) or "nothing recorded"
         raise InsufficientScope(
-            f"Needs {scope}, but the stored consent grants: {held_text}. "
-            "Reconnect via /auth/start."
+            f"Needs {', '.join(missing)}, but the stored consent grants: "
+            f"{held_text}. Reconnect via /auth/start."
         )
 
 

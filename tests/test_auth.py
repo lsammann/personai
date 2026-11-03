@@ -210,12 +210,14 @@ def test_a_refresh_keeps_the_recorded_grant(monkeypatch):
 
 
 def test_no_recorded_grant_means_nothing_granted():
-    """Today's token predates recording. Unknown is not assumed to be what
-    was requested."""
+    """A token from before grants were recorded. Unknown is not assumed to be
+    what was requested - and the error names every missing scope at once."""
     write_granted(None)
     assert auth.granted_scopes() == frozenset()
-    with pytest.raises(auth.InsufficientScope, match="nothing recorded"):
-        auth.require_scope(auth.READONLY)
+    with pytest.raises(auth.InsufficientScope, match="nothing recorded") as raised:
+        auth.require_scopes(auth.READONLY, auth.LABELS)
+    assert auth.READONLY in str(raised.value)
+    assert auth.LABELS in str(raised.value)
 
 
 def test_no_token_at_all_means_nothing_granted():
@@ -223,26 +225,30 @@ def test_no_token_at_all_means_nothing_granted():
 
 
 @pytest.mark.parametrize(
-    "granted, needed, ok",
+    "granted, needed, missing",
     [
-        ([auth.READONLY], auth.READONLY, True),
-        ([auth.READONLY, auth.LABELS], auth.LABELS, True),
+        ([auth.READONLY], (auth.READONLY,), ()),
+        # what setup_labels asks for, against what step 2's consent granted
+        ([auth.READONLY, auth.LABELS], (auth.LABELS, auth.READONLY), ()),
         # modify covers both narrower scopes - the one place that rule lives
-        ([auth.MODIFY], auth.LABELS, True),
-        ([auth.MODIFY], auth.READONLY, True),
+        ([auth.MODIFY], (auth.LABELS, auth.READONLY), ()),
         # labels and readonly are siblings, not nested
-        ([auth.LABELS], auth.READONLY, False),
-        ([auth.READONLY], auth.LABELS, False),
-        ([auth.READONLY, auth.LABELS], auth.MODIFY, False),
+        ([auth.LABELS], (auth.READONLY,), (auth.READONLY,)),
+        # a partial grant names only what is missing, not what is held
+        ([auth.READONLY], (auth.READONLY, auth.LABELS), (auth.LABELS,)),
+        ([auth.READONLY, auth.LABELS], (auth.MODIFY,), (auth.MODIFY,)),
     ],
 )
-def test_require_scope(granted, needed, ok):
+def test_require_scopes(granted, needed, missing):
     write_granted(granted)
-    if ok:
-        auth.require_scope(needed)
-    else:
-        with pytest.raises(auth.InsufficientScope, match=needed):
-            auth.require_scope(needed)
+    if not missing:
+        auth.require_scopes(*needed)
+        return
+    with pytest.raises(auth.InsufficientScope) as raised:
+        auth.require_scopes(*needed)
+    named = str(raised.value).split(", but")[0]
+    assert all(scope in named for scope in missing)
+    assert not any(scope in named for scope in set(needed) - set(missing))
 
 
 def test_status_reports_granted_not_requested(credentials_ok, monkeypatch):
@@ -250,3 +256,9 @@ def test_status_reports_granted_not_requested(credentials_ok, monkeypatch):
     monkeypatch.setattr(auth, "SCOPES", [auth.MODIFY])
     write_granted([auth.READONLY])
     assert auth.status()["granted_scopes"] == [auth.READONLY]
+
+
+def test_scopes_are_pinned():
+    """Step 2's scope. Step 4's widening to gmail.modify has to show up here,
+    in a diff, rather than as a quiet constant change."""
+    assert auth.SCOPES == [auth.READONLY, auth.LABELS]
