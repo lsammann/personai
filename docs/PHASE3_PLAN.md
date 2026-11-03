@@ -463,7 +463,7 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 ## Build order
 
-**Current step: 6** (not started).
+**Current step: 7** (not started). Step 6's rehearsal passed 2026-11-03, which unlocks `app/agent.py`.
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
    no consent, no API calls. **Done 2026-11-02.** Produced
@@ -511,7 +511,20 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
    `MODIFY_LABELS_CALLERS` rule starts empty (A1 as a test). 487 tests
    pass. No live call made
 6. `logbook` schema (`prior_labels`, effective delta) → `undo_run.py` →
-   **rehearsal**
+   **rehearsal**. **Done 2026-11-03.**
+   - Produced `Record.prior_labels` / `labels_after` and three validators,
+     `decision.effective_change`, the pure `app/undo.py`, and the thin
+     `scripts/undo_run.py`.
+   - Also `scripts/rehearse_undo.py`, which acts on tagged throwaway mail
+     only. Both scripts are on `MODIFY_LABELS_CALLERS`. `DESIGN.md` →
+     Undo path amended per A3. 545 tests pass.
+   - The plan was changed during build: `plan_message` became "earliest
+     against now" with a hold on contradictory rows (see Q5).
+   - The rehearsal, the first writes to real messages, passed first time on
+     all three criteria: verify clean on all five, a rerun made zero calls,
+     and the planted orphan was found and then cleared. A reader's star
+     (`STARRED` + `YELLOW_STAR`) survived undo, and pre-archived M5 stayed
+     archived
 7. `agent.classify_and_label` + `Source "reply"`
 8. `scripts/run_pass.py`
 9. `scripts/review_run.py` (A4)
@@ -1157,3 +1170,546 @@ In `test_write_guard.py`:
   mail, and that belongs to step 6's rehearsal, where undo exists to
   reverse it.
 - No log schema change. That is step 6.
+
+---
+
+## Step 6 implementation
+
+**Status: done 2026-11-03.** All code built (545 tests pass), `DESIGN.md` amended per A3, and the rehearsal passed. See Recorded when done. A plan-only `undo_run.py` against the real mailbox resolved all ten ids (`INBOX` by name) and swept no orphans. All eleven design questions were
+settled at review and are recorded in [the decisions table](#decisions-taken-step-6-review-2026-11-03)
+at the end of this section. Q references below point there.
+
+The first step that changes real messages. Every write is to throwaway mail
+sent to self, and undo exists before the first one. Three parts, in this
+order: the log schema, the undo tool, the rehearsal.
+
+### What reading the code turned up
+
+- **No log rows exist.** `data/classifications.jsonl` is absent, and nothing
+  in `app/` or `scripts/` constructs a `logbook.Record` yet. Eval rows go
+  elsewhere. So the schema change needs no migration, and new fields can be
+  validated strictly from the first row.
+- **The vocabularies differ.** `prior_labels` is ids (§6). `Action` is names
+  (§6), which is what `decision` produces. `modify_labels` takes ids. So any
+  code that compares the two needs the `name -> id` map from `label_ids()`.
+  That map is the only bridge, and a missing `Agent/` label fails closed
+  there.
+- **Phase 3's agent rows have a fixed shape.** Every `decide_*` function adds
+  only `Agent/` labels and removes only `INBOX`. Nothing removes an `Agent/`
+  label until Needs Review reconciliation in Phase 4. Undo can therefore
+  check this shape and refuse any row that breaks it (Q5).
+- **§6's rehearsal has an ordering flaw.** The human hand-applies labels,
+  and then a fixture script writes the rows. But `prior_labels` means the
+  labels *before* the write, and by the time the fixture runs, the labels it
+  would fetch are the ones *after*. The fixture would have to be told the
+  prior state, and it would then be testing a hand-typed input rather than
+  the fetch-then-write order step 7 will use. See Q1.
+- **The sweep needs a precise "has a log row".** §6 says any match "with no
+  log row at all" is an orphan. A dry-run row, or a failure row, does not
+  explain a label on a message. So an orphan is defined below as a message
+  with no *applied* row.
+
+### Part 1: the log schema — `app/logbook.py`
+
+```python
+class Record(BaseModel):
+    ...
+    # Label ids at fetch time, before any write. None only when the fetch
+    # itself failed. Ids, not names: user labels can be renamed, and ids are
+    # what modify takes.
+    prior_labels: tuple[str, ...] | None = None
+    # Label ids Gmail reported after the modify (modify_labels' return).
+    # None when no modify was made: a dry run, a failure, or an empty delta.
+    labels_after: tuple[str, ...] | None = None          # Q3
+    action: Action = ...   # now the EFFECTIVE change, names, as §6
+```
+
+**Validators** (Q10). `Record` is the class that defines one log row. A
+validator is a check pydantic runs whenever a `Record` is created; if it
+fails, creating the row raises, so a bad row can never be written. Writes are
+strict, so three rules become things a row physically cannot break:
+
+1. **A row with a label change must carry what the labels were before.** A
+   non-empty `action` requires `prior_labels`. Undo cannot trust a change it
+   cannot compare against anything.
+2. **A failed row carries no label change.** `error` set requires an empty
+   `action`. This is `CLAUDE.md`'s "a failure applies no labels".
+3. **A dry run has no "after".** `labels_after` set requires `dry_run=False`.
+
+`Source` is unchanged. `"reply"` arrives in step 7, as §6 says.
+
+**The effective change lives in `app/decision.py`, not `logbook`** (Q7).
+`logbook` only writes and reads rows and would never call it. The question
+"given this decision and this message's current labels, what actually
+changes?" is the last step of deciding, so it belongs with the decision
+table:
+
+```python
+def effective_change(
+    decision: Decision, prior_names: Collection[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(add, remove): the decision's adds not already present, and its
+    removes that were. Pure; names only."""
+```
+
+- **Names only**, so label ids stay out of `decision`, which today speaks
+  only names. The caller turns the message's `prior_labels` ids into names
+  with the inverted `label_ids()` map. Ids not in the map (system labels,
+  the reader's own labels) are dropped, because only `Agent/` labels and
+  `INBOX` can appear in a decision.
+- **It returns tuples, not a `logbook.Action`.** `test_decision.py` allows
+  `decision` to import only `app.categories` and the standard library, and
+  that does not change. The caller builds the `Action`.
+- Its callers are the rehearsal fixture (this step) and `agent.py` (step 7).
+  The fixture cannot import from `agent.py`, which must not exist yet, so
+  the function has to live somewhere both can reach.
+
+### Part 2: undo — `app/undo.py` (pure) and `scripts/undo_run.py` (thin)
+
+The same split as `categories.plan_label_setup` and `setup_labels.py`. All
+the decisions live in a module with no I/O, so they can be tested without a
+mock. The script only parses arguments, makes Gmail calls and prints.
+`app/undo.py` never refers to `modify_labels`, so the guard's caller list
+stays at the scripts.
+
+**What undo is for.** Reversing *a run*, not a single message. A single
+misfiled message is fixed by hand in Gmail; that is a correction, and Phase
+4's reconciliation is where corrections are handled. Undo is for "that run
+was wrong", and the gate uses it to reverse the 12-message live run as a
+check. So it always works over a time window, matched on **when the agent
+changed the label** (the log row's timestamp), not when the email arrived.
+"Undo 14:00–14:30" means everything the agent did in that half hour. No
+single-message option (Q11).
+
+**What the parts do, in plain terms.** Take one message the agent filed as
+Receipts at 10:00, adding `Receipts` and `Processed` and removing `INBOX`:
+
+- **`parse_window`** checks the two times typed on the command line before
+  anything else happens. It changes nothing.
+- **`plan_message`** decides what to do to the message. It reads the log
+  row, looks at the labels the message has *now*, and works out the opposite
+  change: remove `Receipts` and `Processed`, put `INBOX` back. This is
+  printed before anything is applied.
+- **`orphans`** looks for messages the log does not explain. It searches the
+  whole mailbox for `Agent/Processed` or `Agent/Error` and checks each match
+  against the log. A labelled message with no row is an orphan: the program
+  crashed between the label change and writing the row, so undo would never
+  know to touch it. Orphans are reported, never fixed, because with no row
+  there is no record of what the message looked like before.
+- **`verify`** checks that undo worked. After undo, it re-fetches each
+  message and compares it with `prior_labels`, allowing for the reader's own
+  changes in between (a star stays). Any difference is reported, and the
+  exit is non-zero. This replaces looking at the inbox and judging that it
+  looks right.
+
+The plan step decides, the orphan check catches what was missed, and verify
+proves the result.
+
+```python
+@dataclass(frozen=True)
+class Window:
+    since: dt.datetime   # inclusive
+    until: dt.datetime   # exclusive
+
+def parse_window(since: str, until: str, *, now: dt.datetime) -> Window:
+    """ISO 8601, timezone REQUIRED (a naive time is refused, not assumed UTC).
+    since < until, until <= now, until - since <= MAX_WINDOW."""     # Q6
+
+def applied(record: Record) -> bool:
+    """dry_run=False, error=None, non-empty action. The only rows undo reads."""
+
+def select(records: Iterable[Record], window: Window) -> dict[str, list[Record]]:
+    """Applied rows whose timestamp is in the window, grouped by message.
+    Raises on any row whose shape is not agent-shaped (adds ⊆ AGENT_LABELS,
+    removes ⊆ {INBOX})."""                                            # Q5
+
+@dataclass(frozen=True)
+class MessagePlan:
+    message_id: str
+    add_ids: tuple[str, ...]       # what to put back (INBOX at most)
+    remove_ids: tuple[str, ...]    # what to take off
+    stray: tuple[str, ...]         # Agent/ labels not added by any row, being stripped
+    already_reverted: bool         # nothing to do; no modify call is made
+
+def plan_message(
+    rows: Sequence[Record], current_ids: Collection[str],
+    ids_by_name: Mapping[str, str],
+) -> MessagePlan:
+    """The inverse of the rows, intersected with the CURRENT labels."""  # Q4
+
+def orphans(swept_ids: Collection[str], records: Iterable[Record]) -> set[str]:
+    """Swept messages with no applied row anywhere in the log, in or out of
+    the window."""
+
+def verify(
+    rows: Sequence[Record], before_undo: Collection[str],
+    after_undo: Collection[str], ids_by_name: Mapping[str, str],
+) -> list[str]:
+    """Mismatches, empty when clean. See the rule below."""
+
+class UndoReport(BaseModel): ...   # one row per message, data/undo/<stamp>.jsonl
+```
+
+**Planning a message** (Q4, Q5). The aim is the message as it was before
+the agent first touched it. Two rules:
+
+- **`Agent/` labels, earliest against now:** `remove_ids` = every `Agent/`
+  label present now that was not in the earliest row's `prior_labels`. That
+  covers everything the agent added and anything the reader re-filed into
+  since. The second kind is reported as `stray` (§6's re-file out of Needs
+  Review).
+- **`INBOX`, only if the agent archived it:** `add_ids` = `INBOX`, if any
+  row removed it **and it is absent now**. Restoring `INBOX` to its
+  earliest state instead would override the reader. It would un-archive a
+  message they archived themselves (M4's case if they had), or re-archive
+  one they moved in.
+- **The cross-check, `held`:** the `Agent/` rule trusts `prior_labels`
+  alone, so a second record checks it. A row's adds are the effective
+  change, so no row should ever add a label already in the earliest
+  `prior_labels`. If one does, either `prior_labels` was recorded wrong or
+  the reader removed a pre-existing `Agent/` label that the agent then
+  re-added. The message is then **held**: untouched, reported, and the exit
+  is non-zero. Without this check, a wrong `prior_labels` would fool undo
+  and `verify` together, since both trust it.
+
+If both sets are empty, the message is `already_reverted` and no call is
+made (`modify_labels` would refuse an empty change anyway). Otherwise there
+is one `modify_labels` call per message, whatever the number of rows.
+
+**Why compare with the current labels (Q4), stated honestly:** it is about
+honest reporting, not safety. Gmail ignores removing a label that is absent
+and adding one that is present, so replaying the logged inverse blindly
+would leave the mailbox in the same state in nearly every case. What
+differs is what undo says, and whether it makes calls. Take M1, archived at
+10:00. The reader moves it back to the inbox and removes `Receipts` at
+10:20, then runs undo at 10:30:
+
+| | Blind replay of the log | Against current labels |
+|---|---|---|
+| Sends | remove Receipts, Processed; add INBOX | remove Processed |
+| Reports | "removed Receipts, restored INBOX" (neither happened) | "Receipts already gone, already in inbox, removed Processed" |
+| Second run | 5 calls, each reported as a change | "already reverted", 0 calls |
+| Extra cost | — | none: `stray` and `verify` already fetch every message |
+
+Pass criterion 2 (zero modify calls on a rerun) is only checkable this way.
+
+**Several rows for one message (Q5).** This happens when one window covers
+"labelled, undone, labelled again". The "removed" step never appears in the
+log, because the agent never removes an `Agent/` label or adds `INBOX`.
+Undo and the reader write no classification rows, and `select` refuses
+any row that is not agent-shaped. So every row is the same kind of change,
+and repeats add nothing new: only the earliest `prior_labels` and "did any
+row archive it" matter.
+
+*Changed during build, 2026-11-03:* first written as a union of every row's
+inverse. That was replaced by the rules above, which read more plainly.
+Checked over 400,000 random agent-shaped histories, with the reader and
+earlier undos acting in between. Where no `Agent/` label existed before
+the agent, the two agreed every time. Where one did, they differed only
+when a row re-added a label already in the earliest `prior_labels`. There
+the union would have removed a label the message had before, which
+`verify` then reports as missing. The rules above hold those messages
+instead.
+
+**The verify rule.** "Equal to `prior_labels`, ignoring any the reader
+changed" (§6), made computable. Let `P` be the earliest row's
+`prior_labels`, `B` the labels just before undo, `A` the labels after it,
+and `L` the latest row's `labels_after`:
+
+- **`Agent/` labels:** `A ∩ agent_ids == P ∩ agent_ids`. Undo owns these
+  outright, so a reader change is no excuse.
+- **`INBOX`:** if the reader moved the message since the write
+  (`INBOX ∈ B` differs from `INBOX ∈ L`), `A` keeps the reader's choice.
+  Otherwise `INBOX ∈ A` iff `INBOX ∈ P`. Without `labels_after`, the rule
+  falls back to `P`.
+- **Everything else** (`STARRED`, `UNREAD`, the reader's own labels):
+  `A` equals `B` there. Undo sent no such ids, and `modify_labels` refuses
+  system labels, so this should hold by construction. It is checked anyway,
+  because it is the claim "an inverse, not an overwrite" makes.
+
+**`scripts/undo_run.py`:**
+
+```
+uv run python scripts/undo_run.py --since … --until …                 # plan only
+uv run python scripts/undo_run.py --since … --until … --apply [--verify]
+                                 [--log data/rehearsal/classifications.jsonl]   # Q2
+```
+
+1. `parse_window`. Any failure exits before any Gmail call.
+2. `require_scopes(READONLY)`, or `MODIFY` with `--apply`.
+3. `label_ids(svc, AGENT_LABELS)` plus `INBOX`. Fails closed.
+4. `read_all(log)`. If any lines were skipped, print the count, and refuse
+   `--apply`: a skipped line could be a row that should have been undone.
+5. `select`. A row that breaks the shape check stops the run here.
+6. **Sweep:** `search_ids` over `{label:"Agent/Processed" label:"Agent/Error"}`,
+   built from `STOP_LABELS` with `label_term`, with no date term. Then
+   `orphans`. These are reported only, never acted on.
+7. For each selected message, `fetch` its current labels, then
+   `plan_message`, then print it. Without `--apply`, stop after the table and
+   the orphan list.
+8. With `--apply`, one `modify_labels` per message that is not already
+   reverted. Append its `UndoReport` row after each call, so a crash
+   mid-run leaves a true record of what was done. A Gmail error on one
+   message is reported, and the run continues with the next.
+9. `--verify`: re-fetch every selected message and run `verify`. Any
+   mismatch exits non-zero.
+
+Exit codes: 0 means clean. Non-zero on any error, any verify mismatch, or
+any orphan, because an orphan is the thing the sweep exists to find.
+
+### Part 3: the rehearsal — `scripts/rehearse_undo.py`
+
+**Changes §6** (Q1): the labels are applied by the script through
+`modify_labels`, not by hand. Each fixture message goes through the same
+order step 7 will use: `fetch` (keep `prior_labels`), take a decision from
+the real `decide_*` functions, `decision.effective_change`, `modify_labels`, then
+`logbook.append` after the modify. So the rehearsal tests the write half as
+well as the undo half, and `prior_labels` is a fetched fact rather than a
+typed one.
+
+**It cannot touch real mail.** It finds its messages with
+`search_ids(svc, 'subject:"[personai rehearsal]"')` and acts only on
+messages whose subject is exactly `[personai rehearsal] M<n>` for a known
+`n`. It refuses to run if any tag is missing or duplicated, or if the search
+finds any message without a tag. The tag is the only way in, so there is no
+`--ids` or `--query` argument (Q9). Plan by default; `--apply` writes. Rows
+go to `data/rehearsal/classifications.jsonl` (Q2), with `run_kind="manual"`
+and `note="rehearsal fixture"`. At the end it prints the exact `undo_run.py`
+command for the window it just wrote.
+
+**Built 2026-11-03, with checks the plan did not spell out.** Every check
+runs before the first write, so a refusal changes nothing:
+- **Start state:** M1–M4 must be in the inbox, and M5 archived. None of
+  M1–M6 may carry an `Agent/` label yet, so M6 is labelled only after the
+  script runs (procedure D).
+- **The config:** each decision is checked against the fixture table below,
+  using the real `config.get()` thresholds. A changed config is refused
+  rather than allowed to quietly change the rehearsal. Checked offline:
+  all five match at `T=0.8`, `F=0.15`.
+- **On failure:** it stops at the first `modify_labels` failure. The call is
+  atomic, so that message is untouched, and undo can revert every row
+  already written.
+
+**The fixture, fixed here before it runs (Q8).** Six messages sent to self:
+
+| Msg | Before the fixture (human) | Scripted decision | Effective action | Between fixture and undo (human) |
+|---|---|---|---|---|
+| M1 | — | `decide()`, Receipts 0.95 | +Receipts +Processed −INBOX | **star it** |
+| M2 | — | `decide()`, max 0.55 → Needs Review | +Needs Review +Processed | **re-file**: remove Needs Review, add To Action |
+| M3 | — | `decide_dead_letter()` | +Error | — |
+| M4 | — | `decide()`, To Action 0.95 | +To Action +Processed | — |
+| M5 | **archive it** | `decide()`, Receipts 0.95 | +Receipts +Processed, **no INBOX remove** | — |
+| M6 | — | none (not in the script) | — | **add `Agent/Processed` by hand** (the planted orphan) |
+
+What each one tests:
+
+- **M1:** the archive and its restore, and that a reader's star survives
+  undo.
+- **M2:** the inverse against *current* labels (Needs Review is already
+  gone), and the `stray` strip of a re-file.
+- **M3:** `Agent/Error` alone, the branch an undo that sweeps only
+  `Processed` would miss.
+- **M4:** the keeps-`INBOX` case, so undo must not touch `INBOX`.
+- **M5:** the case A3 exists for. Undo must **not** put an archived message
+  back in the inbox.
+- **M6:** the sweep can fail. A check that can only ever report "no
+  orphans" proves nothing.
+
+Synthetic distributions for `decide()` are passed in the script, with the
+shipped `T=0.8` and `F=0.15`. They exercise the decision table, not the
+model, and they sit in a separate log, so they never reach a metric.
+
+**Expectations, fixed here before running.**
+
+Plan-only `undo_run` over the fixture window:
+
+| Msg | remove | add back | Note |
+|---|---|---|---|
+| M1 | Receipts, Processed | INBOX | |
+| M2 | Processed, To Action | — | To Action listed as `stray` |
+| M3 | Error | — | |
+| M4 | To Action, Processed | — | |
+| M5 | Receipts, Processed | — | **no INBOX** |
+
+Orphans: exactly `{M6}`.
+
+After `--apply --verify`:
+- verify is clean on all five
+- M1 is starred and in the inbox
+- M5 is archived
+- M6 still carries `Agent/Processed`
+- exit is non-zero, because of the orphan
+
+**Pass**, which unlocks step 7:
+1. Both tables above match exactly.
+2. A second `--apply --verify` over the same window reports all five as
+   already reverted, and makes zero modify calls.
+3. Once the human removes M6's label, a plan-only run reports zero orphans
+   and exits 0.
+
+### The guard
+
+`MODIFY_LABELS_CALLERS = {"scripts/undo_run.py", "scripts/rehearse_undo.py"}`,
+each with a comment saying why. `app/agent.py` stays off it until this
+step's Recorded section says the rehearsal passed.
+
+### Tests
+
+- `test_logbook.py`:
+  - `prior_labels` and `labels_after` round-trip
+  - each of the three validators rejects its case, and a dry-run row with an
+    action and `prior_labels` is accepted
+- `test_decision.py`, `effective_change`:
+  - an add already present → dropped
+  - a remove of `INBOX` on an archived message → dropped (M5's case)
+  - both sides effective
+  - names outside the decision (`STARRED`, a reader label) do not affect it
+  - the existing import test still passes, unchanged
+- `test_undo.py` (new):
+  - `parse_window`:
+    - naive time refused
+    - `since >= until` refused
+    - future `until` refused
+    - over `MAX_WINDOW` refused
+    - `Z` and `+01:00` accepted
+    - `since` is inclusive and `until` exclusive
+  - `select`:
+    - dry-run, failure and empty-action rows are excluded
+    - the window bounds hold
+    - a row removing an `Agent/` label raises
+    - a row adding `INBOX` raises
+  - `plan_message`: each of M1–M5 as a pure case; already reverted; two rows
+    for one message, unioned; a stray `Agent/` label
+  - `orphans`: a dry-run row does not count as a row; an applied row outside
+    the window does
+  - `verify`: clean; an `Agent/` label left behind; a reader's `INBOX` change
+    respected; a fallback when `labels_after` is None; a changed `STARRED`
+    flagged
+- `test_write_guard.py`: the caller set is exactly the two scripts.
+- The scripts stay thin and are not unit-tested, the same call as
+  `setup_labels` and `verify_labels`. The rehearsal is their test.
+
+### Files touched
+
+`app/logbook.py`, `app/decision.py` (`effective_change` only),
+`app/undo.py` (new), `scripts/undo_run.py` (new),
+`scripts/rehearse_undo.py` (new), `tests/test_logbook.py`,
+`tests/test_decision.py`, `tests/test_undo.py` (new),
+`tests/test_write_guard.py`. `DESIGN.md` →
+Dry-run mode: the undo paragraphs and the `after:` epoch argument are
+replaced by A3's log-driven design, and the file-tree comment is updated (A3
+said this lands with step 6). No new dependencies: the code uses `pydantic`,
+already present for `logbook`, and the standard library.
+
+### The manual procedure (the human)
+
+A. Land the code; tests pass.
+
+B. Turn conversation view off. Send yourself six emails with the subjects
+   `[personai rehearsal] M1` to `M6`, one each, so they land in six
+   threads. **Archive M5.**
+
+C. `uv run python scripts/rehearse_undo.py`. Read the plan: it should match
+   the "Effective action" column above. Then run it again with `--apply`.
+   Note the window it prints.
+
+D. In Gmail: star M1. On M2, remove `Agent/Needs Review` and add
+   `Agent/To Action`. Add `Agent/Processed` to M6.
+
+E. `undo_run.py` plan-only, with the printed window and the rehearsal
+   `--log`. Compare against the first expectations table and the orphan
+   set. **If anything differs, stop.** Nothing has been undone yet.
+
+F. The same, with `--apply --verify`. Compare against the second
+   expectations list.
+
+G. Run F again. Expected: all five already reverted, and zero modify calls.
+
+H. Remove `Agent/Processed` from M6. Run E again. Expected: zero orphans,
+   exit 0.
+
+I. Delete the six rehearsal emails if you want to. Turn conversation view
+   back on if you want it.
+
+### Recorded when done
+
+**The rehearsal passed, 2026-11-03.** All three pass criteria held, and
+every expectation fixed above matched first time. These were the first
+writes to real messages in the project.
+
+- **The first run of C refused, as designed.** M5 had not been archived
+  (procedure B was missed). The start-state check stopped it before any
+  write, and the human archived M5 and reran it.
+- **C (`--apply`):** the fixture window was `2026-11-03T07:01:31Z` to
+  `07:01:35Z`, 5 rows written to
+  `data/rehearsal/classifications.jsonl`.
+  - Every effective change matched the fixture table.
+  - M5's line read `remove -`: its decision said remove INBOX, and the
+    effective change recorded nothing, which is the A3 case.
+  - `labels_after` as reported by Gmail:
+
+    | Msg | `labels_after` |
+    |---|---|
+    | M1 | Processed, Receipts, `IMPORTANT`, `SENT`, `UNREAD` (no INBOX) |
+    | M2 | INBOX, Needs Review, Processed, `IMPORTANT`, `SENT`, `UNREAD` |
+    | M3 | INBOX, Error, `IMPORTANT`, `SENT`, `UNREAD` |
+    | M4 | INBOX, Processed, To Action, `IMPORTANT`, `SENT` |
+    | M5 | Processed, Receipts, `IMPORTANT`, `SENT`, `UNREAD` (no INBOX) |
+
+- **D, by hand:** M1 starred; M2 re-filed from Needs Review to To Action;
+  `Agent/Processed` put on M6.
+- **E (plan only):** matched the first expectations table exactly.
+  - M2's To Action was reported as stray. Its Needs Review was already gone,
+    so it was not listed, which shows the plan works against the current
+    labels.
+  - M5 had no add-back.
+  - One orphan, M6 (`1a1a030c836f74fd`). Exit 1.
+- **F (`--apply --verify`):** `5 changed, 0 already reverted, 0 held,
+  0 failed`; `5 ok, 0 mismatched`; exit 1 for the orphan. Report:
+  `data/undo/20261103T070734-af5a8b.jsonl`.
+  - The human confirmed in Gmail: M1–M4 in the inbox with M1 still starred,
+    M5 still archived, and M6 still carrying `Agent/Processed`.
+- **G (F again):** all five `already reverted`, `0 changed`, `5 ok`, exit 1
+  for the orphan. Pass criterion 2.
+- **H:** after M6's label was removed by hand: `Orphans: none.`, all five
+  already reverted, `5 ok`, `Clean.`, exit 0. Pass criterion 3.
+  - *Run with `--apply --verify`* rather than the plan-only run the
+    procedure gave. That is a superset: it made zero calls, and it verified
+    as well.
+
+**Not predicted:**
+- **Starring adds two system labels,** `STARRED` and `YELLOW_STAR`. Both
+  survived undo untouched, which tests "an inverse, not an overwrite"
+  against a change of more than one label.
+- **Mail sent to self carries `SENT` and `IMPORTANT`** alongside `INBOX`.
+  Neither interacts with anything the agent owns.
+
+**`labels_after` against a re-fetch** was not compared directly. D changed
+M1, M2 and M6 before the next fetch, and F's re-fetch came after undo. The
+evidence is indirect but consistent. M3 and M4 were untouched by D, and
+E's plan for them (remove exactly what `labels_after` showed the agent
+added) agrees. Every verify, which uses `labels_after` for its INBOX rule,
+passed. Step 7's live run is where to compare them directly.
+
+**What this unlocks:** step 7. `app/agent.py` may now join
+`MODIFY_LABELS_CALLERS`. That change, and the change to
+`test_no_app_module_writes_until_the_rehearsal_passes`, belong in step 7's
+own diff.
+
+### Decisions taken (step 6 review, 2026-11-03)
+
+All agreed as recommended. Q4 and Q7 changed during review; see their rows.
+
+| # | Decision | Choice | Why, and what was rejected |
+|---|---|---|---|
+| 1 | How the rehearsal applies labels | **By script** (`rehearse_undo.py`, through `modify_labels`), not by hand. Amends §6 | Hand-applying means the fixture is told the prior state, so `prior_labels` is typed, not fetched, and the write half goes unrehearsed until a live run. Cost: a second `modify_labels` caller before the pass, which step 5 anticipated; the subject tag bounds it to throwaway mail |
+| 2 | Where rehearsal rows go | **A separate log**, `data/rehearsal/classifications.jsonl`, via `--log` (default `LOG_PATH`) | The rows carry synthetic distributions and must never reach a metric. *Rejected:* `RunKind "rehearsal"` in the real log, which leaves fake rows there permanently |
+| 3 | `labels_after` | **Added now.** Not in §6 | Makes "ignoring the reader's changes" computable for `INBOX`, and it is lossy: absent from every earlier row. *Rejected:* re-deriving it at undo time, which cannot tell the agent's change from the reader's |
+| 4 | What undo plans against | **The current labels**, fetched per message | Honest reporting, not safety: the mailbox ends up the same either way, but undo says what actually happened, and a rerun makes zero calls. Free, because `stray` and `verify` fetch anyway. *Rejected:* blind replay; also, skipping rows from earlier `data/undo/` reports. *Changed at review:* the draft overstated this as a safety property; the table in Part 2 is the corrected argument |
+| 5 | Several rows for one message | **Earliest `prior_labels` against now for `Agent/` labels; "did any row archive it" for `INBOX`**; a message is **held** if a row re-added a label already in the earliest `prior_labels`. All after `select` refuses any row that is not agent-shaped | Agent-shaped rows make repeats add nothing. *Changed during build* from a union of inverses: the same result, plus one correction, and plainer (see Part 2). The hold keeps a second record checking `prior_labels`. *Rejected:* refusing every multi-row message. Also rejected: restoring `INBOX` to its earliest state, which overrides the reader. Phase 4's reconciliation breaks the shape; `select` makes that loud |
+| 6 | Maximum window | **`MAX_WINDOW = 24h`**, a module constant Phase 4 revisits, like `LIVE_LIMIT_CAP` | A required window stops an accidental unscoped undo, but not `--since 2020-01-01`. *Rejected:* a confirmation prompt; plan-by-default already does that job |
+| 7 | Where the effective change lives | **`decision.effective_change`, names only, returning tuples** | `logbook` would never call it; deciding what actually changes is the last step of deciding. Names keep ids out of `decision`, and tuples keep its import test unchanged. *Changed at review* from `logbook.effective_action`. *Rejected:* `logbook`; `app/undo.py` (the agent importing from undo reads backwards); a new one-function module |
+| 8 | The fixture | **Six messages**: §6's mix, plus M5 archived beforehand, M6 a planted orphan, and reader changes on M1 and M2 | Each tests a claim §6's five would not exercise. M5 is A3's motivating case; M6 is the only way the sweep is seen to fail |
+| 9 | `rehearse_undo.py` after the pass | **Kept**, still on `MODIFY_LABELS_CALLERS` | The subject-tag gate confines it to throwaway mail, and it keeps the rehearsal repeatable if undo changes in Phase 4 |
+| 10 | Validators on `Record` | **All three**: action requires `prior_labels`; error requires an empty action; `labels_after` requires `dry_run=False` | No rows exist, so this is free now and a migration later. *Rejected:* checking them only in the agent, where the fixture could skip them |
+| 11 | Single-message undo (`--message ID`) | **Not added** | A single misfiled message is fixed by hand in Gmail, which is a correction (Phase 4), not an undo. Undo reverses runs, and nothing in Phase 3 needs it narrower |

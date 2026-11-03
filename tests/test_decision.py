@@ -319,3 +319,65 @@ def test_a_reply_hit_is_processed_never_errored():
     result = decision.decide_reply_hit()
     assert "Agent/Processed" in result.labels_add
     assert "Agent/Error" not in result.labels_add
+
+
+# --- effective_change: what a decision actually changes (Phase 3 step 6) ----
+
+def test_an_archived_message_gets_no_inbox_remove():
+    """The case A3 exists for. If the log recorded an INBOX remove here, undo
+    would put mail the reader archived back into the inbox."""
+    receipts = decide(dist(Category.RECEIPTS, 0.95))
+    assert INBOX in receipts.labels_remove
+    add, remove = decision.effective_change(receipts, prior_names={"UNREAD"})
+    assert add == tuple(sorted([label_for(Category.RECEIPTS), PROCESSED]))
+    assert remove == ()
+
+
+def test_an_inbox_message_gets_the_full_change():
+    receipts = decide(dist(Category.RECEIPTS, 0.95))
+    add, remove = decision.effective_change(receipts, prior_names={INBOX})
+    assert add == receipts.labels_add
+    assert remove == (INBOX,)
+
+
+def test_an_add_already_present_is_dropped():
+    """Undo removes what was added - so it must not remove a label the
+    message already carried before the agent touched it."""
+    review = decide(dist(Category.UPDATES, 0.5))
+    add, remove = decision.effective_change(
+        review, prior_names={INBOX, NEEDS_REVIEW}
+    )
+    assert add == (PROCESSED,)
+    assert remove == ()
+
+
+def test_labels_outside_the_decision_change_nothing():
+    """Stars, read state and the reader's own labels are never touched."""
+    keeper = decide(dist(Category.TO_ACTION, 0.95, p_to_action=0.95))
+    plain = decision.effective_change(keeper, prior_names={INBOX})
+    noisy = decision.effective_change(
+        keeper, prior_names={INBOX, "STARRED", "UNREAD", "My Own Label"}
+    )
+    assert plain == noisy
+
+
+def test_a_failure_changes_nothing_whatever_the_labels():
+    assert decision.effective_change(
+        decision.decide_failure(), prior_names={INBOX}
+    ) == ((), ())
+
+
+def test_a_dead_letter_adds_error_alone():
+    add, remove = decision.effective_change(
+        decision.decide_dead_letter(), prior_names={INBOX}
+    )
+    assert add == (ERROR,)
+    assert remove == ()
+
+
+def test_prior_names_as_a_bare_string_raises():
+    """"INBOX" as a string is {"I", "N", "B", "O", "X"}, which would quietly
+    drop the INBOX remove instead of failing."""
+    receipts = decide(dist(Category.RECEIPTS, 0.95))
+    with pytest.raises(TypeError):
+        decision.effective_change(receipts, prior_names=INBOX)

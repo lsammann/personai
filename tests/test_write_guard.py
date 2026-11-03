@@ -53,10 +53,17 @@ ALLOWED_API_CALLS = frozenset({
     ("labels", "create"),     # create_label
 })
 
-# The files allowed to refer to gmail_client.modify_labels (A1). Empty until
-# step 6 adds scripts/undo_run.py; app/agent.py joins only at step 7, after
-# the undo rehearsal has passed. Each addition is its own deliberate diff.
-MODIFY_LABELS_CALLERS: frozenset[str] = frozenset()
+# The files allowed to refer to gmail_client.modify_labels (A1). Each addition
+# is its own deliberate diff:
+# - scripts/undo_run.py (step 6): undo is a write too, and A1 makes it the
+#   first writer, so the first live writes can be reversed.
+# - scripts/rehearse_undo.py (step 6, Part 3): writes the rehearsal's
+#   fixture. Acts only on subjects tagged `[personai rehearsal] M<n>`, and
+#   is kept after the pass so the rehearsal stays repeatable (decision Q9).
+# - app/agent.py joins only at step 7, after the undo rehearsal has passed.
+MODIFY_LABELS_CALLERS: frozenset[str] = frozenset(
+    {"scripts/undo_run.py", "scripts/rehearse_undo.py"}
+)
 
 
 # --- the analysis ---------------------------------------------------------
@@ -276,3 +283,18 @@ def test_ordinary_python_with_write_named_methods_is_not_an_api_call(source):
     tree = ast.parse(source)
     assert not _users_calls(tree)
     assert api_calls(tree) == set()
+
+
+def test_every_listed_caller_exists_and_calls_modify_labels():
+    """A stale entry would silently license whatever is created next at that
+    path - the same reason EXEMPT paths must exist."""
+    for path in MODIFY_LABELS_CALLERS:
+        source = ROOT / path
+        assert source.exists(), f"remove {path} from MODIFY_LABELS_CALLERS"
+        assert refers_to_modify_labels(ast.parse(source.read_text())), path
+
+
+def test_no_app_module_writes_until_the_rehearsal_passes():
+    """A1, stated directly: app/agent.py joins at step 7, not before. This
+    test is changed deliberately in that step's diff."""
+    assert not {path for path in MODIFY_LABELS_CALLERS if path.startswith("app/")}

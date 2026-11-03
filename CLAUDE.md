@@ -7,8 +7,8 @@ diverged from it.
 
 **Current phase: 3 — the writer.** Phase 2 is complete (gate passed
 2026-09-14, all eight build steps done). `docs/PHASE3_PLAN.md` was signed off
-2026-11-02; read its amendment log and both decisions tables. No Phase 3 code
-exists yet.
+2026-11-02; read its amendment log and both decisions tables. Phase 3 implementation
+is up to step 7.
 
 This file is the single source of truth for which **phase** is current; the
 current phase plan's Build order is the single source of truth for which
