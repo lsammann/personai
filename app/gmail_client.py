@@ -7,12 +7,12 @@ returns both text parts, raw and decoded, and expresses no preference.
 
 **The only door to the Gmail API.** No other module in `app/` or `scripts/`
 may call `svc.users()`, and every API call made here must be on an explicit
-allowlist - both enforced by `tests/test_write_guard.py`. Writes so far: one,
+allowlist - both enforced by `tests/test_write_guard.py`. Two writes:
 `labels.create` (Phase 3 step 1), which can create a label but cannot touch a
-message. Step 5 adds the single atomic `messages.modify` and widens the
-allowlist by exactly that call. The granted OAuth scope is the backstop
-underneath: until step 4 the token cannot modify a message even if code
-tried.
+message, and `messages.modify` (step 5), the single atomic label change,
+reached only through `modify_labels`. Who may call `modify_labels` is itself
+an allowlist in that test. The granted OAuth scope is the backstop
+underneath.
 
 The MIME walk is the substantial part. An email is headers plus one blob of
 text at the wire level; MIME is the convention that lets one message carry
@@ -86,6 +86,11 @@ NESTED_MESSAGE = "message/rfc822"
 # Mirrors the divider Gmail writes when forwarding inline, so both forwarding
 # styles reach the model looking the same.
 FORWARD_SEPARATOR = "\n\n---------- Forwarded message ----------\n"
+
+# The only system label `modify_labels` may touch. Every other id must be a
+# user label, which Gmail ids as `Label_<n>`. See `_check_modifiable`.
+MODIFIABLE_SYSTEM_LABEL = "INBOX"
+USER_LABEL_ID_PREFIX = "Label_"
 
 # Statuses worth retrying. 403 is included but conditionally - see `_retryable`.
 RETRY_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
@@ -365,6 +370,84 @@ def create_label(svc, name: str) -> str:
     """
     response = _execute(svc.users().labels().create(userId="me", body={"name": name}))
     return response["id"]
+
+
+def modify_labels(
+    svc,
+    message_id: str,
+    *,
+    add_ids: Collection[str],
+    remove_ids: Collection[str],
+) -> tuple[str, ...]:
+    """The single atomic label change. Returns the labels Gmail reports after.
+
+    One `messages.modify` call carrying both sets, so an add can never land
+    without its remove - CLAUDE.md's atomic-modify rule, enforced by the
+    signature rather than by convention. Both keywords are required, even
+    when one side is empty, so every call site states both halves.
+
+    Ids, not names; they come from `label_ids()`. Only `INBOX` and user
+    labels may be touched - see `_check_modifiable` - which also catches a
+    label name passed by mistake.
+
+    Wrapped in `_execute`: modify SETS labels rather than toggling them, so a
+    retried call that had already succeeded changes nothing. A permission
+    403 is still never retried.
+
+    Returns the post-change labels from Gmail's response, so callers can
+    record the state Gmail confirmed rather than the one they asked for.
+    """
+    add = _label_id_set(add_ids, "add_ids")
+    remove = _label_id_set(remove_ids, "remove_ids")
+    if not add and not remove:
+        raise ValueError("empty label change - a caller bug, not a no-op")
+    if add & remove:
+        raise ValueError(f"ids on both sides of one change: {sorted(add & remove)}")
+    _check_modifiable(add | remove)
+
+    response = _execute(
+        svc.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": sorted(add), "removeLabelIds": sorted(remove)},
+        )
+    )
+    return tuple(response.get("labelIds", []) or ())
+
+
+def _label_id_set(ids: Collection[str], name: str) -> set[str]:
+    """`ids` as a set, refusing a bare string.
+
+    A string is a collection of its characters, so `add_ids="Label_3"`
+    would otherwise ask for labels `L`, `a`, `b`...
+    """
+    if isinstance(ids, str):
+        raise TypeError(f"{name} must be a collection of ids, not a string: {ids!r}")
+    return set(ids)
+
+
+def _check_modifiable(ids: Collection[str]) -> None:
+    """Refuse every system label except INBOX.
+
+    The agent and undo only ever move INBOX and `Agent/` labels, so this
+    costs nothing - and in exchange `modify_labels` cannot trash, spam,
+    un-spam or mark-read a message whatever a caller passes. User labels
+    are recognised by Gmail's `Label_` id form (observed in Phase 3 step 2).
+    If Google changed that form, this fails closed: it raises rather than
+    lets anything through.
+    """
+    refused = sorted(
+        label_id
+        for label_id in ids
+        if label_id != MODIFIABLE_SYSTEM_LABEL
+        and not label_id.startswith(USER_LABEL_ID_PREFIX)
+    )
+    if refused:
+        raise ValueError(
+            f"refusing to modify {refused}: only {MODIFIABLE_SYSTEM_LABEL} and "
+            f"user labels ({USER_LABEL_ID_PREFIX}*) may be changed - "
+            "pass label ids from label_ids(), not names"
+        )
 
 
 def collect_text_parts(payload: dict) -> dict[str, str]:

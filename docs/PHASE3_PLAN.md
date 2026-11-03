@@ -463,7 +463,7 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 ## Build order
 
-**Current step: 5** (not started).
+**Current step: 6** (not started).
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
    no consent, no API calls. **Done 2026-11-02.** Produced
@@ -503,7 +503,13 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
    Google's wording for the permission was not recorded. Three stale
    "read-only" claims were corrected (`main.py`, `label_eval.py`,
    `gmail_client._retryable`)
-5. `gmail_client.modify_labels` (A1)
+5. `gmail_client.modify_labels` (A1). **Done 2026-11-03.** One atomic
+   `messages.modify`; both sides are required keywords; it returns the
+   post-change label ids. It refuses an empty change, a bare string, the
+   same id on both sides, and any system label but `INBOX`. The guard
+   allowlist gains `("messages", "modify")`, and the new
+   `MODIFY_LABELS_CALLERS` rule starts empty (A1 as a test). 487 tests
+   pass. No live call made
 6. `logbook` schema (`prior_labels`, effective delta) → `undo_run.py` →
    **rehearsal**
 7. `agent.classify_and_label` + `Source "reply"`
@@ -1043,3 +1049,111 @@ E. Run `uv run python scripts/setup_labels.py` (preview only). Expected: all
 - `granted_scopes`, exactly as stored.
 - Whether the step 2 token had expired, and whether the old token was seen
   to break.
+
+---
+
+## Step 5 implementation
+
+**Status: done 2026-11-03.** The first function that
+can change a message. Code and tests only: **nothing calls it**, and no
+message is touched in this step. Its first real use is step 6's
+rehearsal, on throwaway mail.
+
+### `gmail_client.modify_labels`
+
+```python
+def modify_labels(
+    svc,
+    message_id: str,
+    *,
+    add_ids: Collection[str],
+    remove_ids: Collection[str],
+) -> tuple[str, ...]:
+    """The single atomic label change. Returns the message's label ids
+    after the change, as Gmail reports them."""
+```
+
+One `messages.modify` call carrying `addLabelIds` and `removeLabelIds`
+together, through `_execute`. Both keywords are **required**, even when
+one side is empty, so every call site states both halves of the change.
+
+**Checks before any API call.** Each is a caller bug, so it raises rather
+than silently doing less:
+
+1. **Empty change**: both sides empty → `ValueError` (from §1).
+2. **A string instead of a collection** → `TypeError`. `add_ids="Label_3"`
+   would otherwise be read as the characters `L`, `a`, `b`... It is the
+   same trap `require_scopes` avoids with separate arguments. Here a
+   keyword list is clearer, so the check is explicit instead.
+3. **The same id on both sides** → `ValueError`. Gmail's behaviour then is
+   undocumented, and no correct caller asks for it.
+4. **Only `INBOX` and user labels may be touched.** Every id must be
+   `INBOX` or start with `Label_`, the form Gmail gives user labels
+   (observed in step 2: `Label_2` to `Label_10`). Anything else raises:
+   `TRASH`, `SPAM`, `UNREAD`, `STARRED`, `IMPORTANT`, `CATEGORY_*`.
+   - The agent and undo only ever move `INBOX` and `Agent/` labels, so
+     this costs nothing. In return, `modify_labels` **cannot** trash,
+     spam, un-spam or mark read a message, whatever a caller passes.
+   - If Google ever changed the id format, this fails closed: it raises,
+     and does not let something through.
+
+Ids are sorted and de-duplicated before sending, so the request is
+deterministic and testable.
+
+**Ids, not names.** Both are strings, so the type cannot enforce it. Ids
+come from `label_ids()`. A name passed by mistake (`Agent/Receipts`) fails
+check 4, because it neither is `INBOX` nor starts with `Label_`. So the
+system-label rule also catches the ids-versus-names mistake.
+
+**Retries.** `messages.modify` sets labels and does not toggle them, so a
+retried call that already succeeded changes nothing. That makes
+`_execute`'s backoff safe here. A permission 403 is still never retried.
+
+**Why return the resulting labels** (§1 had `-> None`): Gmail's response
+already carries them, so it costs nothing. Undo's `--verify` and the
+agent's log can then record the state Gmail confirmed, not the state that
+was asked for.
+
+### The guard
+
+- `ALLOWED_API_CALLS` gains `("messages", "modify")`, the change §1 said
+  would come in this step's own diff.
+- **A1 as a test.** New in `test_write_guard.py`: no file under `app/` or
+  `scripts/` other than `gmail_client.py` refers to `modify_labels`, except
+  those in `MODIFY_LABELS_CALLERS`. It starts **empty**.
+  - Step 6 adds `scripts/undo_run.py`, and the rehearsal script that
+    writes fixture rows if it needs it.
+  - Step 7 adds `app/agent.py`.
+  - So "undo is the only caller until the rehearsal passes" is enforced,
+    not just a convention.
+  - A "refers to" scan catches `gmail_client.modify_labels(...)`,
+    `from app.gmail_client import modify_labels`, and passing the function
+    around by name.
+
+### Tests
+
+In `test_gmail_client.py`, with `FakeMessages` gaining `modify`:
+
+- one call, with the body holding both `addLabelIds` and `removeLabelIds`,
+  sorted and de-duplicated
+- an empty change raises, and no call is made
+- a string on either side raises `TypeError`, and no call is made
+- the same id on both sides raises
+- `TRASH`, `SPAM`, `UNREAD` and a label *name* on either side raise;
+  `INBOX` and `Label_7` are accepted
+- returns `labelIds` from the response
+- a permission 403 from `modify` is raised after one attempt; a 429 is
+  retried
+
+In `test_write_guard.py`:
+
+- the allowlist equality test picks up the new pair
+- the callers test, plus a synthetic case showing a reference from another
+  file fails it
+
+### Not in this step
+
+- No live call. A modify on a real message would be the first write to
+  mail, and that belongs to step 6's rehearsal, where undo exists to
+  reverse it.
+- No log schema change. That is step 6.

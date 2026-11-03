@@ -34,6 +34,7 @@ from app.gmail_client import (
     fetch_raw,
     header,
     label_ids,
+    modify_labels,
     search_ids,
 )
 
@@ -249,11 +250,13 @@ class FakeExecutable:
 
 
 class FakeMessages:
-    def __init__(self, pages=None, message=None):
+    def __init__(self, pages=None, message=None, modify_request=None):
         self._pages = list(pages or [])
         self._message = message
+        self._modify_request = modify_request
         self.list_calls: list[dict] = []
         self.get_calls: list[dict] = []
+        self.modify_calls: list[dict] = []
 
     def list(self, **kwargs):
         self.list_calls.append(kwargs)
@@ -262,6 +265,12 @@ class FakeMessages:
     def get(self, **kwargs):
         self.get_calls.append(kwargs)
         return FakeExecutable(self._message)
+
+    def modify(self, **kwargs):
+        self.modify_calls.append(kwargs)
+        if self._modify_request is not None:
+            return self._modify_request
+        return FakeExecutable({"id": kwargs["id"], "labelIds": ["Label_2", "Label_6"]})
 
 
 class FakeLabels:
@@ -575,3 +584,86 @@ def test_create_label_sends_only_the_name_and_returns_the_id():
     labels = FakeLabels()
     assert create_label(FakeService(labels=labels), "Agent/Receipts") == "Label_new"
     assert labels.create_calls == [{"userId": "me", "body": {"name": "Agent/Receipts"}}]
+
+
+# --- modify_labels: the one write to a message ------------------------------
+
+
+def test_modify_is_one_call_carrying_both_sides_sorted_and_deduplicated():
+    messages = FakeMessages()
+    modify_labels(
+        FakeService(messages),
+        "m1",
+        add_ids=["Label_6", "Label_2", "Label_6"],
+        remove_ids=["INBOX"],
+    )
+    assert messages.modify_calls == [{
+        "userId": "me",
+        "id": "m1",
+        "body": {"addLabelIds": ["Label_2", "Label_6"], "removeLabelIds": ["INBOX"]},
+    }]
+
+
+def test_modify_returns_the_labels_gmail_reports_after_the_change():
+    labels = modify_labels(
+        FakeService(FakeMessages()), "m1", add_ids=["Label_2"], remove_ids=["INBOX"]
+    )
+    assert labels == ("Label_2", "Label_6")
+
+
+@pytest.mark.parametrize(
+    "add, remove, error",
+    [
+        # an empty change is a caller bug, not a silent no-op
+        ([], [], ValueError),
+        # a bare string would be read as its characters
+        ("Label_2", [], TypeError),
+        ([], "INBOX", TypeError),
+        # no correct caller asks to add and remove the same label
+        (["Label_2"], ["Label_2"], ValueError),
+        # system labels other than INBOX: modify_labels cannot trash, spam,
+        # un-spam or mark-read, whatever it is passed
+        (["TRASH"], [], ValueError),
+        ([], ["SPAM"], ValueError),
+        ([], ["UNREAD"], ValueError),
+        (["CATEGORY_PROMOTIONS"], [], ValueError),
+        # a label NAME passed instead of its id
+        (["Agent/Receipts"], ["INBOX"], ValueError),
+    ],
+)
+def test_modify_refuses_a_bad_change_before_any_call(add, remove, error):
+    messages = FakeMessages()
+    with pytest.raises(error):
+        modify_labels(FakeService(messages), "m1", add_ids=add, remove_ids=remove)
+    assert messages.modify_calls == []
+
+
+def test_modify_accepts_inbox_and_user_labels_on_either_side():
+    messages = FakeMessages()
+    modify_labels(FakeService(messages), "m1", add_ids=["INBOX"], remove_ids=["Label_7"])
+    assert len(messages.modify_calls) == 1
+
+
+def test_a_permission_403_from_modify_is_raised_after_one_attempt():
+    """Now the error that matters most: a write the token does not cover."""
+    request = FlakyRequest(http_error(403, "insufficientPermissions"), failures=1)
+    with pytest.raises(HttpError):
+        modify_labels(
+            FakeService(FakeMessages(modify_request=request)),
+            "m1", add_ids=["Label_2"], remove_ids=["INBOX"],
+        )
+    assert request.attempts == 1
+
+
+def test_a_rate_limited_modify_is_retried():
+    """Safe because modify sets labels rather than toggling them: a retry of
+    a call that had already succeeded changes nothing."""
+    request = FlakyRequest(
+        http_error(429, "rateLimitExceeded"), failures=2, result={"labelIds": ["Label_2"]}
+    )
+    labels = modify_labels(
+        FakeService(FakeMessages(modify_request=request)),
+        "m1", add_ids=["Label_2"], remove_ids=["INBOX"],
+    )
+    assert request.attempts == 3
+    assert labels == ("Label_2",)

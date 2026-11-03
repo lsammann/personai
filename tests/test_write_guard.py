@@ -19,6 +19,8 @@ The three rules:
 2. Only `app/gmail_client.py` calls `.users()`.
 3. The `.users()`-rooted calls in `app/gmail_client.py` are exactly
    `ALLOWED_API_CALLS`.
+4. Only the files in `MODIFY_LABELS_CALLERS` refer to `modify_labels`, the
+   one function that changes a message (A1).
 
 Limit: this catches mistakes, not deliberate evasion - `getattr(svc, "users")`
 gets past it. The granted OAuth scope is the backstop for that.
@@ -43,13 +45,18 @@ GMAIL_CLIENT = "app/gmail_client.py"
 EXEMPT = frozenset({"scripts/spike_gmail.py"})
 
 # Every Gmail API call gmail_client may make, as the names after `.users()`.
-# Step 5 adds ("messages", "modify") - deliberately, in its own diff.
 ALLOWED_API_CALLS = frozenset({
-    ("messages", "list"),   # search_refs
-    ("messages", "get"),    # fetch_raw
-    ("labels", "list"),     # label_ids
-    ("labels", "create"),   # create_label
+    ("messages", "list"),     # search_refs
+    ("messages", "get"),      # fetch_raw
+    ("messages", "modify"),   # modify_labels (Phase 3 step 5)
+    ("labels", "list"),       # all_labels
+    ("labels", "create"),     # create_label
 })
+
+# The files allowed to refer to gmail_client.modify_labels (A1). Empty until
+# step 6 adds scripts/undo_run.py; app/agent.py joins only at step 7, after
+# the undo rehearsal has passed. Each addition is its own deliberate diff.
+MODIFY_LABELS_CALLERS: frozenset[str] = frozenset()
 
 
 # --- the analysis ---------------------------------------------------------
@@ -111,6 +118,18 @@ def api_calls(tree: ast.AST) -> set[tuple[str, ...]]:
     return found
 
 
+def refers_to_modify_labels(tree: ast.AST) -> bool:
+    """Any call, import or mention of `modify_labels` by name."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "modify_labels":
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == "modify_labels":
+            return True
+        if isinstance(node, ast.alias) and node.name == "modify_labels":
+            return True
+    return False
+
+
 def _scanned_files() -> list[tuple[str, ast.AST]]:
     files = []
     for directory in SCANNED_DIRS:
@@ -149,6 +168,19 @@ def test_gmail_client_api_calls_are_exactly_the_allowlist():
     leave the allowlist, so the list never claims more than the code does."""
     tree = ast.parse((ROOT / GMAIL_CLIENT).read_text())
     assert api_calls(tree) == ALLOWED_API_CALLS
+
+
+def test_only_allowed_callers_refer_to_modify_labels():
+    """A1: until the undo rehearsal has passed, undo is the only writer."""
+    offenders = [
+        name for name, tree in _scanned_files()
+        if name != GMAIL_CLIENT
+        and name not in MODIFY_LABELS_CALLERS
+        and refers_to_modify_labels(tree)
+    ]
+    assert not offenders, (
+        f"modify_labels referenced outside MODIFY_LABELS_CALLERS: {offenders}"
+    )
 
 
 def test_every_exempt_path_still_exists():
@@ -206,6 +238,22 @@ def test_binding_a_resource_to_a_variable_is_not_on_the_allowlist():
 
 def test_a_resourceless_call_is_recorded():
     assert calls_in("svc.users().getProfile(userId='me')") == {("getProfile",)}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "gmail_client.modify_labels(svc, i, add_ids=[], remove_ids=['INBOX'])",
+        "from app.gmail_client import modify_labels",
+        "write = modify_labels",
+    ],
+)
+def test_every_form_of_reference_to_modify_labels_is_seen(source):
+    assert refers_to_modify_labels(ast.parse(source))
+
+
+def test_a_different_name_is_not_a_reference_to_modify_labels():
+    assert not refers_to_modify_labels(ast.parse("gmail_client.label_ids(svc, n)"))
 
 
 def test_a_googleapiclient_import_is_seen_in_both_forms():
