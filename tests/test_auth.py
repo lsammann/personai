@@ -259,6 +259,6 @@ def test_status_reports_granted_not_requested(credentials_ok, monkeypatch):
 
 
 def test_scopes_are_pinned():
-    """Step 2's scope. Step 4's widening to gmail.modify has to show up here,
-    in a diff, rather than as a quiet constant change."""
-    assert auth.SCOPES == [auth.READONLY, auth.LABELS]
+    """Step 4's scope, the last widening in Phase 3. Any change has to show
+    up here, in a diff, rather than as a quiet constant change."""
+    assert auth.SCOPES == [auth.MODIFY]

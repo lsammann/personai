@@ -201,10 +201,10 @@ def _retryable(error: HttpError) -> bool:
 
     The subtlety is 403. Gmail returns it both for "you are going too fast"
     (retry) and for "your token does not carry that permission" (never retry) -
-    and the second is exactly what the read-only scope produces if a write ever
-    slips in. Retrying that would burn a minute and then report a rate-limit
-    problem that was really a scope violation, which is precisely the error this
-    project most wants to see clearly.
+    and the second is exactly what an insufficient scope produces if a call
+    the token does not cover ever slips in. Retrying that would burn a minute
+    and then report a rate-limit problem that was really a scope violation,
+    which is precisely the error this project most wants to see clearly.
     """
     status = getattr(error.resp, "status", None)
     if status not in RETRY_STATUSES:

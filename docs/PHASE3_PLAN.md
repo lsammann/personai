@@ -463,7 +463,7 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 ## Build order
 
-**Current step: 4** (not started).
+**Current step: 5** (not started).
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
    no consent, no API calls. **Done 2026-11-02.** Produced
@@ -490,7 +490,19 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
    removal. Label queries are verified against the real labels, which is
    the precondition `CLAUDE.md` sets for moving to `gmail.modify`.
    `label:"Agent"` does not match children's messages
-4. Consent `gmail.modify`; record token dates
+4. Consent `gmail.modify`; record token dates. **Done 2026-11-03.**
+   Consent at `2026-11-03T02:15:27Z`, which restarts the 7-day clock.
+   Granted, as stored: `gmail.modify` alone, so grants did not accumulate.
+   `require_scopes(MODIFY, LABELS, READONLY)` passes against it, and a
+   `setup_labels` preview found all ten present, so `_IMPLIES` holds
+   against a real grant. The step 2 token was alive (consented 00:20 that
+   day). Whether a `SCOPES` change breaks an old token's refresh: **not
+   observed again**, because consent came at 02:15, before the old access
+   token's 02:19 expiry. Before re-consent, `status()` still correctly
+   reported the old grant (`labels` + `readonly`), not the new request.
+   Google's wording for the permission was not recorded. Three stale
+   "read-only" claims were corrected (`main.py`, `label_eval.py`,
+   `gmail_client._retryable`)
 5. `gmail_client.modify_labels` (A1)
 6. `logbook` schema (`prior_labels`, effective delta) → `undo_run.py` →
    **rehearsal**
@@ -948,3 +960,86 @@ G. Turn conversation view back on if you want it.
 - Whether `label:"Agent"` matches child-labelled messages.
 - That the hand-applied labels were removed, which is shown by the `clean`
   run.
+
+---
+
+## Step 4 implementation
+
+**Status: done 2026-11-03.** The token gains the right
+to change messages. **No code gains the ability to:** until step 5 the
+write guard's allowlist has no `messages.modify`, so from this step until
+that one the token can write but no code path can. This is the reverse of
+Phases 0 to 2, where code might have tried but the token would have
+refused.
+
+### Code
+
+**`app/auth.py`:** `SCOPES = [MODIFY]`. `gmail.modify` includes everything
+`gmail.labels` and `gmail.readonly` allow (`_IMPLIES`, step 1), so asking for
+all three would add nothing. Requesting one scope keeps the consent screen
+honest about what is being granted. The module docstring and the `SCOPES`
+comment say step 4 has happened.
+
+**Callers need no change.** `setup_labels` asks for `LABELS, READONLY` and
+`verify_labels` asks for `READONLY`. A grant of `MODIFY` covers both through
+`_IMPLIES`. The existing `require_scopes` test table already has that row.
+
+**Stale "read-only" claims, corrected** because they are now false:
+
+- `app/main.py:46`: the page still says "Phase 0 - read-only". It becomes
+  "Phase 3", with the granted scopes already shown beside it.
+- `scripts/label_eval.py:25`: "the token carries `gmail.readonly` besides".
+  The script is still read-only by construction (lists and gets only, and
+  the guard enforces that). Only the claim about the token goes.
+- `app/gmail_client.py:204`, the `_retryable` docstring: "what the
+  read-only scope produces if a write ever slips in" becomes "what an
+  insufficient scope produces". The behaviour is unchanged: a permission
+  403 is never retried.
+
+### Tests
+
+Amended only, none added:
+
+- `test_scopes_are_pinned`: `SCOPES == [auth.MODIFY]`. Its docstring now
+  says this is the last widening in Phase 3.
+
+Nothing else depends on the requested list. `test_status_reports_granted_not_requested`
+patches `SCOPES` itself.
+
+### Expected side effects
+
+- **Grants may accumulate.** Google keeps every scope a user has granted to
+  this app. The new token's `granted_scopes` may list all three or only
+  `gmail.modify`. Either passes; the record says which.
+- **The old token may stop refreshing** once `SCOPES` changes, as predicted
+  and not observed in step 2. It only shows when the current access token
+  expires (hourly), so it is recorded only if seen.
+- **The 7-day clock restarts** at this consent.
+
+### The manual procedure (the human)
+
+A. Land the code; tests pass.
+
+B. Record whether the step 2 token was still alive. `consented_at` was
+   `2026-11-03T00:20:50Z`, so it should be, with about 6 days left.
+
+C. Start the server, visit `/auth/start`, and consent. **Read Google's
+   description of the permission, and record its wording.** It is the first consent that lets the app
+   change mail. If Google refuses the scope, add `gmail.modify` under the
+   consent screen's Data access settings in the Cloud console.
+
+D. Check the grant:
+   - `data/token.json` → `granted_scopes` includes `gmail.modify`
+   - the status page shows it
+
+E. Run `uv run python scripts/setup_labels.py` (preview only). Expected: all
+   ten present, nothing to create. This shows a real `gmail.modify` grant
+   satisfies a `LABELS + READONLY` requirement through `_IMPLIES`, and that
+   label reads still work under the new token.
+
+### Recorded when done
+
+- `consented_at` (the new 7-day clock).
+- `granted_scopes`, exactly as stored.
+- Whether the step 2 token had expired, and whether the old token was seen
+  to break.

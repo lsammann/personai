@@ -6,8 +6,8 @@ app, so the flow runs as ordinary routes in this app rather than through
 server, and shells out to a browser). First-time setup and the weekly
 re-authentication are therefore the same code path.
 
-Scope was read-only until Phase 3 step 2, and widens in two deliberate steps
-- see CLAUDE.md. What Google *granted* is recorded at consent and checked by
+Scope was read-only until Phase 3 step 2, gained `gmail.labels` there, and
+became `gmail.modify` at step 4 - see CLAUDE.md. What Google *granted* is recorded at consent and checked by
 `require_scopes`; the `SCOPES` constant is only what we *ask* for.
 """
 
@@ -42,9 +42,13 @@ MODIFY = "https://www.googleapis.com/auth/gmail.modify"
 # re-consent. Never read this to learn what the token can do - Google may
 # grant less than was asked, and that is what `granted_scopes()` reports.
 #
-# Phase 3 step 2: + gmail.labels, which can create labels but cannot touch a
-# message. Step 4 replaces both with gmail.modify. A test pins this list.
-SCOPES = [READONLY, LABELS]
+# Phase 3 step 2 added gmail.labels, which can create labels but cannot touch
+# a message. Step 4 replaced both with gmail.modify alone: it covers both
+# (`_IMPLIES`), so requesting all three would add nothing, and one scope keeps
+# the consent screen exact about what is granted. The token can now change
+# messages; whether code can is decided by the allowlist in
+# tests/test_write_guard.py. A test pins this list.
+SCOPES = [MODIFY]
 
 # gmail.modify covers everything gmail.labels and gmail.readonly allow. Kept
 # in one place so no caller has to know the scope hierarchy.

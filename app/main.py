@@ -43,7 +43,7 @@ def index() -> str:
     return (
         "<!doctype html><title>Email Agent</title>"
         "<h1>Email Agent</h1>"
-        "<p>Phase 0 - read-only.</p>" + body
+        "<p>Phase 3.</p>" + body
     )
 
 

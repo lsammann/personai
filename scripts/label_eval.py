@@ -22,8 +22,9 @@ every truncation change would silently redefine what is being measured and
 `body_chars` would stop being tunable at all. Press `m` if the visible part is
 not enough to decide.
 
-Read-only. This script lists and gets; it cannot touch a label, and the token
-carries `gmail.readonly` besides.
+Read-only. This script lists and gets through `gmail_client`; it cannot
+touch a label, and `tests/test_write_guard.py` enforces that it cannot reach
+the API any other way.
 """
 
 from __future__ import annotations
