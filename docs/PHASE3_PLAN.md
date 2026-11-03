@@ -463,7 +463,7 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 ## Build order
 
-**Current step: 3** (not started).
+**Current step: 4** (not started).
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
    no consent, no API calls. **Done 2026-11-02.** Produced
@@ -484,7 +484,12 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
    the sidebar. Whether a scope change breaks an existing token was **not
    observed**: the old token had already expired, so re-consent was needed
    anyway. `require_scope` became `require_scopes` (see the Step 2 section).
-3. `verify_labels.py`, with the expectations written here first → run it
+3. `verify_labels.py`, with the expectations written here first → run it.
+   **Done 2026-11-03.** Parent `Agent` label added to setup (the nine now
+   nest). `--expect labelled` 13/13 and `--expect clean` 13/13 after
+   removal. Label queries are verified against the real labels, which is
+   the precondition `CLAUDE.md` sets for moving to `gmail.modify`.
+   `label:"Agent"` does not match children's messages
 4. Consent `gmail.modify`; record token dates
 5. `gmail_client.modify_labels` (A1)
 6. `logbook` schema (`prior_labels`, effective delta) → `undo_run.py` →
@@ -805,7 +810,7 @@ how the token behaves across a scope change.
 
 ## Step 3 implementation
 
-**Status: proposed, 2026-11-03. Not yet agreed.** Still no message writes by
+**Status: done 2026-11-03.** Still no message writes by
 code. The human labels a handful of messages by hand. A read-only script
 checks that our queries find exactly those messages, then checks again,
 after the labels are removed, that the queries find nothing.
@@ -920,7 +925,26 @@ G. Turn conversation view back on if you want it.
 
 ### Recorded when done
 
-- Both runs' outputs.
+- **Baseline, before anything was labelled or the parent created
+  (2026-11-03):** `--expect clean` gave 13/13 PASS, base = 19,823 messages,
+  about 1m48s per run. Weak evidence on its own: Gmail returned 0 for
+  `label:"Agent"`, which did not exist yet, without error. A misparsed
+  query returns 0 silently, so only the `labelled` run can tell a correct
+  query from a broken one.
+- **Parent created (procedure B):** `Agent` exists alongside the nine,
+  confirmed by `all_labels` on 2026-11-03.
+- **`--expect labelled` (procedure D), 2026-11-03: 13/13 PASS**, base
+  19,823 throughout. Every label name, including the nested multi-word
+  `Agent/To Action` and `Agent/Needs Review`, matched exactly its
+  hand-counted messages. Both multi-word negations and the complement
+  identity held (19,818 unprocessed + 4 + 1 = 19,823). This is the case
+  `DESIGN.md` → Label naming could not test, now tested.
+- **Parent search does not include children:** `label:"Agent"` matched 0
+  messages while its sub-labels sat on 5. Each label matches only messages
+  carrying it directly.
+- **`--expect clean` after removal (procedure F), 2026-11-03: 13/13 PASS**,
+  as reported by the human (output not pasted). The hand-applied labels on
+  M1-M5 are removed.
 - Whether `label:"Agent"` matches child-labelled messages.
 - That the hand-applied labels were removed, which is shown by the `clean`
   run.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create the nine `Agent/` labels. Phase 3 step 2.
+"""Create the nine `Agent/` labels and their `Agent` parent. Phase 3 steps 2-3.
 
     setup_labels.py            print what would be created; create nothing
     setup_labels.py --apply    create what is missing
@@ -9,7 +9,7 @@ Create-only. It never renames and never deletes. A case-variant clash
 even with `--apply`: renaming the reader's label is their call, not this
 script's.
 
-Idempotent: a second `--apply` finds all nine present and creates nothing.
+Idempotent: a second `--apply` finds all ten present and creates nothing.
 
 Needs `gmail.labels` and `gmail.readonly` as GRANTED, not as requested.
 Labels alone would do for this script, but every later step needs both, and
@@ -23,11 +23,7 @@ import argparse
 import sys
 
 from app import auth, gmail_client
-from app.categories import AGENT_LABELS, LABEL_PREFIX, plan_label_setup
-
-# A parent label Gmail might use to nest `Agent/...` in the sidebar. Reported,
-# not created: whether it is needed is measured in step 3.
-PARENT_LABEL = LABEL_PREFIX.rstrip("/")
+from app.categories import SETUP_LABELS, plan_label_setup
 
 
 def main() -> int:
@@ -62,15 +58,12 @@ def main() -> int:
         created.add(name)
 
     # Re-read through the same lookup every later step uses, so success here
-    # means those steps will find all nine.
-    ids = gmail_client.label_ids(svc, sorted(AGENT_LABELS))
+    # means those steps will find every label.
+    ids = gmail_client.label_ids(svc, sorted(SETUP_LABELS))
     for name, label_id in ids.items():
         state = "created" if name in created else "already present"
         print(f"  {name:<22} {label_id:<24} {state}")
     print(f"\n{len(created)} created, {len(ids) - len(created)} already present.")
-
-    parent = PARENT_LABEL in gmail_client.all_labels(svc)
-    print(f"Parent label {PARENT_LABEL!r}: {'exists' if parent else 'does not exist'}.")
     return 0
 
 

@@ -153,6 +153,16 @@ AGENT_LABELS: frozenset[str] = frozenset(
     {label_for(category) for category in Category} | {NEEDS_REVIEW, *STOP_LABELS}
 )
 
+# Gmail nesting is naming only: `Agent/Bookings` displays under `Agent` if and
+# only if a label named exactly `Agent` exists. Step 2 measured the nine
+# showing flat without it. Created by setup, never applied to a message - so
+# it is deliberately NOT in AGENT_LABELS, and never in a lookup or the undo
+# sweep.
+LABEL_PARENT = LABEL_PREFIX.rstrip("/")
+
+# What `scripts/setup_labels.py` ensures exists: the nine plus the parent.
+SETUP_LABELS: frozenset[str] = AGENT_LABELS | {LABEL_PARENT}
+
 
 @dataclass(frozen=True)
 class LabelSetupPlan:
@@ -165,7 +175,7 @@ class LabelSetupPlan:
 
 
 def plan_label_setup(existing: Collection[str]) -> LabelSetupPlan:
-    """Sort `AGENT_LABELS` into present, to create, and clashing.
+    """Sort `SETUP_LABELS` into present, to create, and clashing.
 
     A clash is an existing label equal to a wanted one ignoring case but not
     exactly - `agent/to action` against `Agent/To Action`. Gmail refuses a
@@ -174,7 +184,7 @@ def plan_label_setup(existing: Collection[str]) -> LabelSetupPlan:
     rather than with a 409 halfway through. Whether to rename the existing
     one is the human's call, never the script's.
 
-    Labels outside `AGENT_LABELS` - INBOX, the reader's own - are ignored.
+    Labels outside `SETUP_LABELS` - INBOX, the reader's own - are ignored.
     """
     existing_set = set(existing)
     by_folded: dict[str, list[str]] = {}
@@ -182,7 +192,7 @@ def plan_label_setup(existing: Collection[str]) -> LabelSetupPlan:
         by_folded.setdefault(name.casefold(), []).append(name)
 
     present, to_create, clashes = [], [], []
-    for wanted in sorted(AGENT_LABELS):
+    for wanted in sorted(SETUP_LABELS):
         if wanted in existing_set:
             present.append(wanted)
             continue
