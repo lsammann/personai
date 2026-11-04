@@ -125,6 +125,35 @@ class NotAuthenticated(GmailError):
     """
 
 
+class GmailApiError(GmailError):
+    """An API call that failed after `_execute`'s backoff, or was never worth
+    retrying. Raised in place of googleapiclient's `HttpError`, `from` it.
+
+    Exists so callers outside this module can tell a Gmail failure from a
+    bug in their own code without importing `googleapiclient`, which
+    `tests/test_write_guard.py` forbids. The agent turns this into a failure
+    row; a bare `except Exception` would turn a bug into one too (Phase 3
+    plan, Step 7 Q2).
+
+    `status` is the HTTP status, or None if the response carried none.
+    """
+
+    def __init__(self, message: str, status: int | None):
+        self.status = status
+        super().__init__(message)
+
+
+class Forbidden(GmailApiError):
+    """Any 403 that outlasted the backoff, or was never retried.
+
+    A 403 from Gmail is always about the account, never about one message:
+    a scope the token lacks, a daily limit, or a rate limit still in force
+    after every attempt. Every later message would fail the same way, so
+    callers treat it like an auth failure and halt rather than logging one
+    failure per message.
+    """
+
+
 class MissingLabels(GmailError):
     """One or more required labels do not exist in the mailbox.
 
@@ -231,6 +260,10 @@ def _execute(request):
     `rateLimitExceeded`. A caller that has to be restarted repeatedly through
     normal operation is not resumable in any useful sense.
 
+    What survives the retries is raised as `GmailApiError` (`Forbidden` for
+    a 403), never as the raw `HttpError`, so no caller has to import
+    `googleapiclient` to catch it.
+
     Backoff is the safety net, not the strategy. A sustained sweep should pace
     itself so the limit is never reached - see `throttle` - because once the
     quota window is exhausted, waiting inside it is strictly worse than not
@@ -242,12 +275,20 @@ def _execute(request):
             return request.execute()
         except HttpError as error:
             if attempt == MAX_ATTEMPTS - 1 or not _retryable(error):
-                raise
+                raise _api_error(error) from error
             retry_count += 1
             delay = min(2.0**attempt, BACKOFF_CAP)
             # Equal jitter: half the delay guaranteed, half randomised.
             time.sleep(delay / 2 + random.uniform(0, delay / 2))
     raise AssertionError("unreachable: the final attempt either returns or raises")
+
+
+def _api_error(error: HttpError) -> GmailApiError:
+    """The `GmailApiError` (or `Forbidden`) a final `HttpError` becomes."""
+    status = getattr(error.resp, "status", None)
+    status = int(status) if status is not None else None
+    kind = Forbidden if status == 403 else GmailApiError
+    return kind(str(error), status=status)
 
 
 def search_refs(svc, query: str, limit: int | None = None) -> list[tuple[str, str]]:

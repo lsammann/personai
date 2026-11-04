@@ -29,7 +29,9 @@ from app.categories import Category
 from app.config import LOG_PATH
 
 # Where a row's ANSWER came from. Orthogonal to `run_kind` below.
-Source = Literal["model", "prefilter", "correction"]
+# `reply` is the reply rule (`decision.decide_reply_hit`), added with its call
+# site in Phase 3 step 7.
+Source = Literal["model", "prefilter", "reply", "correction"]
 
 # Which INVOCATION produced the row. `manual` is the CLI entry point - trying
 # the thing out on a handful of emails - which otherwise lands in the same file
@@ -74,7 +76,9 @@ class Record(BaseModel):
     sender: str = ""
     subject: str = ""
 
-    source: Source
+    # None only on a row that failed before routing was reached - a fetch
+    # failure - where no value would be true (Phase 3 step 7, Q3).
+    source: Source | None
 
     category: Category | None = None
     confidence: float | None = None
@@ -128,7 +132,7 @@ class Record(BaseModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> Record:
-        """Three rules a row cannot break, checked whenever one is built.
+        """Four rules a row cannot break, checked whenever one is built.
 
         Writes are strict, so a row that fails here is never appended. Reads
         stay tolerant: `read_all` counts such a line as skipped.
@@ -143,6 +147,9 @@ class Record(BaseModel):
             raise ValueError("a failed row must carry no label change")
         if self.dry_run and self.labels_after is not None:
             raise ValueError("a dry run made no change, so it has no labels_after")
+        if self.source is None and self.error is None:
+            # Only a failure before routing has no source to record.
+            raise ValueError("a row without a source must carry an error")
         return self
 
 

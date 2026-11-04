@@ -438,6 +438,25 @@ the labelling CLI fetches one message per human decision, roughly every thirty
 seconds, and would gain nothing from sleeping. **Anything that prefetches in
 bulk — notably building the eval content cache — must pace.**
 
+Since Phase 3 step 7, a 403 that outlasts the backoff is raised as
+`gmail_client.Forbidden`, and the agent **halts the run** on it rather than
+writing one failure row per message. A run that trips the window this way
+ends early. It does not label the rest of the batch as failures.
+
+## Transport errors — no policy for the poller yet
+
+Found in Phase 3 step 7. `_execute` retries only `HttpError`. A socket
+timeout, a DNS failure or a reset connection comes from the HTTP layer
+underneath, is not retried, and is not wrapped as a `GmailApiError`, so the
+agent lets it propagate and the run halts. For Phase 3's manual runs (at most
+25 messages) that costs one restart. If one cuts off a modify that Gmail had
+already committed, the message is an orphan, and the undo sweep reports it.
+
+The Phase 4 poller cannot work that way: a wifi blip would stop it. It needs
+a decision, at minimum on retrying these in `_execute` and on whether one
+halts a cycle or only skips the message. Catching them means naming the HTTP
+library underneath (`httplib2`), which the project uses without declaring.
+
 ## Sender concentration — weaker than hoped
 
 77 unique domains across a 150-message sample, **44 of them singletons**.

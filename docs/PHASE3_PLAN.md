@@ -463,7 +463,7 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 ## Build order
 
-**Current step: 7** (not started). Step 6's rehearsal passed 2026-11-03, which unlocks `app/agent.py`.
+**Current step: 7** (built 2026-11-04, 589 tests pass; procedure B, the cold-start check, passed 2026-11-04: 22.2 s, timeout stays 120 s). Step 6's rehearsal passed 2026-11-03, which unlocks `app/agent.py`.
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
    no consent, no API calls. **Done 2026-11-02.** Produced
@@ -1713,3 +1713,426 @@ All agreed as recommended. Q4 and Q7 changed during review; see their rows.
 | 9 | `rehearse_undo.py` after the pass | **Kept**, still on `MODIFY_LABELS_CALLERS` | The subject-tag gate confines it to throwaway mail, and it keeps the rehearsal repeatable if undo changes in Phase 4 |
 | 10 | Validators on `Record` | **All three**: action requires `prior_labels`; error requires an empty action; `labels_after` requires `dry_run=False` | No rows exist, so this is free now and a migration later. *Rejected:* checking them only in the agent, where the fixture could skip them |
 | 11 | Single-message undo (`--message ID`) | **Not added** | A single misfiled message is fixed by hand in Gmail, which is a correction (Phase 4), not an undo. Undo reverses runs, and nothing in Phase 3 needs it narrower |
+
+---
+
+## Step 7 implementation
+
+**Status: built 2026-11-04 (589 tests pass); procedure B passed 2026-11-04.** Code and tests only.
+Nothing calls `classify_and_label` until step 8's `run_pass.py`, so this
+step makes no Gmail call and touches no message. Where this differs from
+§7, this section is newer, and each difference is marked. All ten design
+questions were agreed as recommended; see [the decisions
+table](#decisions-taken-step-7-review-2026-11-04) at the end of this
+section.
+
+### What reading the code turned up
+
+- **Gmail errors arrive as `HttpError`, and `agent.py` may not import it.**
+  `_execute` re-raises `googleapiclient`'s `HttpError` unchanged, and guard
+  rule 1 keeps `googleapiclient` out of every module but `gmail_client`.
+  `undo_run.py` gets round this with `except Exception` after re-raising
+  auth errors. That is fine in a script that only reports. In the agent it
+  would turn a bug in our own code, such as a `Record` validator's
+  `ValueError` or a `KeyError` in the id map, into a failure row. The run
+  would then carry on and write the same failure for every message (Q2).
+- **Transport errors are not `HttpError`.** A socket timeout, a DNS failure
+  or a reset connection comes from the HTTP layer underneath, and
+  `_execute` does not retry these at all.
+- **`classifier.DEFAULT_TIMEOUT` is 600 s.** With 5 tries, a hung Ollama
+  could hold one message for 50 minutes (Q5).
+- **§7 step 6 says "because the call is atomic nothing was applied".** That
+  is not quite right. Atomic means all or nothing, not nothing. A modify
+  that times out or returns a 5xx *after* Gmail committed it has applied
+  everything, and we cannot tell which happened (Q6).
+- **`Source` is required, but a fetch failure happens before routing,** so
+  none of its values is true for that row (Q3).
+- **`classify_and_label` takes any message id.** The queue query excludes
+  `STOP_LABELS`, but the function has no guard of its own. On a message
+  already carrying `Processed` it would add a second category label. On an
+  `Agent/Error` message it would put `Processed` beside `Error`, which the
+  three-states rule forbids (Q4).
+- **`prefilter_domains.json` is `[]`.** The allowlist branch cannot fire on
+  real mail yet; only tests reach it. That is fine, but it means the large
+  dry run will report zero prefilter rows, and this is why.
+- **§7's parameter `label_ids` has the same name as `gmail_client.label_ids`,**
+  the function that produces it. Undo calls the same map `ids_by_name` (Q1).
+- **`prompt_id` is not in `Config`.** The shipped prompt is
+  `classifier.DEFAULT_PROMPT_ID` (`v9b-bookings`). The agent passes that
+  constant and logs it.
+- **The eval already scored the reply rule first and the allowlist second**
+  (`evalscore.py`, commented "the live order"). §7's order is the one the
+  dev and holdout figures measured.
+
+### `app/agent.py`
+
+```python
+# Q7: 4 retries after the first attempt, 5 tries in total (plan review).
+OLLAMA_RETRY_DELAYS: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
+# Q5: replaces classifier.DEFAULT_TIMEOUT for live classification.
+CLASSIFY_TIMEOUT: float = 120.0
+
+def classify_and_label(
+    svc,
+    message_id: str,
+    *,
+    cfg: Config,
+    ids_by_name: Mapping[str, str],        # Q1; was `label_ids`
+    allowlist: Collection[str],
+    run_id: str,
+    run_kind: RunKind,
+    dry_run: bool,
+) -> logbook.Record | None:                # None: Q4
+```
+
+**Order, per message.** These are §7's steps, with changes marked.
+
+0. *New (Q1).* `ids_by_name` must cover `AGENT_LABELS | {INBOX}`. If it
+   does not, raise `ValueError` before any call. That would be a caller
+   bug. `run_pass` builds the map with `label_ids()`, which already fails
+   closed; this check makes the function safe on its own.
+1. `fetch` (format=full, as in eval). Keep `label_ids` as `prior_labels`.
+   A `GmailApiError` becomes a failure row with `prior_labels=None` and
+   `source=None` (Q3). Errors that affect the whole mailbox halt (Q2).
+2. *New (Q4).* If the message already carries any `STOP_LABELS` id, return
+   `None`: no row and no write.
+3. **Reply rule:** `prefilter.is_reply(subject)` → `decide_reply_hit()`,
+   `source="reply"`.
+4. **Allowlist:** `prefilter.matches(sender, allowlist)` →
+   `decide_prefilter_hit()`, `source="prefilter"`.
+5. **Model:** `_classify(message, cfg)`, with retries (Q7), then `decide(...)`
+   with `cfg`'s two thresholds, `source="model"`. A `ClassifierError` that
+   outlasts the retries becomes `decide_failure()` with `error` set.
+6. **Effective change:** turn `prior_labels` into names through the
+   inverted map (ids not in it are dropped), then
+   `decision.effective_change`, then `logbook.Action`.
+7. If `not dry_run` and the action is non-empty: **one** `modify_labels`
+   call, with ids from `ids_by_name`. Its return becomes `labels_after`. A
+   `GmailApiError` becomes a failure row (Q6).
+   - After step 2, every successful decision adds `Processed` or `Error`,
+     and neither can already be present. So on success the action is
+     always non-empty. The condition is still kept: on a failure row the
+     action is empty, and `modify_labels` refuses an empty change anyway.
+8. `logbook.append`, **after** the modify. Return the row.
+
+`dry_run` is still a parameter, as §7 says, so `--live` stays the only way
+to write. A dry run does everything except step 7's call, including the
+effective change against the real prior labels. So the large dry run shows
+exactly what a live run would have done.
+
+**Retries (Q7).** `_classify` calls `classifier.classify(...)` with
+`model=cfg.ollama_model`, `body_chars=cfg.body_chars`,
+`prompt_id=DEFAULT_PROMPT_ID` and `timeout=CLASSIFY_TIMEOUT`. On
+`OllamaError` it sleeps for the next delay and tries again. After the
+fourth retry fails, the last error is used. `NoCategoryLetter` is never
+retried. Sleeping goes through `time.sleep`, looked up on the module, so
+tests patch it and record the delays instead of waiting.
+
+**What halts the run (Q2).** These propagate and no row is written:
+`NotAuthenticated`, `RefreshError`, the new `gmail_client.Forbidden`,
+and anything that is not a `GmailApiError` or a `ClassifierError`: bugs,
+and transport errors. Only `GmailApiError` (fetch or modify) and
+`ClassifierError` (after retries) become failure rows.
+
+**What a row carries** (Q10):
+
+| Field | Set when |
+|---|---|
+| `message_id`, `run_id`, `run_kind`, `dry_run` | always |
+| `sender`, `subject`, `prior_labels` | the fetch succeeded |
+| `source` | routing was reached (Q3) |
+| `model`, `prompt_id`, `body_chars` | the model was called, whether it succeeded or failed |
+| `distribution`, `retained_mass` | the model succeeded |
+| `category`, `confidence` | from the `Decision`: `confidence` is `None` on rule rows, as `decision.py` intends |
+| `confidence_threshold`, `to_action_floor` | `decide()` ran |
+| `action`, `labels_after` | as the validators require |
+| `error` | `"<stage>: <ExceptionType>: <message>"`, where stage is `fetch`, `classify` or `modify` |
+| `note` | missing letters (`"missing letters: C, F"`), Ollama retries if any (`"ollama retries: 2"`), and on a modify failure the intended change (Q6), joined with `"; "` |
+
+The stage in `error` lets Phase 4 decide which failures count toward
+dead-lettering. A deleted message's 404 probably should not count the same
+as a prompt the model always fails on. That decision belongs to Phase 4;
+the string only makes it possible.
+
+### `app/gmail_client.py` (Q2)
+
+```python
+class GmailApiError(GmailError):
+    """An API call that failed after _execute's backoff. `.status` is the
+    HTTP status, or None if the response carried none."""
+
+class Forbidden(GmailApiError):
+    """Any 403 that outlasted the backoff: a scope problem, or a quota that
+    stayed exhausted. Both are about the account, not one message."""
+```
+
+`_execute` raises one of these, `from` the original `HttpError`, where it
+raises the bare `HttpError` today. Retry behaviour does not change.
+
+- **Why every 403 is `Forbidden`, not only the permission one:** a 403
+  from Gmail is always about the account. That covers scope, a daily
+  limit, or a rate limit still in force after 7 attempts. Every later
+  message would fail the same way, so it halts, like an auth failure.
+- **Transport errors are not wrapped.** They propagate and halt the run.
+  On a manual run of at most 25 that costs one restart. If one cuts off a
+  modify that Gmail had already committed, the message is an orphan, and
+  the sweep reports it. The poller (Phase 4) will need its own policy for
+  these; that goes in `docs/BACKLOG.md`, not here.
+- **Existing callers are unaffected.** `undo_run.py` catches `Exception`,
+  and the other scripts catch nothing. Six tests in `test_gmail_client.py`
+  assert `HttpError` and are amended to the new types, with the cause
+  checked.
+
+### `app/logbook.py`
+
+- `Source = Literal["model", "prefilter", "reply", "correction"]`.
+  `"reply"` was deferred to this step by §6.
+- *Q3:* `source: Source | None`, and a fourth validator: `source is None`
+  requires `error`. A row can lack a source only if it failed before
+  routing.
+
+### The guard — `tests/test_write_guard.py`
+
+- `MODIFY_LABELS_CALLERS` gains `"app/agent.py"`. Its comment changes from
+  "joins only at step 7" to "joined at step 7, after the rehearsal passed
+  on 2026-11-03".
+- `test_no_app_module_writes_until_the_rehearsal_passes` is **changed
+  deliberately**, as step 6 said it would be (Q8). It becomes
+  `test_agent_is_the_only_app_module_that_writes`:
+  `{p for p in MODIFY_LABELS_CALLERS if p.startswith("app/")} == {"app/agent.py"}`.
+- Two docstrings that say "until the rehearsal has passed" are updated:
+  rule 4 in the module docstring, and `test_only_allowed_callers_refer_to_modify_labels`.
+
+### Tests
+
+`tests/test_agent.py` (new). Gmail is faked at the service level (Q9), so
+the real `fetch` parsing and the real `modify_labels` checks run.
+`classifier.classify` is monkeypatched, and `time.sleep` is patched to
+record delays.
+
+- **One test per row of the decision table**, run live and in a dry run
+  (parametrised):
+  - confident Receipts (0.95): one modify adding Receipts and Processed and
+    removing `INBOX`, all as ids
+  - confident To Action, and confident Bookings: no `INBOX` remove
+  - Needs Review (0.55): Needs Review and Processed added, `INBOX` kept
+  - the To Action override (Receipts 0.80, To Action 0.15):
+    `to_action_override` is true and `INBOX` is kept
+  - prefilter hit; reply hit
+  - failure: no modify call
+
+  The dry run makes zero modify calls, and its row equals the live row
+  except for `dry_run` and `labels_after`.
+- **Reply beats the allowlist:** a `Re:` subject from an allowlisted domain
+  routes as `reply`, and `classify` is never called.
+- **Rule rows** carry no model fields and no thresholds.
+- **Already archived:** a confident Receipts on a message without `INBOX`
+  sends no `INBOX` in `removeLabelIds`, and the row's action has no remove.
+- **Terminal state (Q4):** `Processed` present returns `None`, with no
+  modify and no row. The same for `Error`.
+- **Failures:**
+  - `NoCategoryLetter`: one call, no sleep, a failure row
+  - `OllamaError` five times: five calls, sleeps of 2, 4, 8 and 16 s, a
+    failure row
+  - `OllamaError` twice then success: three calls, the message labelled,
+    `note` says `ollama retries: 2`
+  - fetch 404: a failure row with `prior_labels=None` and `source=None`
+  - modify 500 (after backoff): a failure row with stage `modify`, an empty
+    action, and the intended change in `note`
+- **Halts:** `NotAuthenticated` from fetch, `RefreshError` from modify and
+  `Forbidden` from fetch each propagate, and no row is written.
+- **A bug is not a failure:** `classify` raising `KeyError` propagates, and
+  no row is written. This is the test that `except Exception` would fail.
+- **The row is written after the modify:** the fake's `modify` asserts the
+  log file is still empty when it is called.
+- **A map missing a label** raises `ValueError` before any fetch.
+- **Logged parameters:** `prompt_id == DEFAULT_PROMPT_ID`, and `model`,
+  `body_chars` and both thresholds come from `cfg`.
+
+Elsewhere:
+
+- `test_logbook.py`: `"reply"` is accepted; `source=None` without `error`
+  is rejected; with `error` it is accepted.
+- `test_gmail_client.py`: the six `HttpError` assertions are amended. New
+  tests: a 404 raises `GmailApiError` with `.status == 404` and the
+  `HttpError` as its cause; a permission 403 raises `Forbidden` after one
+  attempt; a rate-limit 403 that outlasts the backoff raises `Forbidden`.
+- `test_write_guard.py`: as above.
+
+### Not in this step
+
+- No entry point and no live call. Step 8's `run_pass.py` is the first
+  caller.
+- No dead-lettering and no failure counting. Both are Phase 4.
+  `decide_dead_letter()` stays unreachable from the agent.
+
+### Files touched
+
+`app/agent.py` (new), `app/logbook.py`, `app/gmail_client.py`,
+`tests/test_agent.py` (new), `tests/fakes.py` (new, Q9),
+`tests/test_gmail_client.py`, `tests/test_logbook.py`,
+`tests/test_write_guard.py`. One line in `docs/BACKLOG.md`: transport
+errors in the poller. No new dependencies: `RefreshError` comes from
+`google-auth`, already present and already imported by `auth.py` and
+`undo_run.py`.
+
+### Changed during build, 2026-11-04
+
+Where building settled a detail this section left open:
+
+- **The modify-failure row.** The table above says `distribution` is set
+  when "the model succeeded", which a modify failure satisfies. Built to the
+  older rule in `logbook` instead: "a row with an error is never also a
+  classification". So a modify-failure row drops `category`, `confidence`,
+  `distribution`, `retained_mass` and the thresholds, and keeps `model`,
+  `prompt_id` and `body_chars`, since the model was called. What was lost
+  goes in `note`, e.g. `intended: Receipts; +Agent/Processed +Agent/Receipts
+  -INBOX`, which is what an orphan investigation needs. The message retries
+  next run and is classified again anyway.
+- **`CLASSIFY_TIMEOUT = 120`**, an int, because `classifier.classify`'s
+  `timeout` is typed `int`.
+- **Fakes.** `FakeMessages` gained `get_request` (alongside
+  `modify_request`) so a fetch can fail, and `FlakyRequest` accepts any
+  exception, so the halt tests can raise `RefreshError` and `TimeoutError`
+  from inside a call.
+- **One test beyond the list:** a `TimeoutError` from fetch halts the run,
+  which is the transport-error half of Q2.
+- **The tests were checked by breaking the code.** Three changes were made to
+  `agent.py` and then reverted, and each was caught: `except Exception` on
+  the classify call (1 test failed), the allowlist moved before the reply
+  rule (4 failed), and the terminal-state check removed (2 failed).
+- **`docs/BACKLOG.md`** gained "Transport errors — no policy for the poller
+  yet", and a paragraph in the quota section: a rate-limit 403 that outlasts
+  the backoff now halts a run instead of failing each message.
+
+### The manual procedure (the human)
+
+A. Land the code; tests pass. **Done 2026-11-04:** 589 pass (545 before
+   this step), ruff clean.
+
+B. **Check `CLASSIFY_TIMEOUT` against a cold start.** Run
+   `ollama stop llama3.1:8b`, then `uv run python scripts/smoke_classify.py`,
+   and note the first email's wall time. That is model load plus one
+   classification. This reads no mail and writes nothing.
+   *Fixed here before running:* if the cold start is ≤ 40 s, the timeout
+   stays at 120 s, a 3× margin. Otherwise it becomes 3× the measured value,
+   rounded up to the next 30 s, and this section is amended.
+
+### Recorded when done
+
+- The cold-start time from B, 2026-11-04: **22.2 s** (model load plus one
+  classification); warm calls 1.0-2.5 s. That is under 40 s, so
+  `CLASSIFY_TIMEOUT` stays at 120 s.
+- The test count: 589.
+
+### Design questions (as reviewed)
+
+**Q1 — The label map's name and coverage.** *Recommend:* rename §7's
+`label_ids` to `ids_by_name`, the name undo already uses, and check
+coverage of `AGENT_LABELS | {INBOX}` on entry. A parameter with the same
+name as the function that builds it shadows that function inside the
+module that needs it. *Rejected:* trusting the caller alone. The check
+costs one set comparison per message.
+
+**Q2 — Which errors halt, and how the agent tells them apart.**
+*Recommend:* `_execute` raises `GmailApiError` (with `Forbidden` for any
+403) in place of `HttpError`. The agent turns `GmailApiError` and
+`ClassifierError` into failure rows, and lets everything else propagate:
+auth, `Forbidden`, transport errors, bugs. *Rejected:*
+- `except Exception`, as in `undo_run.py`. A bug in our code would become
+  a stream of quiet failure rows. Phase 4's poller would then retry them
+  forever.
+- Importing `HttpError` into the agent. That breaks guard rule 1.
+- Wrapping transport errors as well. Halting costs one restart on a run of
+  at most 25, and catching them needs an import of the HTTP library
+  underneath (`httplib2`), a dependency we use without naming.
+
+**Q3 — The source of a row that failed before routing.** *Recommend:*
+`source: Source | None`, with `None` allowed only when `error` is set.
+*Rejected:*
+- `"model"`. It claims a route that was never taken.
+- A new `"none"` value. `None` already means "absent", and a sentinel
+  string would have to be filtered out of every count by source.
+
+Free now, because the real log has no rows.
+
+**Q4 — A message already in a terminal state.** *Recommend:* check after
+the fetch, and return `None` with no write and no row. `run_pass` reports
+it as skipped. This makes the three-states rule a property of the writer
+rather than of the query, which a race between two runs or a bad
+`--query` could get round. *Rejected:*
+- A failure row. Phase 4's dead-letter counting would count it, and could
+  put `Error` beside `Processed`.
+- A "skipped" row. The log records classifications, and this is not one.
+
+**Q5 — The classify timeout.** *Recommend:* `CLASSIFY_TIMEOUT = 120.0`,
+checked against a cold start by procedure B. A warm classification takes
+about 2.6 s. *Rejected:*
+- Keeping 600 s, which makes the worst case for one message 50 minutes.
+- Something like 30 s, which a cold model load on this CPU might exceed.
+  That would turn every first message of a run into a retry.
+
+**Q6 — A modify that fails ambiguously.** *Recommend:* write a failure
+row (empty action, as the validator requires) with the intended change in
+`note`, and do not re-fetch. If the call had in fact landed, the message
+carries `Processed` with no applied row. The sweep reports that as an
+orphan, and the note says what it probably received. §7's "nothing was
+applied" becomes "probably nothing; if something was, the sweep reports
+it". *Rejected:* re-fetching to find out. That puts a second call in the
+failure path, which can itself fail, and the sweep already covers the case.
+
+**Q7 — The `OllamaError` retry delay**, which §7 left open. *Recommend:*
+2, 4, 8 and 16 s, so 30 s across one message's five tries, retrying only
+`OllamaError`. The transient case this is for is Ollama restarting or
+dropping a connection; a restart takes seconds, and 30 s covers it with
+margin. *Rejected:*
+- A fixed 1 s. All five tries would be over in 4 s, sooner than a
+  restart.
+- Jitter. There is one client, so there is nothing to spread out.
+- Retrying `NoCategoryLetter`. For the same input the distribution is
+  reproducible (Phase 0 measured it identical across temperatures), so a
+  retry asks the same question and gets the same answer.
+
+Cost, accepted: with Ollama fully down, each message spends about 30 s
+before its failure row. On a run of 25 that is about 12 minutes, which the
+per-line output makes visible, and the human can stop it.
+
+**Q8 — The rehearsal test.** *Recommend:* replace its assertion ("no
+`app/` module writes") with "exactly `app/agent.py` writes from `app/`",
+and rename it. A second `app/` module that starts writing still fails a
+test, which is what the original was protecting. *Rejected:* deleting it,
+which loses that protection.
+
+**Q9 — How Gmail is faked.** *Recommend:* move `FakeService` and its
+parts from `test_gmail_client.py` into `tests/fakes.py`. The agent tests
+then run the real `fetch` and `modify_labels` against them. A test where
+the agent passes names instead of ids then fails on `modify_labels`' own
+check. *Rejected:*
+- Monkeypatching `fetch` and `modify_labels` with recorders. A recorder
+  accepts whatever it is given.
+- Importing the fakes from `test_gmail_client.py`. One test module
+  depending on another breaks when that module is reorganised.
+
+**Q10 — What a rule row records.** *Recommend:* only what was used. Rule
+rows carry no `model`, `prompt_id`, `body_chars` or thresholds, because
+none of them decided the row (see the table above). *Rejected:* recording
+the config on every row. A reply row carrying `confidence_threshold=0.8`
+would read as if a threshold had been applied. `run_id` already ties
+every row to the run's config.
+
+### Decisions taken (step 7 review, 2026-11-04)
+
+All agreed as recommended.
+
+| # | Decision | Choice |
+|---|---|---|
+| 1 | The label map | Renamed `ids_by_name`; coverage of `AGENT_LABELS \| {INBOX}` checked on entry |
+| 2 | Errors | `_execute` raises `GmailApiError`, or `Forbidden` for any 403, in place of `HttpError`. `GmailApiError` and `ClassifierError` become failure rows; auth, `Forbidden`, transport errors and bugs halt the run |
+| 3 | Source before routing | `source: Source \| None`; `None` only with `error` set (a fourth validator) |
+| 4 | Terminal-state message | Return `None`: no write, no row |
+| 5 | Classify timeout | `CLASSIFY_TIMEOUT = 120.0`, checked by procedure B |
+| 6 | Ambiguous modify failure | A failure row with the intended change in `note`, and no re-fetch. If the call landed, the message carries `Processed` with no applied row, and the sweep reports it as an orphan. Amends §7's "nothing was applied" |
+| 7 | `OllamaError` retry delay | 2, 4, 8, 16 s; `OllamaError` only, never `NoCategoryLetter` |
+| 8 | The rehearsal test | Replaced by `test_agent_is_the_only_app_module_that_writes` |
+| 9 | Gmail fakes | Moved to `tests/fakes.py`; agent tests run the real `fetch` and `modify_labels` |
+| 10 | Rule rows | Record only what was used: no model fields, no thresholds |

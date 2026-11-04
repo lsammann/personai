@@ -20,7 +20,9 @@ The three rules:
 3. The `.users()`-rooted calls in `app/gmail_client.py` are exactly
    `ALLOWED_API_CALLS`.
 4. Only the files in `MODIFY_LABELS_CALLERS` refer to `modify_labels`, the
-   one function that changes a message (A1).
+   one function that changes a message. Undo came first (A1); `app/agent.py`
+   joined at step 7, after the undo rehearsal passed, and is the only `app/`
+   module on the list.
 
 Limit: this catches mistakes, not deliberate evasion - `getattr(svc, "users")`
 gets past it. The granted OAuth scope is the backstop for that.
@@ -60,9 +62,11 @@ ALLOWED_API_CALLS = frozenset({
 # - scripts/rehearse_undo.py (step 6, Part 3): writes the rehearsal's
 #   fixture. Acts only on subjects tagged `[personai rehearsal] M<n>`, and
 #   is kept after the pass so the rehearsal stays repeatable (decision Q9).
-# - app/agent.py joins only at step 7, after the undo rehearsal has passed.
+# - app/agent.py (step 7): the writer itself. Joined only after the undo
+#   rehearsal passed on 2026-11-03, so the first real writes could already be
+#   reversed (A1).
 MODIFY_LABELS_CALLERS: frozenset[str] = frozenset(
-    {"scripts/undo_run.py", "scripts/rehearse_undo.py"}
+    {"scripts/undo_run.py", "scripts/rehearse_undo.py", "app/agent.py"}
 )
 
 
@@ -178,7 +182,8 @@ def test_gmail_client_api_calls_are_exactly_the_allowlist():
 
 
 def test_only_allowed_callers_refer_to_modify_labels():
-    """A1: until the undo rehearsal has passed, undo is the only writer."""
+    """A1: every writer is listed. Undo was first; the agent joined after
+    the undo rehearsal passed."""
     offenders = [
         name for name, tree in _scanned_files()
         if name != GMAIL_CLIENT
@@ -294,7 +299,11 @@ def test_every_listed_caller_exists_and_calls_modify_labels():
         assert refers_to_modify_labels(ast.parse(source.read_text())), path
 
 
-def test_no_app_module_writes_until_the_rehearsal_passes():
-    """A1, stated directly: app/agent.py joins at step 7, not before. This
-    test is changed deliberately in that step's diff."""
-    assert not {path for path in MODIFY_LABELS_CALLERS if path.startswith("app/")}
+def test_agent_is_the_only_app_module_that_writes():
+    """Replaces `test_no_app_module_writes_until_the_rehearsal_passes`,
+    changed deliberately in step 7's diff once the rehearsal had passed
+    (2026-11-03). What it protected still holds: a second `app/` module that
+    starts writing fails here, and has to be added on purpose."""
+    assert {path for path in MODIFY_LABELS_CALLERS if path.startswith("app/")} == {
+        "app/agent.py"
+    }
