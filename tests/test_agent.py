@@ -16,12 +16,13 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
 from app import agent, classifier, logbook
-from app.agent import REQUIRED_LABELS, classify_and_label
+from app.agent import classify_and_label
 from app.categories import (
     ERROR,
     INBOX,
     NEEDS_REVIEW,
     PROCESSED,
+    REQUIRED_LABELS,
     Category,
     argmax,
     label_for,
@@ -381,3 +382,91 @@ def test_a_map_missing_a_label_is_refused_before_any_call():
             allowlist=ALLOWLIST, run_id="r", run_kind="manual", dry_run=False,
         )
     assert messages.get_calls == [] and logged() == []
+
+
+# --- the run-level helpers (step 8) -------------------------------------------
+
+def test_the_queue_is_received_mail_not_yet_terminal():
+    from app.categories import RECEIVED_ONLY, UNPROCESSED_TERMS
+
+    assert agent.queue_query() == f"{RECEIVED_ONLY} {UNPROCESSED_TERMS}"
+
+
+def test_extra_terms_are_parenthesised_so_an_or_cannot_escape():
+    """The grouping is explicit rather than left to Gmail's precedence
+    between OR and the implicit AND, so whatever `--query` says is ANDed
+    with the base terms as one unit."""
+    query = agent.queue_query("newer_than:1d OR from:x@y.example")
+    assert query.endswith(" (newer_than:1d OR from:x@y.example)")
+    assert query.startswith(agent.queue_query())
+
+
+@pytest.mark.parametrize("extra", [None, "", "   "])
+def test_no_extra_terms_means_no_parentheses(extra):
+    assert "(" not in agent.queue_query(extra)
+
+
+@pytest.mark.parametrize("limit, live", [(1, True), (25, True), (300, False)])
+def test_limits_within_the_rule_are_accepted(limit, live):
+    agent.check_limit(limit, live=live)
+
+
+@pytest.mark.parametrize("limit, live, message", [
+    (0, False, "at least 1"),
+    (-5, True, "at least 1"),
+    (26, True, "at most 25"),
+])
+def test_limits_outside_the_rule_are_refused_saying_why(limit, live, message):
+    with pytest.raises(ValueError, match=message):
+        agent.check_limit(limit, live=live)
+
+
+def test_the_live_cap_is_25():
+    """§8. Changing it is Phase 4's deliberate diff, not a side effect."""
+    assert agent.LIVE_LIMIT_CAP == 25
+
+
+def test_preflight_classifies_the_fixed_email_with_the_run_timeout(monkeypatch):
+    fake = FakeClassify(interpretation(RECEIPTS_95))
+    monkeypatch.setattr(classifier, "classify", fake)
+    seconds = agent.preflight(Config())
+    assert seconds >= 0
+    [call] = fake.calls
+    assert call["args"] == agent.PREFLIGHT_EMAIL
+    assert call["timeout"] == agent.CLASSIFY_TIMEOUT
+    assert call["prompt_id"] == classifier.DEFAULT_PROMPT_ID
+
+
+@pytest.mark.parametrize("error", [OllamaError("down"), NoCategoryLetter("no letter")])
+def test_a_preflight_failure_propagates_untried_and_logs_nothing(monkeypatch, slept, error):
+    """A run with the model down stops here: one try, no sleep, no row."""
+    fake = FakeClassify(error)
+    monkeypatch.setattr(classifier, "classify", fake)
+    with pytest.raises(type(error)):
+        agent.preflight(Config())
+    assert len(fake.calls) == 1
+    assert slept == []
+    assert logged() == []
+
+
+def test_the_tally_counts_each_kind_of_outcome(monkeypatch):
+    tally = agent.RunTally()
+    model_row, _, _ = run(monkeypatch)
+    review_row, _, _ = run(monkeypatch, classify=FakeClassify(
+        interpretation(distribution(Category.UPDATES, 0.55))))
+    reply_row, _, _ = run(monkeypatch, message=payload(subject="Re: dinner"))
+    failed_row, _, _ = run(monkeypatch, classify=FakeClassify(NoCategoryLetter("x")))
+
+    for row, seconds in [(model_row, 2.0), (review_row, 3.0), (reply_row, 0.5),
+                         (failed_row, 2.5), (None, 2.0)]:
+        tally.add(row, seconds)
+
+    assert (tally.messages, tally.classified, tally.skipped, tally.failures) == (5, 3, 1, 1)
+    assert tally.by_source == {"model": 2, "reply": 1}
+    assert tally.by_category == {Category.RECEIPTS: 1, Category.UPDATES: 1, Category.PERSONAL: 1}
+    assert tally.needs_review == 1
+    assert tally.per_minute == pytest.approx(60 * 5 / 10.0)
+
+
+def test_an_empty_tally_has_no_rate():
+    assert agent.RunTally().per_minute == 0.0

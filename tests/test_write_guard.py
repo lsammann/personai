@@ -23,6 +23,10 @@ The three rules:
    one function that changes a message. Undo came first (A1); `app/agent.py`
    joined at step 7, after the undo rehearsal passed, and is the only `app/`
    module on the list.
+5. Only the files in `CLASSIFY_AND_LABEL_CALLERS` refer to
+   `classify_and_label`, the agent's entry point. Rule 4 stops at
+   `agent.py`, so without this a second script that calls the agent with
+   `dry_run=False` would write without appearing in any list (step 8 Q6).
 
 Limit: this catches mistakes, not deliberate evasion - `getattr(svc, "users")`
 gets past it. The granted OAuth scope is the backstop for that.
@@ -68,6 +72,12 @@ ALLOWED_API_CALLS = frozenset({
 MODIFY_LABELS_CALLERS: frozenset[str] = frozenset(
     {"scripts/undo_run.py", "scripts/rehearse_undo.py", "app/agent.py"}
 )
+
+# The files allowed to refer to agent.classify_and_label, beside agent.py
+# itself (rule 5). Each addition is its own deliberate diff:
+# - scripts/run_pass.py (step 8): the Phase 3 CLI, dry run unless --live.
+CLASSIFY_AND_LABEL_CALLERS: frozenset[str] = frozenset({"scripts/run_pass.py"})
+AGENT = "app/agent.py"
 
 
 # --- the analysis ---------------------------------------------------------
@@ -129,16 +139,21 @@ def api_calls(tree: ast.AST) -> set[tuple[str, ...]]:
     return found
 
 
-def refers_to_modify_labels(tree: ast.AST) -> bool:
-    """Any call, import or mention of `modify_labels` by name."""
+def refers_to(tree: ast.AST, name: str) -> bool:
+    """Any call, import or mention of `name`: as a bare name, an attribute,
+    or an imported alias."""
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == "modify_labels":
+        if isinstance(node, ast.Name) and node.id == name:
             return True
-        if isinstance(node, ast.Attribute) and node.attr == "modify_labels":
+        if isinstance(node, ast.Attribute) and node.attr == name:
             return True
-        if isinstance(node, ast.alias) and node.name == "modify_labels":
+        if isinstance(node, ast.alias) and node.name == name:
             return True
     return False
+
+
+def refers_to_modify_labels(tree: ast.AST) -> bool:
+    return refers_to(tree, "modify_labels")
 
 
 def _scanned_files() -> list[tuple[str, ast.AST]]:
@@ -307,3 +322,24 @@ def test_agent_is_the_only_app_module_that_writes():
     assert {path for path in MODIFY_LABELS_CALLERS if path.startswith("app/")} == {
         "app/agent.py"
     }
+
+
+def test_only_allowed_callers_refer_to_classify_and_label():
+    """Rule 5: every entry point that can make the agent write is listed."""
+    offenders = [
+        name for name, tree in _scanned_files()
+        if name != AGENT
+        and name not in CLASSIFY_AND_LABEL_CALLERS
+        and refers_to(tree, "classify_and_label")
+    ]
+    assert not offenders, (
+        f"classify_and_label referenced outside CLASSIFY_AND_LABEL_CALLERS: {offenders}"
+    )
+
+
+def test_every_listed_agent_caller_exists_and_calls_it():
+    for path in CLASSIFY_AND_LABEL_CALLERS:
+        source = ROOT / path
+        assert source.exists(), f"remove {path} from CLASSIFY_AND_LABEL_CALLERS"
+        assert refers_to(ast.parse(source.read_text()), "classify_and_label"), path
+

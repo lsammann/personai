@@ -29,15 +29,16 @@ from app.categories import (
     LABEL_PARENT,
     NEEDS_REVIEW,
     PROCESSED,
+    RECEIVED_ONLY,
     UNPROCESSED_TERMS,
     Category,
     label_for,
     label_term,
 )
 
-# The exclusions run_pass will use. Sent mail is excluded, which is why M1-M6
-# must be received messages.
-BASE = "-in:sent -in:drafts -in:chats"
+# The exclusions run_pass uses, from the one definition. Sent mail is
+# excluded, which is why M1-M6 must be received messages.
+BASE = RECEIVED_ONLY
 
 # M1, M2: To Action + Processed. M3: Needs Review + Processed.
 # M4: the five other categories + Processed. M5: Error. M6: nothing.

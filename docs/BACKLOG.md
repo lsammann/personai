@@ -457,6 +457,15 @@ a decision, at minimum on retrying these in `_execute` and on whether one
 halts a cycle or only skips the message. Catching them means naming the HTTP
 library underneath (`httplib2`), which the project uses without declaring.
 
+## `categories.py` holds more than categories
+
+Found in Phase 3 step 8. Besides the category enum and prompt letters, it is
+now the home of the mailbox's vocabulary: label names, `STOP_LABELS`,
+`UNPROCESSED_TERMS`, `RECEIVED_ONLY`, `REQUIRED_LABELS` and `label_term()`.
+Splitting that half into a `mailbox.py` may read better. It was not done in
+step 8 because many modules import `categories`, and the move is a refactor
+with no behaviour change.
+
 ## Sender concentration — weaker than hoped
 
 77 unique domains across a 150-message sample, **44 of them singletons**.

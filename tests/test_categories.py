@@ -1,5 +1,8 @@
 """Shared constants: the letter mapping, the label names, the argmax tiebreak."""
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from app import categories as cat
@@ -175,3 +178,66 @@ def test_label_setup_ignores_labels_it_does_not_own():
     plan = cat.plan_label_setup(["Agents", "Agent/Something Else", "Receipts"])
     assert set(plan.to_create) == cat.SETUP_LABELS
     assert plan.clashes == ()
+
+
+# --- shared query and label facts, defined once (step 8 decision Q1) --------
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Records of past measurements, left as they were measured. By exact path, so
+# a new script that retypes the exclusions is caught.
+RETYPED_EXCLUSIONS_EXEMPT = frozenset({
+    "scripts/spike_gmail.py",
+    "scripts/measure_bodies.py",
+})
+
+
+def test_the_exclusions_are_written_only_in_categories():
+    """A second copy could drift, and the eval frame and the live queue
+    would then disagree with no error (DESIGN.md: input consistency)."""
+    offenders = [
+        path.relative_to(ROOT).as_posix()
+        for directory in ("app", "scripts")
+        for path in sorted((ROOT / directory).rglob("*.py"))
+        if "-in:sent" in path.read_text()
+        and path.relative_to(ROOT).as_posix()
+        not in RETYPED_EXCLUSIONS_EXEMPT | {"app/categories.py"}
+    ]
+    assert not offenders, f"import categories.RECEIVED_ONLY instead: {offenders}"
+
+
+def test_every_exclusions_exemption_still_exists():
+    missing = [path for path in RETYPED_EXCLUSIONS_EXEMPT if not (ROOT / path).exists()]
+    assert not missing, f"remove these from RETYPED_EXCLUSIONS_EXEMPT: {missing}"
+
+
+def test_the_eval_frame_uses_the_queue_exclusions():
+    from app import evalset
+
+    assert evalset.FRAME_EXCLUSIONS is cat.RECEIVED_ONLY
+
+
+def test_received_only_excludes_what_never_arrives():
+    assert cat.RECEIVED_ONLY.split() == ["-in:sent", "-in:drafts", "-in:chats"]
+
+
+def test_required_labels_are_the_nine_and_inbox():
+    assert cat.REQUIRED_LABELS == cat.AGENT_LABELS | {cat.INBOX}
+
+
+def test_required_labels_are_defined_only_in_categories():
+    """The agent and undo read the same set, so they cannot need different
+    label maps."""
+    offenders = []
+    for directory in ("app", "scripts"):
+        for path in sorted((ROOT / directory).rglob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign)
+                    else [node.target] if isinstance(node, ast.AnnAssign)
+                    else []
+                )
+                if any(isinstance(t, ast.Name) and t.id == "REQUIRED_LABELS" for t in targets):
+                    offenders.append(path.relative_to(ROOT).as_posix())
+    assert offenders == ["app/categories.py"]

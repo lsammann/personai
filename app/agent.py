@@ -25,6 +25,11 @@ row per message (step 7 decision Q2).
 Phase 3 never dead-letters: one failure never becomes `Agent/Error`, and
 nothing counts failures across runs. That is Phase 4.
 
+Around it, the run-level pieces a caller needs and Phase 4's poller will
+reuse (step 8): `queue_query` and `check_limit` say which messages a run may
+take, `preflight` stops a run before its first row if Ollama cannot answer,
+and `RunTally` counts what happened. `scripts/run_pass.py` is their caller.
+
 The only module in `app/` allowed to call `gmail_client.modify_labels`,
 which `tests/test_write_guard.py` enforces. It joined after the undo
 rehearsal passed on 2026-11-03 (A1).
@@ -33,10 +38,19 @@ rehearsal passed on 2026-11-03 (A1).
 from __future__ import annotations
 
 import time
+from collections import Counter
 from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field
 
 from app import classifier, decision, gmail_client, logbook, prefilter
-from app.categories import AGENT_LABELS, INBOX, STOP_LABELS
+from app.categories import (
+    NEEDS_REVIEW,
+    RECEIVED_ONLY,
+    REQUIRED_LABELS,
+    STOP_LABELS,
+    UNPROCESSED_TERMS,
+    Category,
+)
 from app.classifier import ClassifierError, Interpretation, OllamaError
 from app.config import Config
 from app.logbook import Action, Record, RunKind
@@ -54,8 +68,62 @@ OLLAMA_RETRY_DELAYS: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
 # against a measured cold start by step 7's procedure B.
 CLASSIFY_TIMEOUT = 120.0
 
-# Every label a decision can name. The map passed in must cover all of them.
-REQUIRED_LABELS: frozenset[str] = AGENT_LABELS | {INBOX}
+# The most messages one live run may take (§8). Phase 4 removes it
+# deliberately, in its own diff. Dry runs are not capped: the gate's large
+# dry run is 300 messages and writes nothing.
+LIVE_LIMIT_CAP = 25
+
+# Classified once before a run's first message (step 8 Q2). Synthetic and
+# fixed, so the preflight reads no mail.
+PREFLIGHT_EMAIL = (
+    "preflight@personai.invalid",
+    "Preflight check",
+    "This message checks that the model loads and answers before a run.",
+    "",
+)
+
+
+def queue_query(extra: str | None = None) -> str:
+    """The run's Gmail query: received mail not yet in a terminal state,
+    narrowed by `extra` if given.
+
+    `extra` is parenthesised, so an `OR` inside it groups with itself and
+    cannot loosen the base terms (step 8 Q1). It is a human's flag, so it is
+    not otherwise parsed.
+    """
+    base = f"{RECEIVED_ONLY} {UNPROCESSED_TERMS}"
+    extra = (extra or "").strip()
+    return f"{base} ({extra})" if extra else base
+
+
+def check_limit(limit: int, *, live: bool) -> None:
+    """ValueError unless `limit` is at least 1 and, for a live run, at most
+    `LIVE_LIMIT_CAP`. Called before any network call."""
+    if limit < 1:
+        raise ValueError(f"--limit must be at least 1 (got {limit})")
+    if live and limit > LIVE_LIMIT_CAP:
+        raise ValueError(
+            f"--live takes at most {LIVE_LIMIT_CAP} messages in Phase 3 (got {limit})"
+        )
+
+
+def preflight(cfg: Config) -> float:
+    """Classify `PREFLIGHT_EMAIL` once and return the wall time in seconds.
+
+    No retries, and any ClassifierError propagates, so a run with Ollama
+    down halts before it has fetched or logged anything, rather than
+    spending ~30 s of retries per message on failure rows (step 8 Q2). It
+    also takes the model load, so the run's first message is timed warm.
+    """
+    started = time.perf_counter()
+    classifier.classify(
+        *PREFLIGHT_EMAIL,
+        model=cfg.ollama_model,
+        body_chars=cfg.body_chars,
+        prompt_id=classifier.DEFAULT_PROMPT_ID,
+        timeout=CLASSIFY_TIMEOUT,
+    )
+    return time.perf_counter() - started
 
 
 def classify_and_label(
@@ -226,3 +294,47 @@ def _describe(add: Collection[str], remove: Collection[str]) -> str:
 
 def _note(notes: list[str]) -> str | None:
     return "; ".join(notes) or None
+
+
+@dataclass
+class RunTally:
+    """What one run did, counted from what `classify_and_label` returned.
+
+    Pure: it sees each return value and how long it took, and nothing else.
+    """
+
+    skipped: int = 0
+    failures: int = 0
+    needs_review: int = 0
+    by_source: Counter[str] = field(default_factory=Counter)
+    by_category: Counter[Category] = field(default_factory=Counter)
+    seconds: list[float] = field(default_factory=list)
+
+    def add(self, row: Record | None, seconds: float) -> None:
+        self.seconds.append(seconds)
+        if row is None:
+            self.skipped += 1
+            return
+        if row.error is not None:
+            self.failures += 1
+            return
+        self.by_source[row.source] += 1
+        if row.category is not None:
+            self.by_category[row.category] += 1
+        if NEEDS_REVIEW in row.action.add:
+            self.needs_review += 1
+
+    @property
+    def messages(self) -> int:
+        return len(self.seconds)
+
+    @property
+    def classified(self) -> int:
+        return self.messages - self.skipped - self.failures
+
+    @property
+    def per_minute(self) -> float:
+        """Messages per minute of agent time: the pacing figure §8 asks for."""
+        total = sum(self.seconds)
+        return 60 * self.messages / total if total else 0.0
+

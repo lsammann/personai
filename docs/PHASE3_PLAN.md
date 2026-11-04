@@ -463,7 +463,7 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
 
 ## Build order
 
-**Current step: 7** (built 2026-11-04, 589 tests pass; procedure B, the cold-start check, passed 2026-11-04: 22.2 s, timeout stays 120 s). Step 6's rehearsal passed 2026-11-03, which unlocks `app/agent.py`.
+**Current step: 8** (built 2026-11-04, 624 tests pass; no live call made). Step 7 finished 2026-11-04.
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
    no consent, no API calls. **Done 2026-11-02.** Produced
@@ -525,8 +525,18 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
      and the planted orphan was found and then cleared. A reader's star
      (`STARRED` + `YELLOW_STAR`) survived undo, and pre-archived M5 stayed
      archived
-7. `agent.classify_and_label` + `Source "reply"`
-8. `scripts/run_pass.py`
+7. `agent.classify_and_label` + `Source "reply"`. **Done 2026-11-04.**
+   `app/agent.py` with the ten design decisions of the Step 7 section;
+   Gmail fakes moved to `tests/fakes.py`; `_execute` raises `GmailApiError`
+   / `Forbidden`; `Record.source` may be `None` on a pre-routing failure.
+   589 tests pass. Procedure B: a 22.2 s cold start, so
+   `CLASSIFY_TIMEOUT` stays at 120 s. No live call made
+8. `scripts/run_pass.py`. **Built 2026-11-04.** See the Step 8 section.
+   `categories.RECEIVED_ONLY` / `REQUIRED_LABELS` with a test against
+   retyped copies; `agent.queue_query` / `check_limit` / `preflight` /
+   `RunTally`; `undo.window_for_run` and `undo_run.py --window-for`; write
+   guard rule 5 (`CLASSIFY_AND_LABEL_CALLERS`). 624 tests pass. Not yet
+   run against real mail: its first use is gate step 1
 9. `scripts/review_run.py` (A4)
 10. Gate
 
@@ -2136,3 +2146,297 @@ All agreed as recommended.
 | 8 | The rehearsal test | Replaced by `test_agent_is_the_only_app_module_that_writes` |
 | 9 | Gmail fakes | Moved to `tests/fakes.py`; agent tests run the real `fetch` and `modify_labels` |
 | 10 | Rule rows | Record only what was used: no model fields, no thresholds |
+
+---
+
+## Step 8 implementation
+
+**Status: built 2026-11-04 (624 tests pass); not yet run against real
+mail.** This is the first
+entry point that calls `classify_and_label`, so it is the first code that
+can label real mail outside the rehearsal. Where this differs from §8, this
+section is newer, and each difference is marked. All seven design questions
+were agreed, Q1 and Q4 as revised at review; see [the decisions
+table](#decisions-taken-step-8-review-2026-11-04) at the end of this
+section.
+
+### What reading the code turned up
+
+- **The queue's exclusions are typed four times.** `evalset.FRAME_EXCLUSIONS`,
+  `verify_labels.BASE`, `measure_bodies.FRAME_QUERY` and
+  `spike_gmail.BACKFILL_QUERY` each spell out `-in:sent -in:drafts -in:chats`.
+  DESIGN.md makes input consistency between the eval frame and the live
+  queue a hard requirement, so `run_pass` should not add a fifth copy (Q1).
+- **"Every label a decision can name" is written three times.**
+  `agent.REQUIRED_LABELS`, and `AGENT_LABELS | {INBOX}` typed out again in
+  `undo_run.py` and `rehearse_undo.py` (Q1).
+- **`--query` is joined to the base query as plain text.** Gmail has no
+  grouping we control unless we add it. A `--query` with its own `OR`, or
+  with `in:anywhere` (which brings spam and trash back in), changes what the
+  base terms mean (Q1).
+- **With Ollama down, a run spends ~30 s per message before each failure
+  row** (step 7 Q7, accepted for a run of 25). The gate's large dry run is
+  300 messages, so that becomes ~2.5 hours of failure rows (Q2).
+- **The first classification carries the model load,** 22.2 s measured in
+  step 7's procedure B against ~2.6 s warm. Per-message times and the
+  pacing check in §8 are skewed by it unless something absorbs it (Q2).
+- **`undo_run.py` needs a window, and nothing computes one for a run.**
+  Every log row carries its `run_id` and a timestamp, so the log already
+  holds a run's window. But the human has to work it out by reading the
+  log, and getting it wrong is the undo mistake `CLAUDE.md` names (Q4).
+- **The gate's population bound fits Gmail's date terms exactly.** The eval
+  frame used `before:2026/09/11`, which excludes that date. `after:2026/09/11`
+  includes it, so the two are an exact complement: no overlap and no gap.
+  Gmail reads both in the account's timezone, as `evalset` already notes.
+- **`classify_and_label` has one caller today (tests),** and the write guard
+  only polices `modify_labels`. A second script calling the agent with
+  `dry_run=False` would write without appearing in any guarded list (Q6).
+
+### Shape
+
+`scripts/run_pass.py` stays thin: arguments, auth, one loop, printing. The
+parts worth testing go in `app/agent.py` beside the function they drive,
+since Phase 4's poller needs the same queue and the same limit rule.
+
+```python
+# app/categories.py  (Q1) - the mailbox's vocabulary, already home to the
+# label names, STOP_LABELS, UNPROCESSED_TERMS and label_term()
+RECEIVED_ONLY = "-in:sent -in:drafts -in:chats"
+REQUIRED_LABELS: frozenset[str] = AGENT_LABELS | {INBOX}   # moved from agent.py
+
+# app/undo.py  (Q4) - pure
+def window_for_run(records: Iterable[Record], run_id: str) -> tuple[str, str]:
+    """`--since` / `--until` covering every applied row of one run:
+    the earliest row's timestamp floored to the minute, the latest ceiled,
+    in the format `parse_window` accepts. ValueError if the run has no
+    applied rows."""
+
+# app/agent.py
+LIVE_LIMIT_CAP = 25          # §8; Phase 4 removes it deliberately
+
+def queue_query(extra: str | None = None) -> str:
+    """RECEIVED_ONLY + UNPROCESSED_TERMS, plus `(extra)` if given."""
+
+def check_limit(limit: int, *, live: bool) -> None:
+    """ValueError if limit < 1, or live and limit > LIVE_LIMIT_CAP."""
+
+def preflight(cfg: Config) -> float:
+    """One classify of a fixed synthetic email; returns its wall time.
+    Raises ClassifierError, so the run halts before any row (Q2)."""
+
+@dataclass
+class RunTally:                      # pure: built from what the loop sees
+    def add(self, row: Record | None, seconds: float) -> None: ...
+    # counts by source, by category, Needs Review, failures, skipped,
+    # and the slowest and mean seconds per message
+
+```
+
+### Order, per run
+
+1. Parse arguments. `--limit` is required. `check_limit` runs before any
+   network call, so `--live --limit 26` fails without touching Gmail.
+2. `require_scopes(MODIFY)` with `--live`, otherwise `READONLY`. Print the
+   token's `days_remaining` from `auth.status()`.
+3. `config.load()`, `prefilter.load_allowlist()`, and
+   `label_ids(svc, REQUIRED_LABELS)`, which fails closed. `config.dry_run`
+   is not read (§8).
+4. Print the header: mode, model, `prompt_id` and its hash, `body_chars`,
+   both thresholds, the full query, the limit, and the `run_id`.
+5. `preflight(cfg)`. Print its time as the cold-start figure.
+6. `search_ids(svc, queue_query(args.query), limit)`. The ids are listed
+   once, up front. A message labelled after the listing is caught by the
+   agent's terminal-state check and counted as skipped (Q3).
+7. For each id, `classify_and_label(...)` with `run_kind="manual"` and
+   `dry_run=not args.live`, timed. Print one line: sender, subject, source,
+   category and confidence, the action, and seconds.
+8. In a `finally`, so it prints even when the run halts: the tally, the
+   `run_id`, and with `--live` the exact `undo_run.py` command, built by
+   re-reading the log and calling `undo.window_for_run` (Q4). Then let any
+   exception propagate.
+9. Exit 0 if there were no failure rows, 1 otherwise (Q5).
+
+### Design questions
+
+**Q1 — Shared facts in their owning module, guarded.** *Revised at
+review:* the human asked for important constants to live in one safe place
+and be reused. Each shared fact gets one definition, in the module whose
+concern it is, and a test stops it being retyped.
+- `categories.RECEIVED_ONLY` holds the exclusions, beside
+  `UNPROCESSED_TERMS`. `evalset.FRAME_EXCLUSIONS` and `verify_labels.BASE`
+  take their value from it.
+- `categories.REQUIRED_LABELS` moves from `agent.py`. `undo_run.py` and
+  `rehearse_undo.py` import it in place of `AGENT_LABELS | {INBOX}`.
+- A test fails if `-in:sent` appears in `app/` or `scripts/` outside
+  `categories.py`. `spike_gmail.py` and `measure_bodies.py` are exempt by
+  name: they are records of past measurements, so they are left as they
+  were, as the write guard already exempts `spike_gmail.py`.
+- `queue_query` wraps `--query` in parentheses so its own `OR` cannot
+  escape the base terms.
+
+*Rejected:*
+- A general `app/constants.py`. It groups facts by being constants rather
+  than by meaning, so it becomes a dumping ground and every module imports
+  all of it.
+- Splitting `categories.py` into a new `mailbox.py`. That may be cleaner
+  one day, but many modules import `categories`, and the move is a
+  refactor this step does not need. Noted in `docs/BACKLOG.md`.
+- Leaving the copies. If one changed, the eval frame and the live queue
+  would disagree with no error.
+- Parsing `--query` to refuse `in:anywhere` and the like. That means
+  reimplementing Gmail's grammar. `--query` is a human flag in this phase.
+  The agent's terminal-state check already stops a bad query from
+  relabelling mail. A spam or trash message brought in by `in:anywhere`
+  would be classified like any other. That is accepted, because only the
+  human types the flag.
+- Editing the two spike and measurement scripts. They are records of past
+  measurements, so they are left as they were.
+
+**Q2 — A preflight classification.** *Recommend:* one classify call on a
+fixed synthetic email before the listing, with `CLASSIFY_TIMEOUT` and no
+retries. If Ollama is down, the run halts with nothing logged, and the
+first real message is timed warm. *Rejected:*
+- Ollama's `/api/tags`. It shows the server is up, not that the model
+  loads and answers.
+- Halting after N consecutive failures. That is failure counting, which
+  §7 keeps out of this phase, and the preflight catches the common case
+  (Ollama not running) before it starts.
+- No check. A 300-message dry run with Ollama down costs 2.5 hours.
+
+**Q3 — List once, up front.** *Recommend:* one `search_ids` call with the
+limit, then the loop. *Rejected:* re-listing after each message. It costs
+a list call per message, and the only race it closes is one the agent
+already guards.
+
+**Q4 — The undo window comes from the log.** *Revised at review:* the
+human asked for the window to be derived from the log rather than from the
+clock. The log is what undo itself selects from, so a window built from it
+matches undo's selection by construction.
+- `undo.window_for_run(records, run_id)` is pure: the earliest applied
+  row's timestamp floored to the minute, to the latest ceiled.
+- `run_pass` calls it after a live run and prints
+  `undo_run.py --since … --until …`.
+- `undo_run.py --window-for RUN_ID` prints the same command from the log
+  and exits, with no Gmail call and no scope check. This covers a lost
+  terminal, such as the VS Code restart on 2026-11-04.
+
+The hard rule is unchanged: `undo_run.py` still requires `--since` and
+`--until`, with no default. This only computes them.
+
+*Caveat, accepted:* undo selects by time, not by run, so another live run's
+rows inside the window would be undone too. Only one manual run happens at
+a time in this phase, and undo prints its plan before `--apply`, so they
+would be visible. This goes in `window_for_run`'s docstring.
+
+*Rejected:*
+- A start and end taken from the clock (the first draft). It is a second
+  account of when the run happened, which can disagree with the log.
+- A `--run` filter on `undo_run.py`. It changes the selection logic of a
+  write path that has already passed its rehearsal.
+- A run manifest file. Phase 4 may want one; the log already has every
+  row.
+- Leaving it to the human.
+
+**Q5 — Exit status.** *Recommend:* 0 when there were no failure rows,
+1 otherwise. A halt raises, so its status is non-zero anyway. Skipped
+messages are not failures. *Rejected:* always 0. Gate step 3 is checked by
+eye, but the status costs nothing and a later script can rely on it.
+
+**Q6 — Guard the agent's callers too.** *Recommend:* add
+`CLASSIFY_AND_LABEL_CALLERS = {"scripts/run_pass.py"}` to
+`test_write_guard.py`, in the same form as `MODIFY_LABELS_CALLERS`. A
+second entry point that can write then has to appear in a diff.
+*Rejected:* relying on `MODIFY_LABELS_CALLERS` alone. It stops at
+`agent.py`, and so does not see who calls the agent.
+
+**Q7 — Pacing.** *Recommend:* no throttle, as §8 says, and the tally prints
+messages per minute, which answers §8's "to be confirmed on the first 50".
+At ~3 s a message, 300 messages take about 15–20 minutes and about 100
+fetches a minute at most, under the ~150 burst ceiling. *Rejected:* a
+throttle now. Nothing measured asks for one.
+
+### Tests
+
+- `queue_query`: contains `RECEIVED_ONLY` and `UNPROCESSED_TERMS`; `extra`
+  appears in parentheses; no `extra` means no parentheses.
+- `evalset.FRAME_EXCLUSIONS is RECEIVED_ONLY`, so the eval frame and the
+  queue cannot drift.
+- No file in `app/` or `scripts/` but `categories.py` and the two exempt
+  scripts contains `-in:sent`; every exempt path still exists.
+- `REQUIRED_LABELS` is exactly `AGENT_LABELS | {INBOX}`, and no longer
+  defined in `agent.py`.
+- `check_limit`: `0` refused; `--live` with 25 allowed and 26 refused; a
+  dry run with 300 allowed.
+- `preflight`: an `OllamaError` propagates with no retry, and no Gmail call
+  is made (the fake service records none).
+- `RunTally`: a `None` counts as skipped, a row with `error` counts as a
+  failure, and a rule row is counted by source with no confidence.
+- `window_for_run`:
+  - the result parses with `undo.parse_window`, and `undo.select` over it
+    returns every applied row of the run
+  - rows of other runs, dry-run rows and failure rows do not set the bounds
+  - a timestamp already on the minute stays inside the window
+  - a run with no applied rows raises `ValueError`
+- `undo_run.py --window-for` is not unit-tested, like the rest of the
+  script. Its logic is `window_for_run`.
+- `test_write_guard.py`: only `CLASSIFY_AND_LABEL_CALLERS` refer to
+  `classify_and_label` outside `app/agent.py` and `tests/`.
+- `run_pass.py` itself is not unit-tested, like `setup_labels.py` and
+  `undo_run.py`. Its first real use is gate step 1.
+
+### What the build changed from the plan
+
+- **The window is whole seconds, not minutes.** `parse_window` refuses an
+  `--until` in the future, so a minute rounded up would usually be refused
+  when printed straight after a run. `window_for_run` floors the earliest
+  applied row to the second, and gives the latest row floored plus one
+  second, since `--until` is exclusive. Tighter, and the same in effect.
+- **`undo.undo_command(since, until, log=None)`** builds the printed line,
+  so `run_pass.py` and `undo_run.py --window-for` cannot word it
+  differently. It never includes `--apply`: the printed command shows the
+  plan, and the human adds `--apply` after reading it.
+- **`undo_run.py`'s `--since` / `--until` are checked by hand**, not by
+  argparse's `required=True`, which cannot say "required unless
+  `--window-for`". Without `--window-for` the script still refuses to run
+  without both. `--window-for` refuses to be combined with `--since`,
+  `--until`, `--apply` or `--verify`. Only the argument handling changed;
+  the rehearsed write path is untouched.
+- **`classifier.classify`'s `timeout` is annotated `float`,** to match
+  `CLASSIFY_TIMEOUT = 120.0`.
+- **`refers_to_modify_labels` became `refers_to(tree, name)`** in the write
+  guard, so rules 4 and 5 use one detector.
+
+### Checked by breaking the code
+
+Five changes were made and then reverted, and each was caught: a new script
+retyping the exclusions (1 failed), an unlisted script calling
+`classify_and_label` (1), `queue_query` without its parentheses (1), the
+live cap off by one (1), and the window's `--until` without its extra second
+(4).
+
+### The manual procedure (the human)
+
+A. Land the code; tests pass. **Done 2026-11-04:** 624 pass (589 before
+   this step), ruff clean. Checked without a network call: `--live --limit
+   26` is refused, and `--limit` is required.
+
+The first run against real mail is gate step 1, the ~50-message dry run.
+
+### Not in this step
+
+- The review tool (step 9), and so any change to blind review.
+- Dead-lettering, failure counting, and removing `LIVE_LIMIT_CAP`: Phase 4.
+
+### Decisions taken (step 8 review, 2026-11-04)
+
+All agreed; Q1 and Q4 revised at review.
+
+| # | Decision | Choice |
+|---|---|---|
+| 1 | Shared constants | Each in its owning module: `RECEIVED_ONLY` and `REQUIRED_LABELS` in `categories.py`, imported everywhere else. A test refuses `-in:sent` outside it (two old scripts exempt). `--query` wrapped in parentheses |
+| 2 | Preflight | One classify of a fixed synthetic email before listing, no retries; halts the run with nothing logged |
+| 3 | Listing | Once, up front; a message labelled since is skipped by the agent's check |
+| 4 | Undo window | From the log: `undo.window_for_run`, printed by `run_pass` after a live run and by `undo_run.py --window-for RUN_ID`. The window stays required |
+| 5 | Exit status | 0 with no failure rows, 1 otherwise; a halt raises |
+| 6 | Agent callers | `CLASSIFY_AND_LABEL_CALLERS = {"scripts/run_pass.py"}` in `test_write_guard.py` |
+| 7 | Pacing | No throttle; the tally prints messages per minute |

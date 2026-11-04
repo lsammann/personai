@@ -4,11 +4,17 @@
     undo_run.py --since 2026-11-03T14:00Z --until 2026-11-03T14:30Z
     undo_run.py --since … --until … --apply [--verify]
     undo_run.py --since … --until … --log data/rehearsal/classifications.jsonl
+    undo_run.py --window-for 20261104T201500-a1b2c3
 
 `--since` and `--until` are REQUIRED, with no default (CLAUDE.md). They are
 matched on the log row's timestamp, when the agent changed the label, not on
 when the email arrived. At most `undo.MAX_WINDOW` apart; `--until` may not
 be in the future.
+
+`--window-for RUN_ID` does not undo anything. It reads the log, prints the
+command above with the window that covers that run's applied rows, and
+exits: no Gmail call and no scope check (step 8 decision Q4). It is for when
+`run_pass.py`'s own printout of that command has been lost.
 
 Prints the plan by default. Writes only with `--apply`: one atomic
 `modify_labels` per message, reversing exactly what the log says the agent
@@ -35,15 +41,21 @@ from pathlib import Path
 from google.auth.exceptions import RefreshError
 
 from app import auth, config, gmail_client, logbook, undo
-from app.categories import AGENT_LABELS, INBOX
+from app.categories import REQUIRED_LABELS
 
 REPORT_DIR = config.DATA_DIR / "undo"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--since", required=True, help="ISO 8601 with timezone, inclusive")
-    parser.add_argument("--until", required=True, help="ISO 8601 with timezone, exclusive")
+    # Required unless --window-for is given, which only prints a command.
+    # Checked by hand below, because argparse cannot say "required unless".
+    parser.add_argument("--since", help="ISO 8601 with timezone, inclusive (required)")
+    parser.add_argument("--until", help="ISO 8601 with timezone, exclusive (required)")
+    parser.add_argument(
+        "--window-for", metavar="RUN_ID",
+        help="print the undo command for one run's window, then exit; changes nothing",
+    )
     parser.add_argument("--apply", action="store_true", help="make the changes")
     parser.add_argument("--verify", action="store_true", help="after --apply, check every message")
     parser.add_argument(
@@ -51,6 +63,15 @@ def main() -> int:
         help="the classification log to read (default: the real one)",
     )
     args = parser.parse_args()
+    log_path = args.log if args.log is not None else config.LOG_PATH
+
+    if args.window_for is not None:
+        if args.since or args.until or args.apply or args.verify:
+            parser.error("--window-for only prints a command; give it alone (with --log)")
+        return _print_window(args.window_for, log_path, args.log)
+
+    if args.since is None or args.until is None:
+        parser.error("--since and --until are required, with no default")
     if args.verify and not args.apply:
         parser.error("--verify checks what --apply did, so it needs --apply")
 
@@ -66,10 +87,9 @@ def main() -> int:
     else:
         auth.require_scopes(auth.READONLY)
     svc = gmail_client.service()
-    ids_by_name = gmail_client.label_ids(svc, sorted(AGENT_LABELS | {INBOX}))
+    ids_by_name = gmail_client.label_ids(svc, sorted(REQUIRED_LABELS))
 
     # 4. The log. A skipped line could be a row that should be undone.
-    log_path = args.log if args.log is not None else config.LOG_PATH
     records, skipped = logbook.read_all(log_path)
     print(f"Log: {log_path} - {len(records)} rows, {skipped} unreadable")
     if skipped and args.apply:
@@ -177,6 +197,20 @@ def main() -> int:
     clean = not (failures or mismatches or orphan_ids or held)
     print("\nClean." if clean else "\nNot clean - see above.")
     return 0 if clean else 1
+
+
+def _print_window(run_id: str, log_path: Path, log_arg: Path | None) -> int:
+    records, skipped = logbook.read_all(log_path)
+    if skipped:
+        print(f"Warning: {skipped} unreadable lines in {log_path}; the window "
+              "is built from the readable rows only.")
+    try:
+        since, until = undo.window_for_run(records, run_id)
+    except ValueError as error:
+        print(error)
+        return 1
+    print(undo.undo_command(since, until, None if log_arg is None else str(log_arg)))
+    return 0
 
 
 def _describe(plan: undo.MessagePlan, subject: str, ids_by_name: dict[str, str]) -> str:

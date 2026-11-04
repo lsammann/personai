@@ -474,7 +474,7 @@ def classify(
     prompt_id: str = DEFAULT_PROMPT_ID,
     order: tuple[Category, ...] = DEFAULT_ORDER,
     url: str = OLLAMA_URL,
-    timeout: int = DEFAULT_TIMEOUT,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> Interpretation:
     """One forward pass, one token, then `interpret()` on the distribution.
 

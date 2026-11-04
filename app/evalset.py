@@ -39,11 +39,13 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.categories import RECEIVED_ONLY
 from app.config import DATA_DIR
 
 # Sent, drafts and chats are not mail that arrives, so they are not mail the
-# agent would ever classify.
-FRAME_EXCLUSIONS = "-in:sent -in:drafts -in:chats"
+# agent would ever classify. The same object as the live queue's exclusions
+# (step 8 decision Q1), so the frame and the queue cannot drift apart.
+FRAME_EXCLUSIONS = RECEIVED_ONLY
 FRAME_WINDOW_YEARS = 1
 
 DEFAULT_SEED = 7

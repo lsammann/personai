@@ -102,6 +102,48 @@ def applied(record: Record) -> bool:
     )
 
 
+def window_for_run(records: Iterable[Record], run_id: str) -> tuple[str, str]:
+    """`--since` and `--until` covering every applied row of one run.
+
+    Built from the log, which is what `select` reads, so the window matches
+    undo's selection by construction rather than by a second account of when
+    the run happened (step 8 decision Q4). The earliest applied row's
+    timestamp is floored to the second; the latest, floored, plus one second,
+    since `--until` is exclusive. Whole seconds rather than minutes: a
+    minute rounded up would usually be in the future when printed straight
+    after a run, and `parse_window` refuses that.
+
+    Undo selects by time, not by run: another run's applied rows inside this
+    window would be undone too. In Phase 3 only one manual run happens at a
+    time, and `undo_run.py` prints its plan before `--apply`, so they would
+    show there.
+
+    Raises ValueError if the run has no applied rows: a dry run, or one in
+    which every message failed or was skipped, changed nothing to undo.
+    """
+    moments = [
+        record.timestamp.astimezone(dt.UTC).replace(microsecond=0)
+        for record in records
+        if record.run_id == run_id and applied(record)
+    ]
+    if not moments:
+        raise ValueError(f"run {run_id} has no applied rows, so nothing to undo")
+    since, until = min(moments), max(moments) + dt.timedelta(seconds=1)
+    return _format_moment(since), _format_moment(until)
+
+
+def undo_command(since: str, until: str, log: str | None = None) -> str:
+    """The plan-only `undo_run.py` command for a window. The human adds
+    `--apply` after reading the plan, so the printed line cannot write."""
+    command = f"uv run python scripts/undo_run.py --since {since} --until {until}"
+    return command if log is None else f"{command} --log {log}"
+
+
+def _format_moment(moment: dt.datetime) -> str:
+    """`2026-11-03T14:05:09Z`: what `parse_window` accepts, and short."""
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def select(records: Iterable[Record], window: Window) -> dict[str, list[Record]]:
     """Applied rows in the window, grouped by message, oldest first.
 

@@ -39,6 +39,7 @@ from app.categories import (
     INBOX,
     NEEDS_REVIEW,
     PROCESSED,
+    REQUIRED_LABELS,
     Category,
     label_for,
 )
@@ -134,7 +135,7 @@ def main() -> int:
 
     auth.require_scopes(auth.MODIFY if args.apply else auth.READONLY)
     svc = gmail_client.service()
-    ids_by_name = gmail_client.label_ids(svc, sorted(AGENT_LABELS | {INBOX}))
+    ids_by_name = gmail_client.label_ids(svc, sorted(REQUIRED_LABELS))
     names_by_id = {label_id: name for name, label_id in ids_by_name.items()}
     agent_ids = {ids_by_name[name] for name in AGENT_LABELS}
     cfg = config.get()

@@ -306,3 +306,79 @@ def test_m5_verifies_staying_archived():
     before = {"UNREAD", *ids(PROCESSED, RECEIPTS)}
     assert check([archived], before, {"UNREAD"}) == []
     assert check([archived], before, {"UNREAD", INBOX})   # wrongly un-archived
+
+
+# --- window_for_run and undo_command (step 8 decision Q4) --------------------
+
+def run_row(at, *, run_id="run-a", message_id="m1", **overrides):
+    """An applied row of one run, at an exact time."""
+    record = archived_receipt(at=at, message_id=message_id, **overrides)
+    return record.model_copy(update={"run_id": run_id})
+
+
+RUN = [
+    run_row("2026-11-03T14:05:09.700+00:00", message_id="m1"),
+    run_row("2026-11-03T14:06:30.250+00:00", message_id="m2"),
+    run_row("2026-11-03T14:07:59.999+00:00", message_id="m3"),
+]
+
+
+def test_the_window_parses_and_selects_every_applied_row_of_the_run():
+    since, until = undo.window_for_run(RUN, "run-a")
+    window = undo.parse_window(since, until, now=NOW)
+    assert set(undo.select(RUN, window)) == {"m1", "m2", "m3"}
+
+
+def test_the_window_is_whole_seconds_around_the_rows():
+    """Floored to the second at the start; the latest floored plus one,
+    because --until is exclusive."""
+    assert undo.window_for_run(RUN, "run-a") == ("2026-11-03T14:05:09Z", "2026-11-03T14:08:00Z")
+
+
+def test_a_row_exactly_on_a_second_is_inside_the_window():
+    rows = [run_row("2026-11-03T14:05:09+00:00")]
+    since, until = undo.window_for_run(rows, "run-a")
+    window = undo.parse_window(since, until, now=NOW)
+    assert window.contains(rows[0].timestamp)
+
+
+def test_an_offset_timestamp_is_converted_to_utc():
+    rows = [run_row("2026-11-03T15:05:09+01:00")]
+    assert undo.window_for_run(rows, "run-a")[0] == "2026-11-03T14:05:09Z"
+
+
+def test_rows_that_changed_nothing_or_belong_elsewhere_do_not_set_the_bounds():
+    others = [
+        run_row("2026-11-03T13:00:00+00:00", run_id="run-b"),
+        run_row("2026-11-03T13:30:00+00:00", dry_run=True, after=None),
+        run_row("2026-11-03T14:30:00+00:00", add=(), remove=(), after=None, error="classify: x"),
+    ]
+    assert undo.window_for_run(RUN + others, "run-a") == (
+        "2026-11-03T14:05:09Z", "2026-11-03T14:08:00Z"
+    )
+
+
+@pytest.mark.parametrize("rows", [
+    [],
+    [run_row("2026-11-03T14:00:00+00:00", dry_run=True, after=None)],
+    [run_row("2026-11-03T14:00:00+00:00", run_id="run-b")],
+], ids=["no rows", "dry run only", "another run"])
+def test_a_run_with_nothing_applied_has_no_window(rows):
+    with pytest.raises(ValueError, match="no applied rows"):
+        undo.window_for_run(rows, "run-a")
+
+
+def test_the_undo_command_is_plan_only():
+    """The human adds --apply after reading the plan, so a pasted line
+    cannot write."""
+    command = undo.undo_command("2026-11-03T14:05:09Z", "2026-11-03T14:08:00Z")
+    assert command == (
+        "uv run python scripts/undo_run.py "
+        "--since 2026-11-03T14:05:09Z --until 2026-11-03T14:08:00Z"
+    )
+    assert "--apply" not in command
+
+
+def test_the_undo_command_carries_a_non_default_log():
+    command = undo.undo_command("a", "b", log="data/rehearsal/classifications.jsonl")
+    assert command.endswith("--log data/rehearsal/classifications.jsonl")

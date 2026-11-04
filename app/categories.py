@@ -140,6 +140,12 @@ UNPROCESSED_TERMS = " ".join(
     label_term(label, negate=True) for label in STOP_LABELS
 )
 
+# Sent, drafts and chats are not mail that arrives, so they are never mail
+# the agent classifies. The eval frame and the live queue both use this, and
+# DESIGN.md makes their consistency a hard requirement, so it is defined
+# once, here. A test fails if it is retyped elsewhere (step 8 decision Q1).
+RECEIVED_ONLY = "-in:sent -in:drafts -in:chats"
+
 
 def label_for(category: Category) -> str:
     """`Category.TO_ACTION` -> `Agent/To Action`."""
@@ -162,6 +168,12 @@ LABEL_PARENT = LABEL_PREFIX.rstrip("/")
 
 # What `scripts/setup_labels.py` ensures exists: the nine plus the parent.
 SETUP_LABELS: frozenset[str] = AGENT_LABELS | {LABEL_PARENT}
+
+# Every label a decision can name: the nine, plus INBOX, which a decision
+# removes. Each writer resolves exactly these ids once per run. Defined here,
+# not in each writer, so the agent and undo cannot need different maps
+# (step 8 decision Q1).
+REQUIRED_LABELS: frozenset[str] = AGENT_LABELS | {INBOX}
 
 
 @dataclass(frozen=True)
