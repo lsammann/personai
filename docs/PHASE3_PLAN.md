@@ -12,9 +12,10 @@ planning session of 2026-10-22. Each step gets a more detailed
 `Step N implementation` section, written just before it is built, near the
 end. Where the two disagree, the step section is newer.
 
-> **Status: SIGNED OFF 2026-11-02.** Agreed in outline 2026-10-22; open
-> points settled at plan review on 2026-11-02 (see the second decisions
-> table).
+> **Status: COMPLETE 2026-11-17.** Gate steps 1-4 are done. Step 2 failed
+> on action accuracy and proceeded under A6. Signed off 2026-11-02; agreed
+> in outline 2026-10-22, with open points settled at plan review on
+> 2026-11-02 (see the second decisions table).
 
 ---
 
@@ -634,13 +635,52 @@ dev's 0.900 / 0.771.
   unchanged. A6 says why gate step 3 proceeds anyway, and adds a stop rule
   for step 3.
 
+**Step 3 — passed 2026-11-17** (run `20261117T115038-586dfe`, `--live
+--limit 12 --query newer_than:1d`). The first live labelling of real mail.
+- 12 listed, 12 classified, 0 skipped, 0 failed. All from the model (the
+  allowlist is empty). Preflight 13.7 s; mean 3.9 s a message, slowest
+  6.2 s.
+- **The writes are correct.** For all 12, the `labels_after` Gmail returned
+  matches the logged change: exactly the added labels are new, and `INBOX`
+  is gone exactly where `-INBOX` was printed. All 12 had `INBOX` before, so
+  each archive was a real change.
+- Outcome: 10 archived (`Promotions` 9, `Updates` 1), 2 kept (Needs Review
+  1, `Bookings` 1).
+- **Stop rule 1 did not fire.** The human read all 10 archived messages;
+  none should have stayed visible.
+- Six-way slips, both harmless to the action:
+  - A Snapchat "… sent you new messages" notification was archived as
+    `Promotions`; the human would have called it `Updates`. Both archive.
+  - A Booking.com marketing email ("Niseko trip, Luke? Latest prices
+    here") was kept as `Bookings`; it is `Promotions`. That is clutter,
+    not a costly error.
+- "An Important Update from Coles" was confirmed as `Updates`, so archiving
+  it was correct.
+
+**Step 4 — passed 2026-11-17.** `undo_run.py --since 2026-11-17T11:50:57Z
+--until 2026-11-17T11:51:40Z --apply --verify`, over step 3's run.
+- 12 rows and 12 messages in the window; the log read with 0 unreadable
+  lines.
+- The plan was the exact inverse of the logged changes. All 12 lose their
+  two `Agent/` labels. The 10 archived get `INBOX` back. The 2 that kept it
+  (Needs Review, `Bookings`) get no `INBOX` add, because none was removed.
+- 12 changed, 0 already reverted, 0 held, 0 failed. `--verify`: 12 ok,
+  0 mismatched. **Orphans: none.** Report at
+  `data/undo/20261117T120200-851349.jsonl`.
+- With this, the write path has been shown end to end on real mail:
+  classify, one atomic modify, log, undo from the log, and verify.
+
+**Gate steps 1-4 complete, 2026-11-17.** Step 2 failed on action accuracy
+and proceeded under A6; steps 1, 3 and 4 passed. Step 5, bulk processing,
+is Phase 4.
+
 ---
 
 ## Build order
 
-**Current step: 10, the Gate.** Steps 1 and 2 are done: step 2 FAILED on
-action accuracy and proceeds under A6. Next is gate step 3, the small live
-run. Step 9 finished 2026-11-17, when its first use, the review of gate step
+**Current step: 10, the Gate. Gate steps 1-4 are complete (2026-11-17).**
+Step 2 FAILED on action accuracy and proceeded under A6; steps 1, 3 and 4
+passed. Step 5 is Phase 4. Step 9 finished 2026-11-17, when its first use, the review of gate step
 2's run, was completed.
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
@@ -723,7 +763,8 @@ run. Step 9 finished 2026-11-17, when its first use, the review of gate step
    read-only, on neither callers list. 677 tests pass. **Done
    2026-11-17:** all 300 of gate step 2's run reviewed and scored. One label
    was corrected after scoring (see Gate results)
-10. Gate. Steps 1-2 done (step 2 failed, proceeds under A6); step 3 next
+10. Gate. **Steps 1-4 done 2026-11-17** (step 2 failed, proceeded under
+    A6; 3 and 4 passed). Step 5 is Phase 4
 
 Per `CLAUDE.md`, each step is planned in its own section before it is
 written, and nothing is committed by Claude.
