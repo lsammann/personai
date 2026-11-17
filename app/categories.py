@@ -15,7 +15,8 @@ Needs Review" unrepresentable rather than merely unlikely.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 
 
@@ -139,10 +140,80 @@ UNPROCESSED_TERMS = " ".join(
     label_term(label, negate=True) for label in STOP_LABELS
 )
 
+# Sent, drafts and chats are not mail that arrives, so they are never mail
+# the agent classifies. The eval frame and the live queue both use this, and
+# DESIGN.md makes their consistency a hard requirement, so it is defined
+# once, here. A test fails if it is retyped elsewhere (step 8 decision Q1).
+RECEIVED_ONLY = "-in:sent -in:drafts -in:chats"
+
 
 def label_for(category: Category) -> str:
     """`Category.TO_ACTION` -> `Agent/To Action`."""
     return f"{LABEL_PREFIX}{category.value}"
+
+
+# Every label the agent owns: the six categories plus the three operational
+# labels. Built from the names above, never retyped, so a renamed category or
+# a new stop label reaches setup_labels without a second edit.
+AGENT_LABELS: frozenset[str] = frozenset(
+    {label_for(category) for category in Category} | {NEEDS_REVIEW, *STOP_LABELS}
+)
+
+# Gmail nesting is naming only: `Agent/Bookings` displays under `Agent` if and
+# only if a label named exactly `Agent` exists. Step 2 measured the nine
+# showing flat without it. Created by setup, never applied to a message - so
+# it is deliberately NOT in AGENT_LABELS, and never in a lookup or the undo
+# sweep.
+LABEL_PARENT = LABEL_PREFIX.rstrip("/")
+
+# What `scripts/setup_labels.py` ensures exists: the nine plus the parent.
+SETUP_LABELS: frozenset[str] = AGENT_LABELS | {LABEL_PARENT}
+
+# Every label a decision can name: the nine, plus INBOX, which a decision
+# removes. Each writer resolves exactly these ids once per run. Defined here,
+# not in each writer, so the agent and undo cannot need different maps
+# (step 8 decision Q1).
+REQUIRED_LABELS: frozenset[str] = AGENT_LABELS | {INBOX}
+
+
+@dataclass(frozen=True)
+class LabelSetupPlan:
+    """What `scripts/setup_labels.py` would do, given the labels that exist."""
+
+    present: tuple[str, ...]
+    to_create: tuple[str, ...]
+    # (wanted, existing case variant)
+    clashes: tuple[tuple[str, str], ...]
+
+
+def plan_label_setup(existing: Collection[str]) -> LabelSetupPlan:
+    """Sort `SETUP_LABELS` into present, to create, and clashing.
+
+    A clash is an existing label equal to a wanted one ignoring case but not
+    exactly - `agent/to action` against `Agent/To Action`. Gmail refuses a
+    second label differing only in case, so creating it would fail anyway;
+    reporting the clash up front means setup stops before creating anything,
+    rather than with a 409 halfway through. Whether to rename the existing
+    one is the human's call, never the script's.
+
+    Labels outside `SETUP_LABELS` - INBOX, the reader's own - are ignored.
+    """
+    existing_set = set(existing)
+    by_folded: dict[str, list[str]] = {}
+    for name in existing_set:
+        by_folded.setdefault(name.casefold(), []).append(name)
+
+    present, to_create, clashes = [], [], []
+    for wanted in sorted(SETUP_LABELS):
+        if wanted in existing_set:
+            present.append(wanted)
+            continue
+        variants = sorted(by_folded.get(wanted.casefold(), []))
+        if variants:
+            clashes += [(wanted, variant) for variant in variants]
+        else:
+            to_create.append(wanted)
+    return LabelSetupPlan(tuple(present), tuple(to_create), tuple(clashes))
 
 
 def letter_map(order: tuple[Category, ...] = DEFAULT_ORDER) -> dict[str, Category]:

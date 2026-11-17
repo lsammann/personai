@@ -23,13 +23,15 @@ import secrets
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.categories import Category
 from app.config import LOG_PATH
 
 # Where a row's ANSWER came from. Orthogonal to `run_kind` below.
-Source = Literal["model", "prefilter", "correction"]
+# `reply` is the reply rule (`decision.decide_reply_hit`), added with its call
+# site in Phase 3 step 7.
+Source = Literal["model", "prefilter", "reply", "correction"]
 
 # Which INVOCATION produced the row. `manual` is the CLI entry point - trying
 # the thing out on a handful of emails - which otherwise lands in the same file
@@ -45,6 +47,13 @@ class Action(BaseModel):
     dry_run", which destroys exactly what a dry run exists to show: what it
     WOULD have done. The intent and whether it was applied are two facts, so
     they are two fields - see `Record.dry_run`.
+
+    The EFFECTIVE change, not the intended one (Phase 3 step 6): adds that
+    were not already present, removes that were - see
+    `decision.effective_change`. Undo inverts exactly this, so an INBOX
+    remove on mail that was already archived must not appear here. The
+    intended change is still recoverable from `category` and the thresholds.
+    Names, for readability; `prior_labels` and `labels_after` are ids.
     """
 
     add: tuple[str, ...] = ()
@@ -67,7 +76,9 @@ class Record(BaseModel):
     sender: str = ""
     subject: str = ""
 
-    source: Source
+    # None only on a row that failed before routing was reached - a fetch
+    # failure - where no value would be true (Phase 3 step 7, Q3).
+    source: Source | None
 
     category: Category | None = None
     confidence: float | None = None
@@ -99,6 +110,17 @@ class Record(BaseModel):
     confidence_threshold: float | None = None
     to_action_floor: float | None = None
 
+    # Label IDS at fetch time, before any write. None only when the fetch
+    # itself failed. Ids rather than names because a user label can be
+    # renamed, and ids are what messages.modify takes. Added in Phase 3 step 6
+    # because it cannot be recovered afterwards: it is what undo restores to.
+    prior_labels: tuple[str, ...] | None = None
+    # Label ids Gmail reported after the modify (`modify_labels`' return).
+    # None when no modify was made - a dry run, a failure, an empty change.
+    # Compared with the labels at undo time, it is what tells the reader's own
+    # changes since the write apart from the agent's.
+    labels_after: tuple[str, ...] | None = None
+
     action: Action = Field(default_factory=Action)
     dry_run: bool = False
 
@@ -107,6 +129,28 @@ class Record(BaseModel):
     error: str | None = None
     # e.g. a category letter falling outside the returned top-20.
     note: str | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Record:
+        """Four rules a row cannot break, checked whenever one is built.
+
+        Writes are strict, so a row that fails here is never appended. Reads
+        stay tolerant: `read_all` counts such a line as skipped.
+        """
+        changes = bool(self.action.add or self.action.remove)
+        if changes and self.prior_labels is None:
+            # Undo cannot trust a change it has nothing to compare against.
+            raise ValueError("a row with a label change must carry prior_labels")
+        if self.error is not None and changes:
+            # CLAUDE.md: failure is not low confidence. A failure applies no
+            # labels, not even Processed, so the message retries.
+            raise ValueError("a failed row must carry no label change")
+        if self.dry_run and self.labels_after is not None:
+            raise ValueError("a dry run made no change, so it has no labels_after")
+        if self.source is None and self.error is None:
+            # Only a failure before routing has no source to record.
+            raise ValueError("a row without a source must carry an error")
+        return self
 
 
 def new_run_id() -> str:

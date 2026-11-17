@@ -232,14 +232,27 @@ Because dry runs write to the log, the Metrics view works normally during a
 dry run. This is the whole point — a dry run whose output vanishes to stdout
 is much less useful than one you can query afterwards.
 
-**Undo path:** every agent-touched message carries `Agent/Processed` *or*
-`Agent/Error`, so a bad run is recoverable — a script can query
-`{label:"Agent/Processed" label:"Agent/Error"}`, strip all `Agent/` labels, and
-restore `INBOX`. Worth writing this script *before* the first live run, not
-after.
+**Undo path — driven by the log, not by a label query.** *(Amended in
+Phase 3, step 6; see `docs/PHASE3_PLAN.md` → A3.)* The first design swept
+`{label:"Agent/Processed" label:"Agent/Error"}`, stripped every `Agent/`
+label and restored `INBOX`. That fails in the backfill, which touches mail
+the reader had already archived: a blind "restore `INBOX`" would un-archive
+it. So every log row records the message's labels before the write
+(`prior_labels`, as ids), the change actually made (`action`, the effective
+change, so no `INBOX` remove appears for mail that was already archived), and
+the labels Gmail reported afterwards (`labels_after`). `undo_run.py` reads the
+rows in a window and puts each message back as it was before the agent first
+touched it: every `Agent/` label gained since is removed, and `INBOX` is
+restored only where the agent archived it. One atomic `modify_labels` per
+message, planned against the labels it has *now*, so the reader's own
+changes in between (a star, a hand archive) survive. `--verify` re-fetches
+and checks every message. The label sweep is kept as a cross-check: a
+labelled message with no log row is an **orphan**, reported and never
+touched. The script was written, and rehearsed on throwaway mail, before
+the first live run.
 
 **Both labels, not just `Processed`.** This is the one real cost of the
-three-state design above: an undo that sweeps only `label:"Agent/Processed"`
+three-state design above: an orphan sweep over only `label:"Agent/Processed"`
 is incomplete. The consequence is mild — an `Agent/Error` message was never
 archived and carries no category, so a missed one leaves a stray label on
 mail still sitting in the inbox — but `undo_run.py` is the safety net for the
@@ -247,9 +260,12 @@ entire write path, so it is called out here and in the Phase 3 checklist.
 
 **`undo_run.py` must be time-scoped.** An unscoped undo run, executed after
 several good weeks, would dump thousands of correctly-archived emails back
-into the inbox. Gmail search accepts epoch seconds (`after:1725750000`), so
-the time window is a **required argument with no default**. Bounding by run
-id isn't possible without a DB; bounding by time is, and is sufficient.
+into the inbox, so the time window is a **required argument with no
+default**, capped at `undo.MAX_WINDOW` (24h in Phase 3). The window is
+matched on the log row's timestamp, when the agent changed the label.
+*Amended in Phase 3:* it was first going to be Gmail's `after:` epoch, but
+that filters on when a message was *received*. A 2023 message labelled by
+today's backfill would fall outside `after:today`.
 
 ### Pre-filter (before calling the model)
 
@@ -1017,7 +1033,8 @@ email-agent/
     label_eval.py       # sample / label / recheck / verify CLI
     run_eval.py         # predict / score CLI
     setup_labels.py     # (Phase 3) idempotent label creation (check-then-create)
-    undo_run.py         # (Phase 3) strip Agent/ labels, restore INBOX — time-window REQUIRED
+    undo_run.py         # (Phase 3) log-driven undo of a time window — window REQUIRED
+    rehearse_undo.py    # (Phase 3) labels the tagged throwaway mail the undo rehearsal uses
     smoke_classify.py   # live plumbing check of the classifier against Ollama
     measure_*.py        # mailbox and extraction measurements behind docs/BACKLOG.md
     spike_*.py          # Phase 0 throwaway spikes; exempt from ruff

@@ -1,4 +1,6 @@
-"""Gmail access: the MIME walk, pagination, and the read-only guarantee.
+"""Gmail access: the MIME walk, pagination, label lookup and creation.
+
+What may reach the API, and from where, is tested in `test_write_guard.py`.
 
 The walk is pure - it takes the payload dict - so the three real tree shapes
 are tested directly. Only the API calls need a fake service, and it is a hand
@@ -6,30 +8,44 @@ written one rather than a Mock: the chain under test is
 `svc.users().messages().list(...).execute()`, and a Mock would happily answer
 any chain at all, including a wrong one.
 
+The fakes live in `tests/fakes.py`, shared with `test_agent.py`.
+
 Tree shapes are taken from real mail; see the module docstring of
 `app/gmail_client.py` and `docs/BACKLOG.md` -> Body structure.
 """
 
 from __future__ import annotations
 
-import ast
 import base64
 import datetime as dt
-import json
-from pathlib import Path
 
 import pytest
 from googleapiclient.errors import HttpError
 
 from app import gmail_client
 from app.gmail_client import (
+    Forbidden,
+    GmailApiError,
     Message,
+    MissingLabels,
     NotAuthenticated,
+    all_labels,
     collect_text_parts,
     count,
+    create_label,
     fetch,
+    fetch_raw,
     header,
+    label_ids,
+    modify_labels,
     search_ids,
+)
+from tests.fakes import (
+    FakeLabels,
+    FakeMessages,
+    FakeService,
+    FlakyRequest,
+    http_error,
 )
 
 
@@ -235,41 +251,6 @@ def test_a_missing_internal_date_does_not_raise():
 # --- the API calls, against a hand-written fake ---------------------------
 
 
-class FakeExecutable:
-    def __init__(self, result):
-        self._result = result
-
-    def execute(self):
-        return self._result
-
-
-class FakeMessages:
-    def __init__(self, pages=None, message=None):
-        self._pages = list(pages or [])
-        self._message = message
-        self.list_calls: list[dict] = []
-        self.get_calls: list[dict] = []
-
-    def list(self, **kwargs):
-        self.list_calls.append(kwargs)
-        return FakeExecutable(self._pages.pop(0) if self._pages else {})
-
-    def get(self, **kwargs):
-        self.get_calls.append(kwargs)
-        return FakeExecutable(self._message)
-
-
-class FakeService:
-    def __init__(self, messages: FakeMessages):
-        self._messages = messages
-
-    def users(self):
-        return self
-
-    def messages(self):
-        return self._messages
-
-
 def test_search_ids_paginates_to_the_end():
     messages = FakeMessages(
         pages=[
@@ -350,44 +331,6 @@ def test_service_without_credentials_raises_rather_than_returning_none(monkeypat
 # --- transient failures ---------------------------------------------------
 
 
-class FakeHttpResponse:
-    """The two attributes HttpError reads.
-
-    A stub rather than httplib2.Response: httplib2 is a transitive dependency
-    of google-api-python-client, not one this project declares, and reaching
-    through to it in tests would make an undeclared package load-bearing.
-    """
-
-    def __init__(self, status: int):
-        self.status = status
-        self.reason = ""
-
-
-def http_error(status: int, reason: str = "") -> HttpError:
-    """An HttpError shaped like the ones Gmail actually returns."""
-    content = json.dumps(
-        {"error": {"code": status, "message": reason, "errors": [{"reason": reason}]}}
-    ).encode()
-    return HttpError(FakeHttpResponse(status), content)
-
-
-class FlakyRequest:
-    """Fails with `error` for the first `failures` calls, then succeeds."""
-
-    def __init__(self, error: HttpError, failures: int, result=None):
-        self._error = error
-        self._remaining = failures
-        self._result = result or {"messages": []}
-        self.attempts = 0
-
-    def execute(self):
-        self.attempts += 1
-        if self._remaining:
-            self._remaining -= 1
-            raise self._error
-        return self._result
-
-
 @pytest.fixture(autouse=True)
 def no_real_sleeping(monkeypatch):
     """Backoff sleeps are real seconds; the tests should not spend them."""
@@ -421,16 +364,39 @@ def test_a_permission_403_is_never_retried():
     report a rate-limit problem that was really a scope violation.
     """
     request = FlakyRequest(http_error(403, "insufficientPermissions"), failures=1)
-    with pytest.raises(HttpError):
+    with pytest.raises(Forbidden):
         gmail_client._execute(request)
     assert request.attempts == 1
 
 
 def test_a_404_is_never_retried():
     request = FlakyRequest(http_error(404, "notFound"), failures=1)
-    with pytest.raises(HttpError):
+    with pytest.raises(GmailApiError):
         gmail_client._execute(request)
     assert request.attempts == 1
+
+
+def test_a_final_http_error_is_raised_as_gmail_api_error_with_its_status():
+    """Phase 3 step 7 (Q2): callers outside this module may not import
+    googleapiclient, so they could not otherwise tell a Gmail failure from a
+    bug of their own. The original stays reachable as the cause."""
+    request = FlakyRequest(http_error(404, "notFound"), failures=1)
+    with pytest.raises(GmailApiError) as raised:
+        gmail_client._execute(request)
+    assert raised.value.status == 404
+    assert not isinstance(raised.value, Forbidden)
+    assert isinstance(raised.value.__cause__, HttpError)
+
+
+def test_a_rate_limit_403_that_outlasts_the_backoff_is_forbidden():
+    """Every 403 is about the account, not one message, so a rate limit
+    still in force after every attempt halts a run the same way a missing
+    permission does."""
+    request = FlakyRequest(http_error(403, "rateLimitExceeded"), failures=99)
+    with pytest.raises(Forbidden) as raised:
+        gmail_client._execute(request)
+    assert raised.value.status == 403
+    assert request.attempts == gmail_client.MAX_ATTEMPTS
 
 
 def test_throttle_paces_a_sweep_and_is_opt_in(monkeypatch):
@@ -452,9 +418,10 @@ def test_throttle_paces_a_sweep_and_is_opt_in(monkeypatch):
 
 def test_retries_are_bounded_and_the_error_survives():
     request = FlakyRequest(http_error(429, "rateLimitExceeded"), failures=99)
-    with pytest.raises(HttpError):
+    with pytest.raises(GmailApiError) as raised:
         gmail_client._execute(request)
     assert request.attempts == gmail_client.MAX_ATTEMPTS
+    assert raised.value.status == 429
 
 
 def test_backoff_doubles_and_is_capped(monkeypatch):
@@ -463,7 +430,7 @@ def test_backoff_doubles_and_is_capped(monkeypatch):
     monkeypatch.setattr(gmail_client.random, "uniform", lambda _, high: high)
 
     request = FlakyRequest(http_error(429, "rateLimitExceeded"), failures=99)
-    with pytest.raises(HttpError):
+    with pytest.raises(GmailApiError):
         gmail_client._execute(request)
 
     assert slept == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
@@ -484,7 +451,7 @@ def test_jitter_is_equal_not_full_so_retries_span_the_window(monkeypatch):
     monkeypatch.setattr(gmail_client.random, "uniform", lambda low, _: low)
 
     request = FlakyRequest(http_error(429, "rateLimitExceeded"), failures=99)
-    with pytest.raises(HttpError):
+    with pytest.raises(GmailApiError):
         gmail_client._execute(request)
 
     # Even with the jitter drawing its minimum, every wait is half the delay.
@@ -492,22 +459,143 @@ def test_jitter_is_equal_not_full_so_retries_span_the_window(monkeypatch):
     assert sum(slept) > 30
 
 
-# --- the read-only guarantee ---------------------------------------------
+# --- labels ----------------------------------------------------------------
 
 
-def test_gmail_client_contains_no_write_call():
-    """CLAUDE.md requires Phases 0-2 to be INCAPABLE of modifying the inbox,
-    not merely unlikely to. The gmail.readonly token is the backstop; this is
-    the guarantee. Phase 3 adds messages.modify and updates this deliberately.
-    """
-    forbidden = {
-        "modify", "batchModify", "trash", "untrash", "delete", "batchDelete",
-        "insert", "send", "create", "update", "patch",
-    }
-    source = Path(gmail_client.__file__).read_text()
-    called = {
-        node.func.attr
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-    assert not called & forbidden, f"write calls: {sorted(called & forbidden)}"
+def test_fetch_raw_returns_the_whole_response_through_execute(monkeypatch):
+    """measure_bodies needs more than Message carries, and used to call the
+    API directly - without backoff. It goes through here now."""
+    executed = []
+    real_execute = gmail_client._execute
+    monkeypatch.setattr(
+        gmail_client, "_execute", lambda r: executed.append(r) or real_execute(r)
+    )
+    response = {"id": "m1", "payload": {"headers": []}, "sizeEstimate": 1234}
+    messages = FakeMessages(message=response)
+
+    assert fetch_raw(FakeService(messages), "m1") == response
+    assert len(executed) == 1
+    assert messages.get_calls == [{"userId": "me", "id": "m1", "format": "full"}]
+
+
+LABELS = {"INBOX": "INBOX", "Agent/To Action": "Label_1", "Agent/Processed": "Label_2"}
+
+
+def test_all_labels_returns_every_label_including_system_ones():
+    labels = FakeLabels(LABELS)
+    assert all_labels(FakeService(labels=labels)) == LABELS
+    assert labels.list_calls == [{"userId": "me"}]
+
+
+def test_label_ids_maps_every_requested_name_and_nothing_else():
+    labels = FakeLabels(LABELS)
+    ids = label_ids(FakeService(labels=labels), ["Agent/To Action", "Agent/Processed"])
+    assert ids == {"Agent/To Action": "Label_1", "Agent/Processed": "Label_2"}
+    assert len(labels.list_calls) == 1
+
+
+def test_label_ids_names_every_missing_label_not_just_the_first():
+    """One rerun of setup should fix all of them."""
+    with pytest.raises(MissingLabels) as raised:
+        label_ids(
+            FakeService(labels=FakeLabels(LABELS)),
+            ["Agent/Processed", "Agent/Receipts", "Agent/Error"],
+        )
+    assert raised.value.missing == ["Agent/Error", "Agent/Receipts"]
+
+
+def test_label_ids_does_not_match_a_case_variant():
+    """A case variant is a different label here; setup_labels reports the
+    clash rather than this quietly accepting it."""
+    labels = FakeLabels({"agent/to action": "Label_9"})
+    with pytest.raises(MissingLabels):
+        label_ids(FakeService(labels=labels), ["Agent/To Action"])
+
+
+def test_create_label_sends_only_the_name_and_returns_the_id():
+    labels = FakeLabels()
+    assert create_label(FakeService(labels=labels), "Agent/Receipts") == "Label_new"
+    assert labels.create_calls == [{"userId": "me", "body": {"name": "Agent/Receipts"}}]
+
+
+# --- modify_labels: the one write to a message ------------------------------
+
+
+def test_modify_is_one_call_carrying_both_sides_sorted_and_deduplicated():
+    messages = FakeMessages()
+    modify_labels(
+        FakeService(messages),
+        "m1",
+        add_ids=["Label_6", "Label_2", "Label_6"],
+        remove_ids=["INBOX"],
+    )
+    assert messages.modify_calls == [{
+        "userId": "me",
+        "id": "m1",
+        "body": {"addLabelIds": ["Label_2", "Label_6"], "removeLabelIds": ["INBOX"]},
+    }]
+
+
+def test_modify_returns_the_labels_gmail_reports_after_the_change():
+    labels = modify_labels(
+        FakeService(FakeMessages()), "m1", add_ids=["Label_2"], remove_ids=["INBOX"]
+    )
+    assert labels == ("Label_2", "Label_6")
+
+
+@pytest.mark.parametrize(
+    "add, remove, error",
+    [
+        # an empty change is a caller bug, not a silent no-op
+        ([], [], ValueError),
+        # a bare string would be read as its characters
+        ("Label_2", [], TypeError),
+        ([], "INBOX", TypeError),
+        # no correct caller asks to add and remove the same label
+        (["Label_2"], ["Label_2"], ValueError),
+        # system labels other than INBOX: modify_labels cannot trash, spam,
+        # un-spam or mark-read, whatever it is passed
+        (["TRASH"], [], ValueError),
+        ([], ["SPAM"], ValueError),
+        ([], ["UNREAD"], ValueError),
+        (["CATEGORY_PROMOTIONS"], [], ValueError),
+        # a label NAME passed instead of its id
+        (["Agent/Receipts"], ["INBOX"], ValueError),
+    ],
+)
+def test_modify_refuses_a_bad_change_before_any_call(add, remove, error):
+    messages = FakeMessages()
+    with pytest.raises(error):
+        modify_labels(FakeService(messages), "m1", add_ids=add, remove_ids=remove)
+    assert messages.modify_calls == []
+
+
+def test_modify_accepts_inbox_and_user_labels_on_either_side():
+    messages = FakeMessages()
+    modify_labels(FakeService(messages), "m1", add_ids=["INBOX"], remove_ids=["Label_7"])
+    assert len(messages.modify_calls) == 1
+
+
+def test_a_permission_403_from_modify_is_raised_after_one_attempt():
+    """Now the error that matters most: a write the token does not cover."""
+    request = FlakyRequest(http_error(403, "insufficientPermissions"), failures=1)
+    with pytest.raises(Forbidden):
+        modify_labels(
+            FakeService(FakeMessages(modify_request=request)),
+            "m1", add_ids=["Label_2"], remove_ids=["INBOX"],
+        )
+    assert request.attempts == 1
+
+
+def test_a_rate_limited_modify_is_retried():
+    """Safe because modify sets labels rather than toggling them: a retry of
+    a call that had already succeeded changes nothing."""
+    request = FlakyRequest(
+        http_error(429, "rateLimitExceeded"), failures=2, result={"labelIds": ["Label_2"]}
+    )
+    labels = modify_labels(
+        FakeService(FakeMessages(modify_request=request)),
+        "m1", add_ids=["Label_2"], remove_ids=["INBOX"],
+    )
+    assert request.attempts == 3
+    assert labels == ("Label_2",)

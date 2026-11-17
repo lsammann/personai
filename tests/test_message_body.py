@@ -212,6 +212,16 @@ def test_a_url_with_no_host_does_not_vanish_silently():
     assert select_body("go to https:///nowhere", "").text == "go to link"
 
 
+@pytest.mark.parametrize("url", ["https://site.com]/", "https://[broken"])
+def test_a_url_with_a_malformed_bracketed_host_becomes_link(url):
+    """`urlsplit` raises on these; that crashed the gate's large dry run."""
+    assert select_body(f"see {url} now", "").text == "see link now"
+
+
+def test_a_bracket_in_the_path_still_keeps_the_host():
+    assert select_body("see https://example.com/a[b now", "").text == "see example.com now"
+
+
 def test_informative_length_ignores_urls_and_padding():
     assert informative_length("hi\u200c there https://example.com/" + "x" * 500) == 8
 

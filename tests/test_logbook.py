@@ -4,6 +4,7 @@ import datetime as dt
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from app import logbook
 from app.categories import INBOX, PROCESSED, Category, label_for
@@ -28,6 +29,8 @@ def record(**overrides):
         "to_action_floor": 0.15,
         "retained_mass": 0.97,
         "action": Action(add=(label_for(Category.TO_ACTION), PROCESSED)),
+        # Required by the first validator whenever `action` is non-empty.
+        "prior_labels": (INBOX, "UNREAD"),
     }
     return Record(**(fields | overrides))
 
@@ -182,3 +185,98 @@ def test_default_path_is_resolved_at_call_time(tmp_path, monkeypatch):
     monkeypatch.setattr(logbook, "LOG_PATH", target)
     logbook.append(record())
     assert target.exists()
+
+
+# --- Phase 3 step 6: prior_labels, labels_after, and the validators ---------
+
+
+def test_prior_and_after_labels_round_trip_as_ids(tmp_path):
+    """Ids, as Gmail gives them - what undo restores to and compares with."""
+    path = tmp_path / "log.jsonl"
+    logbook.append(
+        record(prior_labels=(INBOX, "UNREAD"),
+               labels_after=("Label_4", "Label_9", "UNREAD")),
+        path,
+    )
+    stored = logbook.read_all(path)[0][0]
+    assert stored.prior_labels == (INBOX, "UNREAD")
+    assert stored.labels_after == ("Label_4", "Label_9", "UNREAD")
+
+
+def test_a_label_change_without_prior_labels_is_refused():
+    """Undo cannot trust a change it has nothing to compare against."""
+    with pytest.raises(ValidationError, match="prior_labels"):
+        record(prior_labels=None)
+
+
+def test_no_change_needs_no_prior_labels():
+    """A failed fetch has no labels to record, and changes nothing."""
+    row = record(action=Action(), prior_labels=None, error="fetch failed",
+                 category=None, confidence=None, distribution={})
+    assert row.prior_labels is None
+
+
+def test_a_failed_row_carrying_a_label_change_is_refused():
+    """CLAUDE.md: failure is not low confidence. A failure applies nothing."""
+    with pytest.raises(ValidationError, match="failed row"):
+        record(error="ollama unreachable")
+
+
+def test_a_dry_run_with_labels_after_is_refused():
+    """A dry run made no change, so there is no 'after' to report."""
+    with pytest.raises(ValidationError, match="dry run"):
+        record(dry_run=True, labels_after=("Label_4",))
+
+
+def test_a_dry_run_with_a_change_and_prior_labels_is_accepted():
+    """The normal dry-run row: what it would have done, and what it saw."""
+    row = record(dry_run=True, labels_after=None)
+    assert row.action.add and row.prior_labels is not None
+
+
+def test_the_reply_source_is_accepted(tmp_path):
+    """Phase 3 step 7: the reply rule's rows carry their own source."""
+    path = tmp_path / "log.jsonl"
+    logbook.append(record(source="reply", confidence=None, distribution={}), path)
+    assert logbook.read_all(path)[0][0].source == "reply"
+
+
+def test_a_row_without_a_source_must_be_a_failure():
+    """None means routing was never reached (a fetch failure, step 7 Q3).
+    A successful row always knows where its answer came from."""
+    with pytest.raises(ValidationError, match="without a source"):
+        record(source=None)
+
+
+def test_a_failure_before_routing_has_no_source(tmp_path):
+    path = tmp_path / "log.jsonl"
+    logbook.append(
+        record(source=None, error="fetch: GmailApiError: 404", action=Action(),
+               prior_labels=None, category=None, confidence=None, distribution={},
+               sender="", subject=""),
+        path,
+    )
+    stored = logbook.read_all(path)[0][0]
+    assert stored.source is None and stored.error
+
+
+def test_a_row_breaking_a_validator_is_never_appended(tmp_path):
+    """Strict writes: the failure is at construction, before any I/O."""
+    path = tmp_path / "log.jsonl"
+    with pytest.raises(ValidationError):
+        logbook.append(record(error="boom"), path)
+    assert not path.exists()
+
+
+def test_an_invalid_line_on_disk_is_skipped_not_fatal(tmp_path):
+    """Reads stay tolerant: a hand-edited line that breaks a validator costs
+    one row, counted, rather than the whole log."""
+    path = tmp_path / "log.jsonl"
+    logbook.append(record(message_id="good"), path)
+    raw = json.loads(record().model_dump_json())
+    raw["prior_labels"] = None
+    with path.open("a") as handle:
+        handle.write(json.dumps(raw) + "\n")
+    records, skipped = logbook.read_all(path)
+    assert [r.message_id for r in records] == ["good"]
+    assert skipped == 1

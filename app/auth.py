@@ -6,7 +6,9 @@ app, so the flow runs as ordinary routes in this app rather than through
 server, and shells out to a browser). First-time setup and the weekly
 re-authentication are therefore the same code path.
 
-Scope is read-only and stays that way until Phase 3 - see CLAUDE.md.
+Scope was read-only until Phase 3 step 2, gained `gmail.labels` there, and
+became `gmail.modify` at step 4 - see CLAUDE.md. What Google *granted* is recorded at consent and checked by
+`require_scopes`; the `SCOPES` constant is only what we *ask* for.
 """
 
 from __future__ import annotations
@@ -31,9 +33,26 @@ os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 # granted, which oauthlib treats as a scope change and rejects.
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
-# Phase 0-2 are structurally incapable of modifying the mailbox. Widening
-# this to gmail.modify is a Phase 3 decision and forces a re-consent.
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+LABELS = "https://www.googleapis.com/auth/gmail.labels"
+MODIFY = "https://www.googleapis.com/auth/gmail.modify"
+
+# What the consent flow REQUESTS. Phases 0-2 were structurally incapable of
+# modifying the mailbox; each widening is its own Phase 3 step and forces a
+# re-consent. Never read this to learn what the token can do - Google may
+# grant less than was asked, and that is what `granted_scopes()` reports.
+#
+# Phase 3 step 2 added gmail.labels, which can create labels but cannot touch
+# a message. Step 4 replaced both with gmail.modify alone: it covers both
+# (`_IMPLIES`), so requesting all three would add nothing, and one scope keeps
+# the consent screen exact about what is granted. The token can now change
+# messages; whether code can is decided by the allowlist in
+# tests/test_write_guard.py. A test pins this list.
+SCOPES = [MODIFY]
+
+# gmail.modify covers everything gmail.labels and gmail.readonly allow. Kept
+# in one place so no caller has to know the scope hierarchy.
+_IMPLIES = {MODIFY: frozenset({LABELS, READONLY})}
 
 REDIRECT_URI = "http://localhost:8000/auth/callback"
 
@@ -56,6 +75,15 @@ WARN_AFTER_DAYS = 6
 # In-memory is sufficient: the window is seconds, and a server restart in
 # between simply means starting the flow again.
 _pending_flows: dict[str, str] = {}
+
+
+class InsufficientScope(Exception):
+    """The stored consent does not cover what this entry point needs.
+
+    Lives here rather than under `gmail_client.NotAuthenticated` because
+    `gmail_client` imports `auth`; the reverse import would be circular. Like
+    an expired token, retrying cannot help - a human has to re-consent.
+    """
 
 
 def _flow() -> Flow:
@@ -95,26 +123,47 @@ def exchange_code(code: str, state: str) -> None:
     flow = _flow()
     flow.code_verifier = code_verifier
     flow.fetch_token(code=code)
-    _write_token(flow.credentials)
+    # `granted_scopes` is Google's token response, read by google_auth_oauthlib
+    # from the `scope` field. It is NOT kept by `Credentials.to_json()`, so it
+    # has to be captured here or it is lost.
+    raw_granted = getattr(flow.credentials, "granted_scopes", None)
+    _write_token(
+        flow.credentials,
+        granted=None if raw_granted is None else _normalise_scopes(raw_granted),
+    )
 
 
-def _write_token(creds: Credentials, consented_at: str | None = None) -> None:
+def _normalise_scopes(scopes: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    """Google's `scope` field is space-separated; the library sometimes splits it."""
+    if scopes is None:
+        return []
+    if isinstance(scopes, str):
+        scopes = scopes.split()
+    return sorted(set(scopes))
+
+
+def _write_token(
+    creds: Credentials,
+    consented_at: str | None = None,
+    granted: list[str] | None = None,
+) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if consented_at is None:
         consented_at = _now().isoformat()
-    TOKEN_PATH.write_text(
-        json.dumps(
-            {
-                "credentials": json.loads(creds.to_json()),
-                # When the human last approved consent. Refreshing an access
-                # token does not reset this - only a new consent does, which
-                # is what the 7-day window actually measures.
-                "consented_at": consented_at,
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    record: dict[str, Any] = {
+        "credentials": json.loads(creds.to_json()),
+        # When the human last approved consent. Refreshing an access
+        # token does not reset this - only a new consent does, which
+        # is what the 7-day window actually measures.
+        "consented_at": consented_at,
+    }
+    # What that consent granted. Top level, beside consented_at, for the same
+    # reason: it is a fact about the consent, not the access token. Omitted
+    # rather than written empty when unknown, so "never recorded" stays
+    # distinguishable on disk.
+    if granted is not None:
+        record["granted_scopes"] = granted
+    TOKEN_PATH.write_text(json.dumps(record, indent=2) + "\n")
 
 
 def _now() -> dt.datetime:
@@ -150,11 +199,55 @@ def load_credentials() -> Credentials | None:
             creds.refresh(Request())
         except RefreshError:
             return None
-        # The access token changed; keep the original consent timestamp.
-        _write_token(creds, consented_at=stored.get("consented_at"))
+        # The access token changed; the consent did not. Keep both facts
+        # about it as they were recorded.
+        _write_token(
+            creds,
+            consented_at=stored.get("consented_at"),
+            granted=stored.get("granted_scopes"),
+        )
         return creds
 
     return None
+
+
+def granted_scopes() -> frozenset[str]:
+    """What the last consent actually granted, as Google returned it.
+
+    Empty when nothing is recorded - no token, or a token written before this
+    was captured. Empty means `require_scopes` fails closed, which is the
+    point: an unknown grant is not assumed to be the requested one.
+    """
+    stored = _read_token()
+    if stored is None:
+        return frozenset()
+    return frozenset(_normalise_scopes(stored.get("granted_scopes")))
+
+
+def require_scopes(scope: str, *more: str) -> None:
+    """Raise `InsufficientScope` unless the granted set covers every scope.
+
+    Checks the recorded grant, not `SCOPES`: requesting a scope proves
+    nothing about having it. Each entry point calls this once, with every
+    scope it needs, before making any API call. The error names every
+    missing scope, so one re-consent fixes all of them.
+
+    Separate arguments rather than a list: a list parameter given a single
+    string would iterate its characters. The first is positional and
+    required, so calling with no scopes at all is a TypeError rather than a
+    check that silently passes.
+    """
+    granted = granted_scopes()
+    covered = set(granted)
+    for held in granted:
+        covered |= _IMPLIES.get(held, frozenset())
+    missing = [needed for needed in (scope, *more) if needed not in covered]
+    if missing:
+        held_text = ", ".join(sorted(granted)) or "nothing recorded"
+        raise InsufficientScope(
+            f"Needs {', '.join(missing)}, but the stored consent grants: "
+            f"{held_text}. Reconnect via /auth/start."
+        )
 
 
 def status() -> dict[str, Any]:
@@ -179,7 +272,9 @@ def status() -> dict[str, Any]:
         "connected": True,
         "needs_auth": False,
         "consented_at": consented_at,
-        "scopes": SCOPES,
+        # What Google granted, not what we asked for. Empty means the
+        # consent predates recording it.
+        "granted_scopes": sorted(granted_scopes()),
     }
     if consented_at:
         age_days = (_now() - dt.datetime.fromisoformat(consented_at)).days

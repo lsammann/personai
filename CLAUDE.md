@@ -5,10 +5,17 @@ Personal Gmail classification agent. Read `DESIGN.md` for what and why,
 plan for how that phase is being built and where the code has deliberately
 diverged from it.
 
-**Current phase: 3 — the writer. Not yet planned.** Phase 2 is complete
-(gate passed 2026-09-14, all eight build steps done). The first piece of
-Phase 3 work is writing and agreeing `docs/PHASE3_PLAN.md`, built from
-`docs/PLAN.md` → Phase 3; no Phase 3 code exists yet.
+**Current phase: 4 — automation. Not yet planned.** There is no
+`docs/PHASE4_PLAN.md` yet, and nothing is built for Phase 4 until one is
+written and signed off. Phase 3 is complete: gate steps 1-4 were done
+2026-11-17, and step 2 failed on action accuracy and proceeded under
+amendment A6. Phase 2 is complete (gate passed 2026-09-14).
+
+**`docs/PHASE3_PLAN.md` is now the record of how the writer was built.** Read
+its **amendment log** (A1-A6), both decisions tables, and **Gate results**.
+Gate results holds the large dry run's reviewed figures, the one label
+corrected after scoring, why the Needs Review volume was accepted, and the
+first live run and its undo.
 
 This file is the single source of truth for which **phase** is current; the
 current phase plan's Build order is the single source of truth for which

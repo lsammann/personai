@@ -2,7 +2,9 @@
 
 Given an outcome, which labels? That is the only question this file answers,
 and it answers it four ways - a model result, a prefilter hit, a failure, and a
-dead letter. It is the most-tested file in the project and that only holds if
+dead letter. Plus the last step of the same question, `effective_change`:
+given that decision and the labels a message already has, what actually
+changes. It is the most-tested file in the project and that only holds if
 it stays isolated, so it imports nothing but `app.categories` and the standard
 library. `test_decision.py` asserts that mechanically.
 
@@ -21,7 +23,7 @@ collapse into each other:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
 from app.categories import (
@@ -192,6 +194,35 @@ def decide_dead_letter() -> Decision:
         needs_review=False,
         to_action_override=False,
     )
+
+
+def effective_change(
+    decision: Decision, prior_names: Collection[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(add, remove): what this decision actually changes on this message.
+
+    The decision's adds that are not already present, and its removes that
+    are. A message the reader had already archived gets no INBOX remove, so
+    the log - and undo, which inverts the log - never claims a change that
+    was not made. Undoing a remove that never happened would put archived
+    mail back in the inbox (Phase 3 plan, A3).
+
+    Names only, so label ids stay out of this module: the caller turns the
+    message's label ids into names first. Ids it cannot name (system labels,
+    the reader's own) can be dropped, because only `Agent/` labels and INBOX
+    ever appear in a decision.
+
+    Returns tuples rather than a `logbook.Action`, because this module
+    imports nothing but `app.categories`; the caller builds the Action.
+    """
+    if isinstance(prior_names, str):
+        # A string is a collection of its characters, so "INBOX" would read
+        # as {"I", "N", ...} and silently drop the INBOX remove.
+        raise TypeError(f"prior_names must be a collection, not a string: {prior_names!r}")
+    prior = set(prior_names)
+    add = tuple(label for label in decision.labels_add if label not in prior)
+    remove = tuple(label for label in decision.labels_remove if label in prior)
+    return add, remove
 
 
 def _sorted(*labels: str) -> tuple[str, ...]:

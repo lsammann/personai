@@ -5,13 +5,14 @@ nothing about what the model should read - choosing between the plain and HTML
 parts is model-input policy and lives in `message_body`. `fetch()` therefore
 returns both text parts, raw and decoded, and expresses no preference.
 
-**Read-only until Phase 3.** `CLAUDE.md` requires Phases 0-2 to be incapable
-of modifying the inbox rather than merely unlikely to, and the token carries
-`gmail.readonly`, so a write here would fail at the API. That is a backstop,
-not the guarantee: a test parses this module and fails if a modify, trash or
-delete call appears in it, the same way a test guards the purity of
-`decision`. Phase 3 adds the single atomic `messages.modify` call and updates
-that test deliberately.
+**The only door to the Gmail API.** No other module in `app/` or `scripts/`
+may call `svc.users()`, and every API call made here must be on an explicit
+allowlist - both enforced by `tests/test_write_guard.py`. Two writes:
+`labels.create` (Phase 3 step 1), which can create a label but cannot touch a
+message, and `messages.modify` (step 5), the single atomic label change,
+reached only through `modify_labels`. Who may call `modify_labels` is itself
+an allowlist in that test. The granted OAuth scope is the backstop
+underneath.
 
 The MIME walk is the substantial part. An email is headers plus one blob of
 text at the wire level; MIME is the convention that lets one message carry
@@ -47,6 +48,7 @@ import base64
 import datetime as dt
 import random
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from google.oauth2.credentials import Credentials
@@ -85,6 +87,11 @@ NESTED_MESSAGE = "message/rfc822"
 # styles reach the model looking the same.
 FORWARD_SEPARATOR = "\n\n---------- Forwarded message ----------\n"
 
+# The only system label `modify_labels` may touch. Every other id must be a
+# user label, which Gmail ids as `Label_<n>`. See `_check_modifiable`.
+MODIFIABLE_SYSTEM_LABEL = "INBOX"
+USER_LABEL_ID_PREFIX = "Label_"
+
 # Statuses worth retrying. 403 is included but conditionally - see `_retryable`.
 RETRY_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
 
@@ -116,6 +123,51 @@ class NotAuthenticated(GmailError):
     expired refresh token fails identically every time and needs a human to
     re-consent.
     """
+
+
+class GmailApiError(GmailError):
+    """An API call that failed after `_execute`'s backoff, or was never worth
+    retrying. Raised in place of googleapiclient's `HttpError`, `from` it.
+
+    Exists so callers outside this module can tell a Gmail failure from a
+    bug in their own code without importing `googleapiclient`, which
+    `tests/test_write_guard.py` forbids. The agent turns this into a failure
+    row; a bare `except Exception` would turn a bug into one too (Phase 3
+    plan, Step 7 Q2).
+
+    `status` is the HTTP status, or None if the response carried none.
+    """
+
+    def __init__(self, message: str, status: int | None):
+        self.status = status
+        super().__init__(message)
+
+
+class Forbidden(GmailApiError):
+    """Any 403 that outlasted the backoff, or was never retried.
+
+    A 403 from Gmail is always about the account, never about one message:
+    a scope the token lacks, a daily limit, or a rate limit still in force
+    after every attempt. Every later message would fail the same way, so
+    callers treat it like an auth failure and halt rather than logging one
+    failure per message.
+    """
+
+
+class MissingLabels(GmailError):
+    """One or more required labels do not exist in the mailbox.
+
+    Raised by `label_ids` so a run fails closed: classifying into a label
+    that is not there would mean either a 400 per message or, worse, a
+    silent fallback.
+    """
+
+    def __init__(self, missing: Collection[str]):
+        self.missing = sorted(missing)
+        super().__init__(
+            "Missing labels: " + ", ".join(self.missing)
+            + ". Run scripts/setup_labels.py."
+        )
 
 
 @dataclass(frozen=True)
@@ -183,10 +235,10 @@ def _retryable(error: HttpError) -> bool:
 
     The subtlety is 403. Gmail returns it both for "you are going too fast"
     (retry) and for "your token does not carry that permission" (never retry) -
-    and the second is exactly what the read-only scope produces if a write ever
-    slips in. Retrying that would burn a minute and then report a rate-limit
-    problem that was really a scope violation, which is precisely the error this
-    project most wants to see clearly.
+    and the second is exactly what an insufficient scope produces if a call
+    the token does not cover ever slips in. Retrying that would burn a minute
+    and then report a rate-limit problem that was really a scope violation,
+    which is precisely the error this project most wants to see clearly.
     """
     status = getattr(error.resp, "status", None)
     if status not in RETRY_STATUSES:
@@ -208,6 +260,10 @@ def _execute(request):
     `rateLimitExceeded`. A caller that has to be restarted repeatedly through
     normal operation is not resumable in any useful sense.
 
+    What survives the retries is raised as `GmailApiError` (`Forbidden` for
+    a 403), never as the raw `HttpError`, so no caller has to import
+    `googleapiclient` to catch it.
+
     Backoff is the safety net, not the strategy. A sustained sweep should pace
     itself so the limit is never reached - see `throttle` - because once the
     quota window is exhausted, waiting inside it is strictly worse than not
@@ -219,12 +275,20 @@ def _execute(request):
             return request.execute()
         except HttpError as error:
             if attempt == MAX_ATTEMPTS - 1 or not _retryable(error):
-                raise
+                raise _api_error(error) from error
             retry_count += 1
             delay = min(2.0**attempt, BACKOFF_CAP)
             # Equal jitter: half the delay guaranteed, half randomised.
             time.sleep(delay / 2 + random.uniform(0, delay / 2))
     raise AssertionError("unreachable: the final attempt either returns or raises")
+
+
+def _api_error(error: HttpError) -> GmailApiError:
+    """The `GmailApiError` (or `Forbidden`) a final `HttpError` becomes."""
+    status = getattr(error.resp, "status", None)
+    status = int(status) if status is not None else None
+    kind = Forbidden if status == 403 else GmailApiError
+    return kind(str(error), status=status)
 
 
 def search_refs(svc, query: str, limit: int | None = None) -> list[tuple[str, str]]:
@@ -275,6 +339,18 @@ def count(svc, query: str) -> int:
     return len(search_ids(svc, query))
 
 
+def fetch_raw(svc, message_id: str) -> dict:
+    """The full `messages.get` response, unparsed.
+
+    For measurement scripts that need more of the payload than `Message`
+    carries. Exists so they reach the API through here, with backoff, rather
+    than calling `svc.users()` themselves.
+    """
+    return _execute(
+        svc.users().messages().get(userId="me", id=message_id, format="full")
+    )
+
+
 def fetch(svc, message_id: str) -> Message:
     """One message, with both text parts decoded.
 
@@ -284,9 +360,7 @@ def fetch(svc, message_id: str) -> Message:
     recovery path for a genuine failure, not a substitute for handling a
     rate limit that normal operation trips on its own.
     """
-    payload_response = _execute(
-        svc.users().messages().get(userId="me", id=message_id, format="full")
-    )
+    payload_response = fetch_raw(svc, message_id)
     payload = payload_response.get("payload", {})
     parts = collect_text_parts(payload)
     return Message(
@@ -299,6 +373,122 @@ def fetch(svc, message_id: str) -> Message:
         text_html=parts.get("text/html", ""),
         label_ids=tuple(payload_response.get("labelIds", []) or ()),
     )
+
+
+def all_labels(svc) -> dict[str, str]:
+    """name -> id for every label in the mailbox, system labels included.
+
+    One `labels.list` call; it is not paginated. `setup_labels` needs every
+    name, not just the wanted ones, to see case variants.
+    """
+    response = _execute(svc.users().labels().list(userId="me"))
+    return {label["name"]: label["id"] for label in response.get("labels", [])}
+
+
+def label_ids(svc, names: Collection[str]) -> dict[str, str]:
+    """name -> id for every requested label, matched by exact name.
+
+    Raises `MissingLabels` naming every absent label, not just the first, so
+    one rerun of setup fixes all of them. Exact match only: a case variant is
+    a different label as far as this is concerned, and `setup_labels` is
+    where a clash gets reported.
+    """
+    by_name = all_labels(svc)
+    missing = [name for name in names if name not in by_name]
+    if missing:
+        raise MissingLabels(missing)
+    return {name: by_name[name] for name in names}
+
+
+def create_label(svc, name: str) -> str:
+    """Create one user label and return its id.
+
+    Name only; Gmail's default visibility (shown in the sidebar and on
+    messages) is what the agent's labels want. Not idempotent, but still
+    wrapped in `_execute`: if a create succeeds and its response is lost to a
+    5xx, the retry gets 409 "already exists", which is not retryable and
+    raises. Rerunning `setup_labels`, which is idempotent, then finds it.
+    """
+    response = _execute(svc.users().labels().create(userId="me", body={"name": name}))
+    return response["id"]
+
+
+def modify_labels(
+    svc,
+    message_id: str,
+    *,
+    add_ids: Collection[str],
+    remove_ids: Collection[str],
+) -> tuple[str, ...]:
+    """The single atomic label change. Returns the labels Gmail reports after.
+
+    One `messages.modify` call carrying both sets, so an add can never land
+    without its remove - CLAUDE.md's atomic-modify rule, enforced by the
+    signature rather than by convention. Both keywords are required, even
+    when one side is empty, so every call site states both halves.
+
+    Ids, not names; they come from `label_ids()`. Only `INBOX` and user
+    labels may be touched - see `_check_modifiable` - which also catches a
+    label name passed by mistake.
+
+    Wrapped in `_execute`: modify SETS labels rather than toggling them, so a
+    retried call that had already succeeded changes nothing. A permission
+    403 is still never retried.
+
+    Returns the post-change labels from Gmail's response, so callers can
+    record the state Gmail confirmed rather than the one they asked for.
+    """
+    add = _label_id_set(add_ids, "add_ids")
+    remove = _label_id_set(remove_ids, "remove_ids")
+    if not add and not remove:
+        raise ValueError("empty label change - a caller bug, not a no-op")
+    if add & remove:
+        raise ValueError(f"ids on both sides of one change: {sorted(add & remove)}")
+    _check_modifiable(add | remove)
+
+    response = _execute(
+        svc.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": sorted(add), "removeLabelIds": sorted(remove)},
+        )
+    )
+    return tuple(response.get("labelIds", []) or ())
+
+
+def _label_id_set(ids: Collection[str], name: str) -> set[str]:
+    """`ids` as a set, refusing a bare string.
+
+    A string is a collection of its characters, so `add_ids="Label_3"`
+    would otherwise ask for labels `L`, `a`, `b`...
+    """
+    if isinstance(ids, str):
+        raise TypeError(f"{name} must be a collection of ids, not a string: {ids!r}")
+    return set(ids)
+
+
+def _check_modifiable(ids: Collection[str]) -> None:
+    """Refuse every system label except INBOX.
+
+    The agent and undo only ever move INBOX and `Agent/` labels, so this
+    costs nothing - and in exchange `modify_labels` cannot trash, spam,
+    un-spam or mark-read a message whatever a caller passes. User labels
+    are recognised by Gmail's `Label_` id form (observed in Phase 3 step 2).
+    If Google changed that form, this fails closed: it raises rather than
+    lets anything through.
+    """
+    refused = sorted(
+        label_id
+        for label_id in ids
+        if label_id != MODIFIABLE_SYSTEM_LABEL
+        and not label_id.startswith(USER_LABEL_ID_PREFIX)
+    )
+    if refused:
+        raise ValueError(
+            f"refusing to modify {refused}: only {MODIFIABLE_SYSTEM_LABEL} and "
+            f"user labels ({USER_LABEL_ID_PREFIX}*) may be changed - "
+            "pass label ids from label_ids(), not names"
+        )
 
 
 def collect_text_parts(payload: dict) -> dict[str, str]:

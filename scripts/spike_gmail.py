@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# EXEMPT FROM tests/test_write_guard.py, by exact path.
+#
+# Phase 0 throwaway code, kept as the record of how the Phase 0 numbers were
+# measured. It imports googleapiclient and builds its own client, which every
+# other file is forbidden to do: it reaches the Gmail API around
+# app/gmail_client.py, so no test checks what it calls. It must stay
+# read-only. Do not add any call here that is not a read, and do not copy
+# this pattern into a new script - a new file gets no exemption.
 """Phase 0 spike: read the real mailbox and close four open assumptions.
 
 `docs/PLAN.md` only asks for "fetch 20 messages and print them", which proves

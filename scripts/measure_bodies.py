@@ -215,12 +215,7 @@ def main() -> None:
     pace = gmail_client.throttle(args.delay)
 
     for i, message_id in enumerate(sample, start=1):
-        response = (
-            svc.users()
-            .messages()
-            .get(userId="me", id=message_id, format="full")
-            .execute()
-        )
+        response = gmail_client.fetch_raw(svc, message_id)
         payload = response.get("payload", {})
         parts = gmail_client.collect_text_parts(payload)
         plain = parts.get("text/plain", "")

@@ -22,8 +22,9 @@ every truncation change would silently redefine what is being measured and
 `body_chars` would stop being tunable at all. Press `m` if the visible part is
 not enough to decide.
 
-Read-only. This script lists and gets; it cannot touch a label, and the token
-carries `gmail.readonly` besides.
+Read-only. This script lists and gets through `gmail_client`; it cannot
+touch a label, and `tests/test_write_guard.py` enforces that it cannot reach
+the API any other way.
 """
 
 from __future__ import annotations
@@ -32,18 +33,15 @@ import argparse
 import datetime as dt
 import json
 import sys
-import termios
-import tty
 from collections import Counter, deque
 from dataclasses import replace
 from pathlib import Path
 
-from app import evallabel, evalscore, evalset, gmail_client
-from app.evallabel import KEYS
+from app import evallabel, evalscore, evalset, gmail_client, labelloop
 
 CACHE_DIR = evalset.DATA_DIR / "eval_cache"
 
-RULE = "-" * 78
+RULE = labelloop.RULE
 
 
 # --- sample ---------------------------------------------------------------
@@ -114,39 +112,6 @@ def report(plan: evalset.SamplePlan) -> None:
     print("Commit both - they are ids and provenance only, no content.")
 
 
-# --- terminal -------------------------------------------------------------
-
-
-def read_key() -> str:
-    """One keypress, no Enter. Falls back to line mode off a tty.
-
-    Two hundred messages is two hundred spurious Enters otherwise. The fallback
-    is what lets the loop be driven from a pipe in a test without a pty.
-
-    `setcbreak` leaves ISIG on, so Ctrl-C still raises `KeyboardInterrupt` and
-    quits through the same path as `q` - every decision is already on disk.
-    """
-    if not sys.stdin.isatty():
-        line = sys.stdin.readline()
-        return line.strip()[:1] if line.strip() else "q"
-    fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        return sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-
-
-def footer(unsure: bool) -> str:
-    keys = "  ".join(f"{key} {category.value}" for key, category in KEYS.items())
-    flag = "  [UNSURE - the next digit is recorded as unsure]" if unsure else ""
-    return (
-        f"{RULE}\n{keys}\n"
-        f"u unsure (flag)    s skip   b back   m more   q save and quit{flag}"
-    )
-
-
 # --- label ----------------------------------------------------------------
 
 
@@ -206,11 +171,11 @@ def label_loop(
     limit: int | None,
     batch: int,
 ) -> set[str]:
-    """The keypress loop. Mutates `resolved`, returns the sitting's skips.
+    """One sitting of the eval's keypress loop. Mutates `resolved`, returns skips.
 
-    One loop for both passes rather than a copy per subcommand. The copy would
-    be the code that writes ground truth, and two of those drift - `b` fixed in
-    one and not the other is a silent misfire that survives into the labels.
+    The loop is `labelloop.label_loop`, shared with the dry-run review (Phase
+    3 step 9). What is the eval's is wired in here: its cache, its labels
+    file, and `pass_no`.
 
     `pass_no` is the only difference between a labelling sitting and the blind
     recheck. Nothing here reads a record from another pass, so the pass-1 label
@@ -222,96 +187,36 @@ def label_loop(
     # what makes the recheck, whose 30 messages are all cached, fully offline.
     service: list = []
 
-    def gmail():
+    def get(message_id: str) -> gmail_client.Message:
         if not service:
             service.append(gmail_client.service())
-        return service[0]
+        return gmail_client.fetch(service[0], message_id)
 
-    skipped: set[str] = set()
-    history: list[str] = []
-    decided = 0
+    def show(message: evallabel.Cached, show_full: bool, position: int) -> str:
+        return evallabel.render(
+            message, body_chars, show_full, position=position, total=total
+        )
 
-    try:
-        while queue and (limit is None or decided < limit):
-            prefetch(gmail, queue, batch)
-            message_id = queue[0]
-            message = evallabel.cache_get(message_id, CACHE_DIR)
-            if message is None:
-                print(f"{message_id}: could not be fetched - skipping")
-                skipped.add(queue.popleft())
-                continue
+    def record(message_id: str, label, unsure: bool) -> evallabel.LabelRecord:
+        row = evallabel.LabelRecord(
+            message_id=message_id,
+            label=label,
+            unsure=unsure,
+            labelled_at=dt.datetime.now(dt.UTC).isoformat(),
+            pass_no=pass_no,
+        )
+        evallabel.append_record(row, evallabel.LABELED_PATH)
+        return row
 
-            unsure = False
-            show_full = False
-            while True:
-                print(f"\n{RULE}")
-                print(
-                    evallabel.render(
-                        message,
-                        body_chars,
-                        show_full,
-                        position=len(resolved) + 1,
-                        total=total,
-                    )
-                )
-                print(footer(unsure))
-                key = read_key()
-
-                if key in KEYS:
-                    record = evallabel.LabelRecord(
-                        message_id=message_id,
-                        label=KEYS[key],
-                        unsure=unsure,
-                        labelled_at=dt.datetime.now(dt.UTC).isoformat(),
-                        pass_no=pass_no,
-                    )
-                    evallabel.append_record(record, evallabel.LABELED_PATH)
-                    resolved[message_id] = record
-                    history.append(queue.popleft())
-                    decided += 1
-                    break
-                if key == "u":
-                    unsure = not unsure
-                    continue
-                if key == "m":
-                    show_full = True
-                    continue
-                if key == "s":
-                    skipped.add(queue.popleft())
-                    break
-                if key == "b":
-                    if history:
-                        queue.appendleft(history.pop())
-                    else:
-                        print("nothing to go back to")
-                    break
-                if key == "q":
-                    queue.clear()
-                    break
-    except KeyboardInterrupt:
-        print("\ninterrupted")
-    return skipped
-
-
-def prefetch(gmail, queue, batch: int) -> None:
-    """Cache the next `batch` messages, if they are not already on disk.
-
-    Fifty sequential gets is ~25 seconds, and `docs/BACKLOG.md` measured the
-    rate limit between 150 and 175 consecutive `messages.get` - so a chunk this
-    size stays well under it, and the ~25 minutes of human labelling that
-    follows resets the window entirely. No throttle for the same reason.
-
-    Caching at fetch rather than at label time is what makes quitting cheap:
-    stop after ten and the other forty are already on disk.
-    """
-    missing = evallabel.cache_missing(list(queue)[:batch], CACHE_DIR)
-    if not missing:
-        return
-    svc = gmail()
-    for i, message_id in enumerate(missing, 1):
-        print(f"\rfetching {i}/{len(missing)}...", end="", flush=True)
-        evallabel.cache_put(gmail_client.fetch(svc, message_id), CACHE_DIR)
-    print("\r" + " " * 30 + "\r", end="")
+    return labelloop.label_loop(
+        queue,
+        resolved,
+        fetch=lambda message_id: evallabel.cache_get(message_id, CACHE_DIR),
+        show=show,
+        record=record,
+        prefetch=lambda pending: labelloop.prefetch(get, pending, batch, CACHE_DIR),
+        limit=limit,
+    )
 
 
 # --- recheck ---------------------------------------------------------------

@@ -231,7 +231,22 @@ def shorten_urls(text: str) -> str:
     `?qs=ABB7InYiOjEs...` tracking token cannot, which is why this change did
     not wait for a measurement to justify it.
     """
-    return URL.sub(lambda match: urlsplit(match.group(0)).netloc or "link", text)
+    return URL.sub(lambda match: _host(match.group(0)), text)
+
+
+def _host(url: str) -> str:
+    """The URL's host, or "link" when it has none or `urlsplit` rejects it.
+
+    `urlsplit` reads a `[` or `]` in the host as an IPv6 literal and raises
+    on a malformed one. `URL` grabs everything up to whitespace, so plain
+    text such as `[https://site.com]` hands it `https://site.com]`. That
+    crashed the Phase 3 gate's large dry run at message 113. Only inputs that
+    used to raise change here, so no previously built prompt changes.
+    """
+    try:
+        return urlsplit(url).netloc or "link"
+    except ValueError:
+        return "link"
 
 
 def informative_length(text: str) -> int:
