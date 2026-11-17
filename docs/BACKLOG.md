@@ -577,6 +577,39 @@ subject and the two text parts only, so the header would need
 `gmail_client.fetch` to carry it and the cache to store it — a schema change
 and a refetch, which is why it is deferred rather than guessed at now.
 
+**Observed, Phase 3 gate step 2 (2026-11-17), run `20261104T121423-f46437`:**
+1 rule hit in 300 messages, action correct and label exact. That one hit is
+the step 6 rehearsal's planted `Re: [personai rehearsal] M6`, sent by the
+reader from a second account, so **precision on real replies is still
+unmeasured**. The 300 newest messages held no other `Re:`/`Fw:` subject. The
+trigger above has not fired; take the sample from the first live runs.
+
+## Needs Review volume — larger than planned, accepted for now
+
+**Measured at Phase 3 gate step 2 (2026-11-17).** 58 of 300 messages (19%)
+went to Needs Review at T = 0.80. Of those, 46 were truly archive-side
+(`Promotions` 30, `Updates` 14, `Receipts` 2) and 12 were `To Action`. The
+46 are most of why action accuracy failed its mark (0.807 against 0.84).
+Every action error in that run was clutter; none was costly.
+
+**What the threshold bought.** Of the 12 `To Action` messages in Needs
+Review, 3 had a `Promotions` argmax with p(`To Action`) under the 0.15
+floor. Without the threshold they would have been archived, and costly
+errors would have been 3/25 instead of 0/25.
+
+**The reader's call (2026-11-17):** keep it as it is to start with. A queue
+that is too large is the safe direction, and the reader would rather be safe
+than sorry. Revisit from live performance data later, if that makes sense.
+
+**When it is revisited:** not against the gate's 300 (the lock-box rule).
+Use logged live rows plus the reader's corrections as the ground truth.
+`Record.distribution` and `confidence_threshold` are on every model row, so
+the trade-off can be computed from the log: messages moved out of Needs
+Review against `To Action` messages newly archived. The cost to watch is
+the second, not the first.
+**Trigger:** the Needs Review queue is too big to read, or the reader
+stops reading it. A queue nobody reads protects nothing.
+
 ## Boilerplate inside the truncation budget — measured, not yet acted on
 
 Raised while diagnosing the holdout's one costly error: a human reply whose

@@ -1,6 +1,6 @@
 """Hand-labelling the eval set: records, corrections, the cache, rendering.
 
-No terminal, no network. The keypress loop lives in `scripts/label_eval.py`;
+No terminal, no network. The keypress loop lives in `app/labelloop.py`;
 everything here is a function of its arguments, which is what makes the parts
 that would otherwise only be exercised by 200 keystrokes at 11pm testable -
 resume, correction, and the truncation marker.

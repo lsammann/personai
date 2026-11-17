@@ -52,6 +52,69 @@ large dry run to be "read as a second eval" but lists no tool for reading it.
 Reviewing a few hundred predictions by grepping a JSONL file would not be
 reliable, so it gets a step (step 9) of its own.
 
+**A5 — The large dry run is reviewed with the prediction shown, not blind.**
+Decided by the human on 2026-11-04, reversing the plan review's "blind" of
+2026-11-02. The reason given: a review that looks for errors in what the
+model said is faster than labelling from scratch, and the reviewer trusts
+their calls not to be pulled toward the model's. A half-shown, half-blind
+split, which would have measured that pull, was offered and declined.
+
+What this costs, recorded so the figures are read correctly:
+- Seeing the prediction tends to pull a reviewer toward agreeing, and the
+  pull is not visible from the inside. Gate step 2's figures are therefore
+  an **upper bound of unknown size** on what a blind review would give.
+- **They are not comparable to Phase 2's.** Dev's 0.900 action accuracy and
+  0.771 six-way were labelled blind. The 0.84 pass mark was set against
+  the blind 0.900, and is kept unchanged: moving a threshold once the review
+  method is known would be worse than reading the result with this caveat.
+- The reviewer had already seen the model's answers for the 50 newest
+  messages in gate step 1, which fall inside the 300.
+
+**A6 — Gate step 2 failed on clutter only; the gate goes on anyway.**
+Decided by the human on 2026-11-17, after the review was scored (see Gate
+results → Step 2, the review). Step 2 **failed**: action accuracy 0.807
+against the 0.84 mark. It passed on costly errors (0/25). That verdict
+stands as recorded. The 0.84 mark is not lowered, and step 2 is not
+re-described as a pass. What changes is that, in this case, a failed step 2
+no longer blocks gate steps 3 and 4.
+
+The reasons given, and the evidence for them:
+- **Every action error is in the safe direction.** All 58 are clutter: a
+  message kept that could have been archived. None archived something the
+  reader needed. The design is built on that asymmetry: a missed bill
+  costs something, a promotion left visible does not.
+- **Most of the miss is Needs Review doing its job.** 46 of the 58 errors
+  are Needs Review rows, which keep `INBOX` by design. The same threshold
+  kept 3 `To Action` messages that the argmax and the floor would both have
+  archived. Without it, costly errors would have been 3/25 instead of 0.
+  The reader prefers a large review queue at the start ("better safe than
+  sorry"). Tuning it later from live data is a backlog item (`docs/BACKLOG.md`
+  → Needs Review volume), not part of this phase.
+
+What it does **not** change:
+- **The lock-box rule.** No threshold, prompt or rule is tuned against the
+  300. The configuration that goes live is the one that was reviewed.
+- **Gate steps 3-5 as written.** Step 3 stays at `--live --limit 12` with
+  the inbox inspected by eye. Step 4's `undo_run.py --apply --verify` must
+  come back clean. `LIVE_LIMIT_CAP` stays at 25, and bulk processing is
+  still Phase 4.
+- **Every scope and write rule in `CLAUDE.md`.**
+
+What it costs, recorded so later readers do not overread step 2:
+- **The safe-direction claim rests on little data.** 25 keeps-`INBOX`
+  messages, with a Wilson upper bound of 0.133 on the costly rate. The run
+  held 1 `Personal` (the planted reply) and no `Bookings`, so it says almost
+  nothing about either. The figures are also an upper bound, per A5.
+- **Live clutter is expected.** About one message in five went to Needs
+  Review in this run. Expect a queue of that size in Phase 4 too.
+
+Stop rules, written before step 3 runs (confirmed by the human, 2026-11-17):
+- In step 3, **any message archived that should have stayed visible** stops
+  the gate: run step 4's undo over the run's window, and go back to
+  planning rather than on to Phase 4.
+- A6 covers this one failure only. A later gate that fails is judged on
+  its own; this one is not a precedent.
+
 ---
 
 ## Context
@@ -98,7 +161,7 @@ reverted cleanly.
 | Log vs modify order | Log row written **after** `modify`, carrying success or `error`. An append that fails after a successful modify is the orphan case the sweep catches |
 | Failure in Phase 3 | No labels, a log row with `error`. **One failure never becomes `Agent/Error`**. Dead-lettering is Phase 4 |
 | CLI dry run | Dry by default. Writes need an explicit `--live`. `--limit` is required, and live runs are capped by a constant that Phase 4 removes |
-| Large dry run review | Every message reviewed, **blind**: the prediction is hidden (changed from "prediction shown" at plan review, 2026-11-02). Reviewer's own call. Gives both the action matrix and a six-way figure |
+| Large dry run review | Every message reviewed, **blind**: the prediction is hidden (changed from "prediction shown" at plan review, 2026-11-02). Reviewer's own call. Gives both the action matrix and a six-way figure. *Superseded by A5 (2026-11-04): prediction shown* |
 | Re-consent | Every 7 days is normal operation in Testing status, not a bug. The step 2 consent date and the date it actually fails are recorded |
 | Out of scope → Phase 4 | Dead-lettering, Needs Review reconciliation, `batchModify` bucketing, the poll loop |
 | Dependencies | None new. Everything is `google-api-python-client`, already present |
@@ -113,7 +176,7 @@ reverted cleanly.
 | Large dry run draw | Most recent 300 after 2026-09-11 |
 | Gate thresholds | Action accuracy ≥ 0.84; costly errors ≤ 2% of keeps-`INBOX` truth |
 | `OllamaError` retries | 4 retries after the first attempt, 5 tries in total |
-| Review blindness | Blind. Seeing the prediction anchors the reviewer toward agreeing, which would inflate accuracy against a dev figure that was measured blind |
+| Review blindness | Blind. Seeing the prediction anchors the reviewer toward agreeing, which would inflate accuracy against a dev figure that was measured blind. *Superseded by A5 (2026-11-04): prediction shown* |
 
 ---
 
@@ -411,7 +474,9 @@ uv run python scripts/run_pass.py --limit 50 [--query "newer_than:7d"] [--live]
 ## 9. The review tool — `scripts/review_run.py` (A4)
 
 Agreed 2026-11-02 as written below, including that review output is not
-committed. Made blind at the same review.
+committed. Made blind at the same review, and **made not blind again by
+A5** (2026-11-04). Where the next paragraph says the prediction is hidden,
+read A5 and the Step 9 section.
 
 Reads one `run_id`'s rows from the log, fetches each message, and shows
 sender, subject and the same truncated body the model saw. **The prediction
@@ -439,12 +504,13 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
      About 700 messages at the frame's rate. *Size:* 300. *Draw:* the
      **most recent 300**. Accepted knowingly: it leans on recency, so the
      result describes current mail rather than the whole post-frame period.
-   - *Review:* every message, blind, with step 9's tool.
+   - *Review:* every message, with step 9's tool, the prediction shown
+     (A5; originally blind).
    - *Pass:* action accuracy ≥ **0.84**, the lower end of dev's 0.900, and
      costly errors (a keeps-`INBOX` message archived) ≤ **2%** of reviewed
      keeps-`INBOX` truth.
-   - *Reported, not gated:* six-way accuracy (comparable to dev's 0.771,
-     since both were labelled blind, though on a different population);
+   - *Reported, not gated:* six-way accuracy (**not** comparable to dev's
+     0.771: dev was labelled blind and this review is not, per A5);
      `To Action` retention; `Personal` →
      archive count; reply-rule precision.
    - *Watch triggers, checked here:* any `Personal` → archive starts the
@@ -452,18 +518,130 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
      scheduled as follow-up work, not done inside this gate. Reply-rule
      precision is recorded in `docs/BACKLOG.md`.
    - *Fail:* the classifier configuration is not tuned against these 300.
-     Same lock-box logic as Phase 2's step 8.
+     Same lock-box logic as Phase 2's step 8. (Failed 2026-11-17 on
+     action accuracy; the gate proceeds under A6.)
 3. **Live run over a tiny slice** — `--live --limit 12 --query newer_than:1d`.
    Inspect the inbox by eye.
 4. **`undo_run.py --apply --verify`** over that window. Pass: `--verify`
    clean, no orphans.
 5. Only then is bulk processing on the table, which is Phase 4.
 
+### Gate results
+
+**Step 1 — passed 2026-11-04** (run `20261104T102240-e04cfe`,
+`--limit 50`, no `--query`).
+- 50/50 rows carry `prior_labels`; all marked `dry_run`, none with
+  `labels_after`; 0 failed, 0 skipped, 0 unreadable log lines.
+- Retained mass ≥ 0.9998 on every row, so the model kept to the format.
+- Pacing: 3.2 s a message on average (slowest 10.4 s), 19 a minute, which
+  is about one fetch every 3 s. That settles §8's "to be confirmed on the
+  first 50": no throttle. Preflight 13.1 s.
+- Outcome mix: Promotions 39, Receipts 4, To Action 3, Updates 3, Personal 1;
+  Needs Review 11 of 50.
+- **The reply rule was not seen firing.** None of the 50 subjects is a
+  reply. "Re-Introducing: …" correctly did not fire it, since the rule
+  needs a colon. A `subject:re` query found only words like "we're",
+  because Gmail search ignores punctuation, so a `Re:` cannot be searched
+  for. The human chose not to plant a test reply. The check moves to step 2,
+  whose 300 messages will include real replies and whose reply-rule
+  precision is reported anyway. Routing is covered by unit tests, and the
+  rule's accuracy was measured on the Phase 2 holdout.
+- Labelling questions it raised, settled under the existing rules: periodic
+  statements are `Receipts` (Webull, CommBank); Music League's automated
+  notifications are not `Personal`, since a platform wrote them ("Vote
+  Reminder" is `To Action`, "We're Halfway There" is `Updates`).
+
+**Step 2, first attempt — halted 2026-11-04** (run `20261104T111406-4660b4`,
+112 of 300). Message 113's body held a URL whose host contained a bracket
+(plain text like `[https://site.com]`, where `URL` takes the `]` too), and
+`urlsplit` raised `ValueError: Invalid IPv6 URL` inside `shorten_urls`. Not
+an expected error, so the run halted as step 8 agreed, with its summary
+printed and nothing written. Fixed in `message_body._host`: a host
+`urlsplit` rejects becomes `link`, like a URL with no host. Only inputs that
+used to raise change, so no prompt that was ever built changes and
+`EXTRACTION_VERSION` stays. Tests 624 → 627. That run's rows stay in the
+log and are **not** the gate run; step 2 is rerun whole under a new run id,
+so the review covers one run.
+
+**Step 2, the gate run — completed 2026-11-04, awaiting review** (run
+`20261104T121423-f46437`). 300 rows for 300 distinct messages, 0 failed, 0
+skipped, 0 unreadable log lines; every row has `prior_labels`; retained
+mass ≥ 0.9998. It contains all 112 messages of the halted attempt,
+including the one that crashed it. Source model 299, reply 1; 217 would
+archive, 83 keep `INBOX`; Needs Review 58. Mean 2.9 s per message, 20 a
+minute. The one reply row is the step 6 rehearsal's own `Re: [personai
+rehearsal] M6`, written by the human from a second account: the rule is now
+seen firing end to end, but on a planted message, so its precision on real
+replies is still unmeasured here. That message is reviewed like any other
+(a human wrote it, so `Personal` under the rules).
+
+**Step 2, the review — FAILED 2026-11-17** on action accuracy (run
+`20261104T121423-f46437`, all 300 reviewed with `review_run.py`, not blind
+per A5). Configuration in force: `llama3.1:8b`, prompt `v9b-bookings`,
+`body_chars` 300, T = 0.80, F = 0.15.
+
+| Figure | Result | 95% Wilson | Mark | |
+|---|---|---|---|---|
+| Action accuracy | 242/300 = 0.807 | 0.758-0.847 | >= 0.84 | **FAIL** |
+| Costly errors | 0/25 = 0.000 | 0.000-0.133 | <= 2% | PASS |
+| Six-way accuracy (reported) | 250/300 = 0.833 | 0.787-0.871 | - | |
+| `To Action` retention (reported) | 24/24 = 1.000 | 0.862-1.000 | - | |
+| `Personal` -> archive (watch) | 0 | | any | not fired |
+| Reply rule (reported) | 1/1 action correct, 1 label exact | 0.207-1.000 | - | |
+
+Read with A5's caveat: the reviewer saw the model's answer, so these are an
+upper bound of unknown size on a blind review's, and not comparable with
+dev's 0.900 / 0.771.
+
+- **One label corrected after scoring.** Message `1a1679e2ce807d25`
+  (Coles/Flybuys bulk marketing, "Luke, earn double cookware credits…") was
+  keyed `Personal` and is `Promotions` under the rules: a platform wrote it
+  and it sells something. The human confirmed it as a keying slip (`6` for
+  `5`) on 2026-11-17. A correction row was appended to the review file, so
+  the original call is kept and the newest row counts. Figures **before** the correction:
+  action 241/300 = 0.803, costly **1/26 = 0.038 (FAIL)**, six-way 0.830,
+  `Personal` -> archive 1 (watch trigger fired). The correction turned the
+  costly mark from fail to pass and the watch trigger off. It did not change the
+  verdict. It is a ground-truth fix, not tuning: nothing about the
+  classifier moved.
+- **Every one of the 58 action errors is clutter** (kept, truth archives).
+  None is costly.
+  - 46 are Needs Review rows (truth `Promotions` 30, `Updates` 14,
+    `Receipts` 2). Needs Review keeps `INBOX` by design, so each counts as
+    a wrong action.
+  - 9 the model called `Personal` (truth `Updates` 5, `Promotions` 4).
+  - 3 the model called `To Action` (truth `Promotions`).
+- **Needs Review earned its place on the costly side.** Of its 58 rows, 12
+  are truly keeps-`INBOX`, all `To Action`. For 4 of them the argmax was
+  `Promotions`. Through `decide()` with no confidence threshold, the
+  `To Action` floor would still have kept one (p = 0.222), but 3 would have
+  been archived: costly errors 3/25 = 0.12 instead of 0. Descriptive only;
+  nothing is tuned on it (the lock-box rule).
+- **Truth mix:** `Promotions` 228, `Updates` 35, `To Action` 24,
+  `Receipts` 12, `Personal` 1 (the planted reply), `Bookings` 0. With one
+  `Personal` and no `Bookings`, this run says almost nothing about either
+  category. The 2% mark on 25 keepers allows zero costly errors.
+- **Lock-box:** per the Fail rule, no threshold, prompt or rule is tuned
+  against these 300. Reply-rule precision is recorded in `docs/BACKLOG.md`
+  (the one hit is the planted message, so real-reply precision is still
+  unmeasured).
+- **The human's position on the failure, 2026-11-17:** a Needs Review
+  queue larger than planned is acceptable at the start. Clutter is the safe
+  direction, and the threshold can be revisited later from live
+  performance data. Recorded in `docs/BACKLOG.md` → Needs Review volume.
+- **The gate goes on despite the failure: amendment A6** (decided by the
+  human, 2026-11-17). Step 2 stays recorded as FAIL and the 0.84 mark is
+  unchanged. A6 says why gate step 3 proceeds anyway, and adds a stop rule
+  for step 3.
+
 ---
 
 ## Build order
 
-**Current step: 8** (built 2026-11-04, 624 tests pass; no live call made). Step 7 finished 2026-11-04.
+**Current step: 10, the Gate.** Steps 1 and 2 are done: step 2 FAILED on
+action accuracy and proceeds under A6. Next is gate step 3, the small live
+run. Step 9 finished 2026-11-17, when its first use, the review of gate step
+2's run, was completed.
 
 1. Write interface + repo-wide guard + granted-scope check (A2). Code only,
    no consent, no API calls. **Done 2026-11-02.** Produced
@@ -537,8 +715,15 @@ Sample, draw and pass thresholds agreed 2026-11-02, before any dry run.
    `RunTally`; `undo.window_for_run` and `undo_run.py --window-for`; write
    guard rule 5 (`CLASSIFY_AND_LABEL_CALLERS`). 624 tests pass. Not yet
    run against real mail: its first use is gate step 1
-9. `scripts/review_run.py` (A4)
-10. Gate
+9. `scripts/review_run.py` (A4). **Built 2026-11-04.** See the Step 9
+   section. `app/labelloop.py` (the keypress loop and `prefetch`, moved out
+   of `label_eval.py`, with their first tests); the pure `app/review.py`
+   (`run_rows`, `ordering`, `suggestion`, `not_in_inbox`, `score` ->
+   `GateReport`, `report_lines`); `scripts/review_run.py label|score`,
+   read-only, on neither callers list. 677 tests pass. **Done
+   2026-11-17:** all 300 of gate step 2's run reviewed and scored. One label
+   was corrected after scoring (see Gate results)
+10. Gate. Steps 1-2 done (step 2 failed, proceeds under A6); step 3 next
 
 Per `CLAUDE.md`, each step is planned in its own section before it is
 written, and nothing is committed by Claude.
@@ -2440,3 +2625,280 @@ All agreed; Q1 and Q4 revised at review.
 | 5 | Exit status | 0 with no failure rows, 1 otherwise; a halt raises |
 | 6 | Agent callers | `CLASSIFY_AND_LABEL_CALLERS = {"scripts/run_pass.py"}` in `test_write_guard.py` |
 | 7 | Pacing | No throttle; the tally prints messages per minute |
+
+---
+
+## Step 9 implementation
+
+**Status: agreed 2026-11-04 (all eight questions as recommended). Built
+2026-11-04**, 677 tests pass, ruff clean; see "What the build changed from
+the plan" below. Not yet used: the review of gate step 2's run is the
+human's. Review is
+**not blind** (A5): this section replaces §9's "the prediction and intended
+action are not shown". It reads mail and never writes to Gmail. Its output
+is the ground truth for gate step 2.
+
+### What reading the code turned up
+
+- **The keypress loop is in `scripts/label_eval.py`, not `app/evallabel.py`.**
+  §9 says to reuse "the keypress loop … from `app/evallabel.py`", but
+  `read_key`, `footer`, `label_loop` and `prefetch` all live in the script.
+  The loop is also tied to the eval: it writes to `LABELED_PATH` and reads
+  `CACHE_DIR`. And it has **no tests**. Its docstring says why it must not
+  be copied: "two of those drift - `b` fixed in one and not the other is a
+  silent misfire that survives into the labels" (Q1).
+- **What can be reused unchanged:** `evallabel.Cached`, `render`, `KEYS`,
+  `LabelRecord`, `append_record`, `load_records`, `resolve`, `cache_put`,
+  `cache_get` and `cache_missing`. The cache and record functions already
+  take their paths as parameters.
+- **The log has no bodies,** so every message is fetched again, read-only.
+  300 gets is over the measured 150–175 burst ceiling, so they are fetched in
+  batches of 50 as the labeller goes, which is what `prefetch` already does.
+- **Rule rows carry no distribution** (step 7 Q10). `evalscore._reply_bucket`'s
+  `model_action_correct` (what the model would have done instead) cannot be
+  computed for live reply rows. Only `rule_action_correct` and `label_exact`
+  can.
+- **`evalscore.score` is built for the eval:** stratum weights, `Prediction`
+  rows from a results file, a manifest. The dry run is a census of the 300
+  newest messages, with no strata, so its figures are plain proportions (Q6).
+- **The predicted action is in the log already.** A row's `action.remove`
+  contains `INBOX` exactly when the live system would have archived it.
+  Scoring reads that, rather than re-running `decide()`, so it scores what the
+  run actually decided.
+
+### Shape
+
+```
+uv run python scripts/review_run.py label RUN_ID     # resumable
+uv run python scripts/review_run.py score RUN_ID     # the gate figures
+```
+
+```python
+# app/labelloop.py  (Q1) - moved out of scripts/label_eval.py
+def read_key() -> str: ...
+def footer(unsure: bool) -> str: ...
+def label_loop(
+    queue: deque[str], resolved: dict[str, LabelRecord], *,
+    fetch: Callable[[str], Cached | None],       # cache_get, after prefetch
+    show: Callable[[Cached, bool, int], str],    # render, plus any extra line
+    record: Callable[[str, Category, bool], LabelRecord],  # appends, returns
+    prefetch: Callable[[deque[str]], None],
+    limit: int | None,
+    read: Callable[[], str] = read_key,          # tests pass a script of keys
+) -> set[str]: ...                               # the sitting's skips
+
+# app/review.py  (pure, no I/O but what its path parameters name)
+REVIEW_DIR = DATA_DIR / "reviews"
+CACHE_DIR  = DATA_DIR / "review_cache"
+
+def run_rows(records: Iterable[Record], run_id: str) -> dict[str, Record]: ...
+def ordering(message_ids: Sequence[str], run_id: str) -> list[str]: ...  # Q5
+def suggestion(row: Record) -> str: ...          # the line shown (Q2)
+
+@dataclass(frozen=True)
+class GateReport: ...                            # Q6
+def score(rows: Mapping[str, Record], labels: Mapping[str, LabelRecord]) -> GateReport: ...
+```
+
+### Design questions
+
+**Q1 — Where the keypress loop lives.** *Recommend:* move `read_key`,
+`footer` and `label_loop` into `app/labelloop.py`, with the eval's specifics
+passed in as functions. `label_eval.py` and `review_run.py` both call it.
+Tests drive it with a scripted key sequence through `read`, which gives the
+labelling loop its first tests: `b`, `s`, `u`, `m`, `q` and a digit. The
+recheck's "a pass-1 label cannot reach the screen" property stays true,
+because `show` still takes only a `Cached`. *Rejected:*
+- Copying the loop into `review_run.py`. Its own docstring explains why.
+- Importing it from `scripts/label_eval.py`. A script is not a module, and
+  one script depending on another breaks when that one is reorganised (the
+  same reason as step 7 Q9).
+- Leaving `label_eval.py` untouched and writing a new loop for review. That is
+  the copy under another name.
+
+*Cost:* this changes the code that wrote the Phase 2 ground truth. That
+code is finished and its labels are committed, so nothing already measured
+moves. The new tests are the protection against breaking it for the next
+eval.
+
+**Q2 — What the reviewer sees.** *Recommend:* the message exactly as the
+eval labeller saw it (`render`, the same body the model saw, `m` for more),
+plus one line above the keys:
+
+```
+model:  Promotions 0.959 -> archive        (or: reply rule -> keep,
+                                             Needs Review -> keep, failed -> keep)
+```
+
+The source, the category, the confidence for model rows, and the action.
+*Rejected:*
+- The full distribution. Five more numbers to read and more anchoring, for
+  little a reviewer would use.
+- The label diff (`+Agent/Promotions -INBOX`). The action word says the
+  same thing more briefly.
+
+**Q3 — How a call is entered.** *Recommend:* every decision is a digit,
+including agreeing: you press the suggested category's own digit. No
+Enter-to-accept. Agreeing then takes one keystroke, the same as with Enter,
+so nothing is slower. But a keypress can't agree without naming a category,
+so an accidental Enter in a fast run is not a silent "yes". *Rejected:*
+Enter accepts. That is the human's call to make if they want it, but it buys
+no speed.
+
+**Q4 — Which rows are reviewed.** *Recommend:* every row of the run,
+including failure rows. A failure applied no labels, so it kept `INBOX`,
+and scoring counts it that way, as `evalscore.keeps_inbox` does.
+Messages that could not be fetched are skipped and counted. Skipped messages
+(no row) are not in the review, because there is no row to review.
+*Rejected:* failure rows left out. The live system's behaviour on them
+(keep) is part of what the gate measures.
+
+**Q5 — Order.** *Recommend:* a seeded shuffle, seeded from the `run_id`,
+so a resumed session keeps the same order. The log's order is newest first,
+which puts repeated senders side by side (two Casting Networks emails in a
+row in step 1). A reviewer then tends to copy the previous call rather than
+judge each one. *Rejected:* log order. It is simpler, but has that effect.
+
+**Q6 — Scoring.** *Recommend:* a new pure `review.score` returning plain
+proportions with Wilson intervals (`evalscore.wilson`, reused):
+- **Gated:** action accuracy (archived or kept, against whether the truth is
+  in `KEEPS_INBOX`), pass at ≥ 0.84; costly errors (archived while the truth
+  keeps `INBOX`) as a share of keeps-`INBOX` truth, pass at ≤ 2%.
+- **Reported:** six-way accuracy; `To Action` retention; `Personal` ->
+  archive count, the watch trigger; reply rule `n`, `rule_action_correct`
+  and `label_exact`; Needs Review count; unsure count; messages not
+  reviewed.
+- **Printed with A5's caveat** on every run, so the figures cannot be quoted
+  without it.
+
+*Rejected:*
+- Reusing `evalscore.score`. It would have to fake strata and a manifest.
+- Pass and fail on the interval rather than the point estimate. The
+  thresholds were agreed as point figures on 2026-11-02, and changing that
+  now would be changing a threshold after the method changed.
+
+**Q7 — What is written, and where.** *Recommend:*
+`data/reviews/<run_id>.jsonl`, one `LabelRecord` per decision through
+`append_record`, so it has exactly the eval label shape and `resolve`'s
+"last row wins" handles `b`. Not committed (§9). The fetched messages go to
+`data/review_cache/`, apart from `eval_cache/`, so a review can never put a
+message into the eval's cache. *Rejected:* storing the shown suggestion in
+each row. It is the log row's, joined by message id, and A5 says it was
+always shown.
+
+**Q8 — Scope and guards.** *Recommend:* `require_scopes(READONLY)`. The
+script calls only `fetch`. It is on neither callers list, so the write
+guard fails if it ever refers to `modify_labels` or `classify_and_label`.
+*Rejected:* nothing; this is what a reader should be.
+
+### Tests
+
+- `labelloop`: a scripted key sequence records the right category; `u`
+  marks the next digit unsure; `b` re-queues the last decision and the
+  re-label wins; `s` skips; `q` stops with every decision already recorded;
+  a message that cannot be fetched is skipped.
+- `label_eval.py` still works: one scripted sitting through its wiring
+  writes the expected `labeled.jsonl` rows into a temporary path.
+- `review.suggestion`: model, reply rule, Needs Review and failure rows each
+  render as above.
+- `review.ordering`: the same `run_id` gives the same order; another gives
+  another; every id appears once.
+- `review.score`, on hand-built rows and labels:
+  - an archived `Personal` truth counts as a costly error and as a `Personal`
+    -> archive
+  - a Needs Review row whose truth is `Receipts` is a wrong action (kept,
+    should have been archived), and is six-way correct only if its recorded
+    category is `Receipts`
+  - a failure row counts as kept
+  - an unreviewed row counts in "not reviewed", in no proportion
+  - the pass and fail boundaries sit exactly at 0.84 and 2%
+- `review_run.py` is thin and not unit-tested, like the other scripts.
+
+### What the build changed from the plan
+
+Agreed with the human during the build (2026-11-04), except where marked as
+filling a gap.
+
+- **A row fetched outside the inbox cannot be scored, so `score` refuses
+  it** (agreed). "Reading the code" above says `action.remove` holds `INBOX`
+  exactly when the run would have archived. That is true only for a message
+  that was in the inbox when fetched: the log stores the *effective* change,
+  so an already-archived message gets no `INBOX` remove whatever was
+  decided, and would have been scored as kept. The queue query takes all
+  received mail, not only the inbox, so this can happen. `review.not_in_inbox`
+  finds such rows; `score` raises on them and `review_run.py label` refuses
+  before the first message. A fetch failure has no prior labels and still
+  counts as kept (Q4). **Gate step 2's run is unaffected:** all 300 rows
+  have `INBOX` in `prior_labels` (counted from the log, no content read).
+  Recomputing through `decide()` was offered and declined, as the plan had
+  already rejected re-running it.
+- **`prefetch` moved into `app/labelloop.py` too** (agreed), as
+  `prefetch(get, queue, batch, directory)`, so the review does not copy it.
+  Decision 1 named only `read_key`, `footer` and `label_loop`. `get` may
+  return None for a message it could not fetch; nothing is cached and the
+  loop skips it.
+- **Unfetchable messages are skipped, not a crash** (filling a gap in Q4).
+  The eval's loop never had this path: a failed fetch inside `prefetch`
+  raised. `review_run.py`'s `get` catches a per-message `GmailApiError`,
+  remembers the id so the next batch does not ask again, and reports the
+  count at the end. A `Forbidden` still halts, as in the agent.
+  `label_eval.py` keeps its old behaviour.
+- **An allowlist row shows `model:  allowlist -> archive`** (filling a
+  gap). Q2 listed model, reply, Needs Review and failure rows; the gate run
+  has no prefilter rows, but a run can.
+- **Small additions in `review.py`:** `review_path` refuses anything not
+  shaped like a run id, since it becomes a filename; `run_rows` refuses two
+  rows for one message; review rows for ids not in the run are ignored and
+  counted (`stray_labels`); pass/fail compares as `Fraction`s, so 84/100 and
+  1/50 sit exactly on the marks; a figure with `n = 0` fails, so an empty
+  or all-archive review cannot pass the costly-error mark by default. The
+  overall verdict also fails while any row is unreviewed.
+- **Counts in the report are over reviewed rows**, labelled so: "Needs
+  Review (reviewed)" reads 0 before review even though the run has 58.
+- **`review_run.py label --body-chars` defaults to 1500**, as
+  `label_eval.py` does, so the screen matches the eval labeller's (Q2). No
+  `--relabel`: `b` only reaches back through one sitting, and a correction
+  to an earlier sitting would need it added.
+- **`label_eval.py`'s `label_loop` stays as a thin wrapper** that wires the
+  eval's cache, labels file and `pass_no` into `labelloop.label_loop`, so
+  `cmd_label` and `cmd_recheck` are unchanged.
+- **An import allowlist test for `review.py`**, the way `decision.py` is
+  guarded, since the plan calls it pure.
+
+### Checked by breaking the code
+
+Eight changes were made and then reverted, and each was caught: `b` not
+re-queueing (2 failed), `u` ignored (2), the eval wiring writing pass 2 (1),
+the costly mark as `<` (1), a failure row counted as archived (2), ordering
+without the shuffle (2), `review_run.py` referring to `modify_labels` (1)
+and to `classify_and_label` (1).
+
+### The manual procedure (the human)
+
+A. Land the code; tests pass. **Done 2026-11-04:** 677 pass (627 before
+   this step), ruff clean. Checked without a Gmail call: `score` on run
+   `20261104T121423-f46437` with no review file reports 300 rows, 0
+   reviewed, gate FAIL (incomplete review); a malformed run id is refused.
+B. `uv run python scripts/review_run.py label 20261104T121423-f46437`,
+   over as many sittings as needed. Then `score`, and record the result
+   under Gate results.
+
+### Not in this step
+
+- Changing any threshold, prompt or rule because of what the review shows.
+  The gate's lock-box rule holds, and follow-ups go against a fresh holdout.
+
+### Decisions taken (step 9 review, 2026-11-04)
+
+All eight agreed as recommended.
+
+| # | Decision | Choice |
+|---|---|---|
+| 1 | Keypress loop | Moved from `scripts/label_eval.py` into `app/labelloop.py`, shared by the eval labeller and the review; it gets its first tests |
+| 2 | What is shown | The message exactly as the eval labeller showed it, plus one line: the model's category, confidence and intended action |
+| 3 | Entering a call | Every decision is a digit; no Enter-to-accept |
+| 4 | Rows reviewed | Every row of the run, failures included (a failure counts as kept) |
+| 5 | Order | Shuffle seeded from the `run_id` |
+| 6 | Scoring | New pure `review.score`: proportions with Wilson intervals, pass/fail on point estimates against the agreed thresholds, A5's caveat printed |
+| 7 | Output | `data/reviews/<run_id>.jsonl` as `LabelRecord`s; its own cache in `data/review_cache/`; neither committed |
+| 8 | Scope | `require_scopes(READONLY)`; on neither write-guard callers list |
